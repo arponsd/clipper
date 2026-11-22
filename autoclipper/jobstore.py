@@ -1,4 +1,9 @@
-"""Job manifests on disk: data/jobs/<id>/job.json. Thread-safe writes so the UI can read while a worker runs."""
+"""Job manifests on disk: data/jobs/<id>/job.json. Thread-safe writes so the UI can read while a worker runs.
+
+Single-writer rule (CONTRACT.md section 1a): exactly one JobStore owner writes a job's job.json. Saves are
+atomic (unique tmp file + os.replace) so readers never see a torn file, but two writers would still lose
+each other's updates; there is no cross-process lock.
+"""
 from __future__ import annotations
 
 import os
@@ -14,6 +19,22 @@ JOB_STAGES = ["ingest", "transcribe", "moments", "cut"]
 CLIP_STAGES = ["script", "voice", "captions", "render"]
 
 _lock = threading.RLock()
+
+# os.replace onto job.json fails on Windows (WinError 5/32) while another process has it open
+# (a status reader, antivirus, OneDrive). Retry for about 1 s before giving up.
+REPLACE_RETRIES = 20
+REPLACE_RETRY_DELAY = 0.05
+
+
+def _replace_with_retry(src: Path, dst: Path) -> None:
+    for attempt in range(REPLACE_RETRIES):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == REPLACE_RETRIES - 1:
+                raise
+            time.sleep(REPLACE_RETRY_DELAY)
 
 
 def jobs_root() -> Path:
@@ -51,9 +72,13 @@ class JobStore:
 
     def save(self) -> None:
         with _lock:
-            tmp = self.dir / "job.json.tmp"
-            tmp.write_text(self.job.model_dump_json(indent=2), encoding="utf-8")
-            os.replace(tmp, self.dir / "job.json")
+            # Unique tmp name per save: two savers never share (and steal) one tmp file.
+            tmp = self.dir / f"job.json.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}.tmp"
+            try:
+                tmp.write_text(self.job.model_dump_json(indent=2), encoding="utf-8")
+                _replace_with_retry(tmp, self.dir / "job.json")
+            finally:
+                tmp.unlink(missing_ok=True)
 
     # ---- paths -----------------------------------------------------------
     def path(self, *parts: str) -> Path:

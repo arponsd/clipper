@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import shutil
 from pathlib import Path
@@ -13,6 +14,9 @@ from .. import ffmpeg
 from ..config import VoiceProfile
 from ..interfaces import ProgressFn, ShortenFn, VoiceboxAPI
 from ..voicebox import VoiceboxError
+from ._atomic import write_text_atomic
+
+log = logging.getLogger(__name__)
 
 VOICE_SAMPLE_RATE = 44100
 FADE_SECONDS = 0.3
@@ -36,6 +40,9 @@ class VoiceResult(BaseModel):
     tempo: float
     shortened: bool
     trimmed: bool
+    # When trimmed: the estimated prefix of `narration` that is actually heard before the cut.
+    # Captions use it instead of `narration`. None for untrimmed takes and older voice.json files.
+    spoken_narration: str | None = None
 
 
 def narration_hash(text: str) -> str:
@@ -51,6 +58,28 @@ def engine_for(lang: str, voice: VoiceProfile) -> str:
 
 def _count_words(text: str) -> int:
     return len(text.split())
+
+
+def estimate_spoken_prefix(text: str, raw_duration: float, tempo: float, clip_duration: float) -> str:
+    """Words of ``text`` that end before ``clip_duration`` in a take of ``raw_duration`` played at ``tempo``.
+
+    The sped-up take (raw_duration / tempo) is spread over the words by character length, the same
+    way captions.distribute_words does, and words whose estimated end is <= clip_duration are kept.
+    At least the first word is kept.
+    """
+    words = text.split()
+    if not words:
+        return ""
+    spoken = raw_duration / max(tempo, 1e-6)
+    total = sum(max(1, len(w)) for w in words)
+    kept: list[str] = []
+    t = 0.0
+    for w in words:
+        t += spoken * max(1, len(w)) / total
+        if t > clip_duration + 1e-6:
+            break
+        kept.append(w)
+    return " ".join(kept or words[:1])
 
 
 def _settings_key(lang: str) -> str:
@@ -110,7 +139,13 @@ def make_voice(*, client: VoiceboxAPI, narration: str, lang: str, voice: VoicePr
         max_words = math.floor(_count_words(text) * clip_duration * max_speedup / d * 0.95)
         max_words = max(1, max_words)
         progress(0.6, f"voice {d:.1f}s > clip {clip_duration:.1f}s, shortening to {max_words} words")
-        candidate = (shorten(text, max_words) or "").strip()
+        try:
+            candidate = (shorten(text, max_words) or "").strip()
+        except Exception as e:  # noqa: BLE001 - refusal, network, bad output: fall back to tempo + trim
+            msg = f"shortening failed: {e}; speeding up and trimming instead"
+            log.warning(msg)
+            progress(0.6, msg)
+            candidate = ""
         if candidate and candidate != text:
             text = candidate
             shortened = True
@@ -143,9 +178,10 @@ def make_voice(*, client: VoiceboxAPI, narration: str, lang: str, voice: VoicePr
         path=str(final.resolve()), narration=text, narration_hash=narration_hash(text),
         raw_duration=round(d, 3), final_duration=round(ffmpeg.duration(final), 3),
         clip_duration=round(clip_duration, 3), tempo=round(tempo, 4),
-        shortened=shortened, trimmed=trimmed)
-    (out_dir / "voice.json").write_text(
-        json.dumps(result.model_dump(), indent=2, ensure_ascii=False), encoding="utf-8")
+        shortened=shortened, trimmed=trimmed,
+        spoken_narration=estimate_spoken_prefix(text, d, tempo, clip_duration) if trimmed else None)
+    write_text_atomic(out_dir / "voice.json",
+                      json.dumps(result.model_dump(), indent=2, ensure_ascii=False))
     progress(1.0, "voice ready")
     return result
 

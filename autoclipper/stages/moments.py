@@ -8,6 +8,7 @@ from pathlib import Path
 from ..config import ClipSettings
 from ..interfaces import LLM
 from ..models import Moment, Transcript
+from ._atomic import write_text_atomic
 
 # A boundary further away than this is not "near": keep the LLM's time instead of jumping.
 SNAP_TOLERANCE = 5.0
@@ -98,11 +99,8 @@ def validate_moments(raw: list[Moment], t: Transcript, *, count: int, min_second
 
 
 def save_moments(moments: list[Moment], path: Path) -> Path:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps([m.model_dump() for m in moments], ensure_ascii=False, indent=2),
-                    encoding="utf-8")
-    return path
+    text = json.dumps([m.model_dump() for m in moments], ensure_ascii=False, indent=2)
+    return write_text_atomic(Path(path), text)
 
 
 def load_moments(path: Path) -> list[Moment]:

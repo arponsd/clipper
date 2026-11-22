@@ -4,6 +4,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
+import re
 import subprocess
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
@@ -239,12 +241,12 @@ def test_escape_windows_path_with_space_and_quote():
 
 def test_ass_filter_windows_paths():
     f = ffmpeg.ass_filter(PureWindowsPath(r"D:\jobs\a b\captions.ass"), PureWindowsPath(r"D:\app\fonts"))
-    assert f == r"subtitles=filename='D\:/jobs/a b/captions.ass':fontsdir='D\:/app/fonts'"
+    assert f == r"ass=filename='D\:/jobs/a b/captions.ass':shaping=complex:fontsdir='D\:/app/fonts'"
 
 
 def test_ass_filter_posix_and_no_fontsdir():
     f = ffmpeg.ass_filter(PurePosixPath("/data/my job/x:y.ass"), None)
-    assert f == r"subtitles=filename='/data/my job/x\:y.ass'"
+    assert f == r"ass=filename='/data/my job/x\:y.ass':shaping=complex"
     assert "fontsdir" not in f
 
 
@@ -341,9 +343,11 @@ def test_mix_burn_graph_and_fontsdir_only_with_fonts(monkeypatch, vertical, tmp_
     empty.mkdir()
     graph = _captured_graph(monkeypatch, vertical, tmp_path, empty)
     assert "fontsdir" not in graph
-    assert "[0:a]volume=0.15[a0]" in graph
-    assert "[1:a]volume=1.0,apad[a1]" in graph
-    assert "[a0][a1]amix=inputs=2:normalize=0:duration=first[a]" in graph
+    # HINDI_CAPTIONS-3: explicit unity-gain upmix of the mono voice, limiter after the mix
+    assert "[0:a]aformat=channel_layouts=stereo,volume=0.15[a0]" in graph
+    assert "[1:a]aformat=channel_layouts=mono,pan=stereo|c0=c0|c1=c0,volume=1.0[a1]" in graph
+    assert "[a0][a1]amix=inputs=2:normalize=0:duration=first,alimiter=limit=0.97:level=0[a]" in graph
+    assert "apad" not in graph
 
     fonts = tmp_path / "fonts"
     fonts.mkdir()
@@ -353,10 +357,120 @@ def test_mix_burn_graph_and_fontsdir_only_with_fonts(monkeypatch, vertical, tmp_
 
 def test_mix_burn_graph_without_voice(monkeypatch, vertical, tmp_path):
     graph = _captured_graph(monkeypatch, vertical, tmp_path, None, voice=False)
-    assert "amix" not in graph and "[0:a]volume=0.15[a]" in graph
+    assert "amix" not in graph
+    assert "[0:a]aformat=channel_layouts=stereo,volume=0.15,alimiter=limit=0.97:level=0[a]" in graph
 
 
 def test_synth_video(tmp_path):
     out = ffmpeg.synth_video(tmp_path / "s.mp4", 1.0, width=320, height=240)
     info = ffmpeg.probe(out)
     assert (info.width, info.height, info.has_audio) == (320, 240, True)
+
+
+# --------------------------------------------------------------------------- HINDI_CAPTIONS-3 levels
+
+
+def _peak_db(path: Path) -> float:
+    proc = subprocess.run(["ffmpeg", "-hide_banner", "-nostdin", "-i", str(path), "-map", "0:a:0",
+                           "-af", "volumedetect", "-f", "null", "-"], capture_output=True, text=True)
+    m = re.search(r"max_volume:\s*(-?[\d.]+) dB", proc.stderr)
+    assert m, proc.stderr[-500:]
+    return float(m.group(1))
+
+
+def _loud_tone(dst: Path, seconds: float, *, channels: int = 1, volume_db: float = -1.0) -> Path:
+    amp = 10 ** (volume_db / 20)  # lavfi `sine` is fixed at 1/8 amplitude, so build the tone with aevalsrc
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+                    f"aevalsrc={amp:.4f}*sin(2*PI*330*t):s=48000:d={seconds}",
+                    "-ac", str(channels), "-c:a", "pcm_s16le", str(dst)], check=True)
+    return dst
+
+
+@pytest.fixture
+def loud_vertical(tmp_path) -> Path:
+    """Vertical clip whose stereo original audio peaks near 0 dBFS."""
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                    "-f", "lavfi", "-i", "testsrc2=size=270x480:rate=30:duration=2",
+                    "-f", "lavfi", "-i", "aevalsrc=0.944*sin(2*PI*440*t)|0.944*sin(2*PI*440*t):s=48000:d=2",  # stereo, -0.5 dBFS
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    "-c:a", "pcm_s16le", "-shortest", str(tmp_path / "loud_src.mov")], check=True)
+    return tmp_path / "loud_src.mov"
+
+
+def test_mix_burn_voice_volume_2_never_clips(loud_vertical, tmp_path):
+    voice = _loud_tone(tmp_path / "voice.wav", 1.5, volume_db=-1.0)
+    assert _peak_db(voice) == pytest.approx(-1.0, abs=0.2)
+    assert _peak_db(loud_vertical) == pytest.approx(-0.5, abs=0.2)
+    out = ffmpeg.mix_burn(loud_vertical, tmp_path / "o.mp4", voice=voice, ass=None, original_volume=0.15,
+                          voice_volume=2.0, fonts_dir=None, duration=2.0)
+    # volumedetect clamps at 0.0 dB, so an unlimited (clipping) render reads exactly 0.0
+    assert _peak_db(out) < 0.0
+
+
+def test_mix_burn_voice_volume_1_is_unity(vertical, tmp_path):
+    # a mono -6 dB voice over a silenced original must come out at about -6 dB on each channel
+    voice = _loud_tone(tmp_path / "voice.wav", 1.5, volume_db=-6.0)
+    out = ffmpeg.mix_burn(vertical, tmp_path / "o.mp4", voice=voice, ass=None, original_volume=0.0,
+                          voice_volume=1.0, fonts_dir=None, duration=2.0)
+    assert _peak_db(voice) == pytest.approx(-6.0, abs=0.2)
+    assert _peak_db(out) == pytest.approx(-6.0, abs=0.6)
+
+
+def test_mix_burn_without_voice_is_limited(loud_vertical, tmp_path):
+    out = ffmpeg.mix_burn(loud_vertical, tmp_path / "o.mp4", voice=None, ass=None, original_volume=2.0,
+                          voice_volume=1.0, fonts_dir=None)
+    assert _peak_db(out) < 0.0
+
+
+# --------------------------------------------------------------------------- WINDOWS-3 locked output
+
+
+def test_atomic_output_locked_destination_raises_clear_error(tmp_path, monkeypatch):
+    dst = tmp_path / "final.mp4"
+    dst.write_bytes(b"old")
+    calls = []
+
+    def locked(src, target):
+        calls.append(target)
+        raise PermissionError(13, "The process cannot access the file", str(target))
+
+    monkeypatch.setattr(ffmpeg, "_REPLACE_RETRY_SECONDS", 0.3)
+    monkeypatch.setattr(ffmpeg.os, "replace", locked)
+    with pytest.raises(FFmpegError, match=r"could not replace final\.mp4: is it open in another program "
+                                          r"\(e\.g\. a video player\)\? Close it and retry"):
+        with ffmpeg._AtomicOutput(dst) as tmp:
+            tmp.write_bytes(b"new")
+    assert len(calls) >= 2  # retried before giving up
+    assert not (tmp_path / "final.part.mp4").exists()
+    assert dst.read_bytes() == b"old"
+
+
+def test_atomic_output_retry_succeeds_when_lock_released(tmp_path, monkeypatch):
+    dst = tmp_path / "final.mp4"
+    real = os.replace
+    attempts = []
+
+    def flaky(src, target):
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise PermissionError(13, "locked")
+        real(src, target)
+
+    monkeypatch.setattr(ffmpeg.os, "replace", flaky)
+    with ffmpeg._AtomicOutput(dst) as tmp:
+        tmp.write_bytes(b"new")
+    assert dst.read_bytes() == b"new" and len(attempts) == 3
+
+
+def test_atomic_output_other_oserror_fails_fast(tmp_path, monkeypatch):
+    (tmp_path / "out").mkdir()
+    dst = tmp_path / "out" / "final.mp4"
+
+    def bad(src, target):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(ffmpeg.os, "replace", bad)
+    with pytest.raises(FFmpegError, match="could not replace final.mp4"):
+        with ffmpeg._AtomicOutput(dst) as tmp:
+            tmp.write_bytes(b"new")
+    assert list(dst.parent.iterdir()) == []

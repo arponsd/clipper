@@ -8,6 +8,7 @@ from pathlib import Path
 
 from ..interfaces import LLM, ShortenFn
 from ..models import ClipScript, Moment, Transcript
+from ._atomic import write_text_atomic
 from .moments import format_transcript
 
 WORDS_PER_SECOND = {"en": 2.6, "hi": 2.2}
@@ -80,10 +81,8 @@ def normalize_script(s: ClipScript) -> ClipScript:
 
 
 def save_script(s: ClipScript, path: Path) -> Path:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(s.model_dump(), ensure_ascii=False, indent=2), encoding="utf-8")
-    return path
+    text = json.dumps(s.model_dump(), ensure_ascii=False, indent=2)
+    return write_text_atomic(Path(path), text)
 
 
 def load_script(path: Path) -> ClipScript:

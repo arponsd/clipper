@@ -46,6 +46,22 @@ renames/removals need a TEAM_LOG note and lead sign-off. Architect files (`confi
 
 "Output exists" for idempotency = file exists and size > 0.
 
+### 1a. job.json has exactly one writer (recorded by fixer_a, PIPELINE-1 / WINDOWS-2)
+
+- Each job has **exactly one writer**: the `JobStore` owner that runs it (the CLI process in step 1, the one
+  worker thread in step 2). Nobody else may hold a `JobStore` for that job and call `save()`/`set_stage()`.
+- `JobStore.save()` is atomic for readers: it writes a unique tmp file per save
+  (`job.json.<pid>.<thread>.<rand>.tmp`), then `os.replace`s it onto job.json. On `PermissionError` (Windows,
+  while a reader has the file open) it retries for about 1 s, then re-raises. The tmp file is always removed.
+- There is **no cross-process lock and no merge**: two writers would overwrite each other's changes (lost
+  update). So the **step-2 UI must never hold its own JobStore**. It reads job.json read-only, and it sends
+  `rerender` (and resume) requests through the worker, which runs them as the single writer.
+- A failed progress save inside a running stage is logged and ignored (it never aborts ffmpeg); the next
+  save brings job.json up to date.
+- When the pipeline deletes an output (cut.mp4 re-made, voice or captions regenerated), it resets the
+  dependent clip-lang stages to `pending` (progress 0) and sets `final` to null in the same step, so job.json
+  never points at a deleted file.
+
 ## 2. media builder
 
 ### `autoclipper/ffmpeg.py`
@@ -74,7 +90,7 @@ def cut_vertical(src: Path, dst: Path, start: float, end: float, *, width: int =
     # accurate seek, re-encode libx264 -crf 20 -preset veryfast, aac 192k 48 kHz stereo, +faststart;
     # if source has no audio, add anullsrc so cut.mp4 ALWAYS has an audio stream
 def ass_filter(ass_path: Path, fonts_dir: Path | None) -> str
-    # "subtitles=filename='<esc>':fontsdir='<esc>'" with filtergraph escaping that works for Windows
+    # "ass=filename='<esc>':shaping=complex:fontsdir='<esc>'" (complex shaping is required for Devanagari) with filtergraph escaping that works for Windows
     # paths (C:\ -> C\:/ ...) and spaces/quotes. Test with a path containing a space.
 def mix_burn(video: Path, dst: Path, *, voice: Path | None, ass: Path | None,
              original_volume: float, voice_volume: float, fonts_dir: Path | None,

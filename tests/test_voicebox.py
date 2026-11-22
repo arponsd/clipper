@@ -179,3 +179,88 @@ def test_implements_protocol():
 
     client, _ = make_client(lambda r: httpx.Response(200, json=[]))
     assert isinstance(client, VoiceboxAPI)
+
+
+# ----------------------------------------------------------------------------- FAILURES-6 cancel
+
+
+def _generating_server(cancel_status: int = 200):
+    reqs: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        reqs.append(req)
+        if req.url.path.endswith("/cancel"):
+            return httpx.Response(cancel_status, json={"message": "cancelled"})
+        return httpx.Response(200, json={"id": "g1", "status": "generating"})
+
+    return handler, reqs
+
+
+def _cancels(reqs: list[httpx.Request]) -> list[httpx.Request]:
+    return [r for r in reqs if r.url.path.endswith("/cancel")]
+
+
+def test_wait_timeout_sends_exactly_one_cancel():
+    handler, reqs = _generating_server()
+    client, _ = make_client(handler, timeout=3.0, poll=1.0)
+    with pytest.raises(VoiceboxError, match="did not finish within 3s") as ei:
+        client.wait("g1")
+    assert type(ei.value) is VoiceboxError
+    (cancel,) = _cancels(reqs)
+    assert cancel.method == "POST" and cancel.url.path == "/generate/g1/cancel"
+    assert reqs[-1] is cancel  # no polling after the cancel
+
+
+def test_wait_interrupt_sends_cancel_and_reraises():
+    handler, reqs = _generating_server()
+    client, clock = make_client(handler)
+
+    def interrupted_sleep(_s: float) -> None:
+        raise KeyboardInterrupt
+
+    client._sleep = interrupted_sleep
+    with pytest.raises(KeyboardInterrupt):
+        client.wait("g1")
+    assert [r.url.path for r in _cancels(reqs)] == ["/generate/g1/cancel"]
+
+
+def test_synthesize_interrupt_from_progress_callback_cancels(tmp_path: Path):
+    handler, reqs = _generating_server()
+    client, _ = make_client(handler)
+
+    def progress(f: float, msg: str) -> None:
+        if msg == "generating":
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        client.synthesize("hi", profile_id="p", language="en", engine="e", dst=tmp_path / "v.wav",
+                          on_progress=progress)
+    assert len(_cancels(reqs)) == 1
+
+
+@pytest.mark.parametrize("failure", ["http500", "connect"])
+def test_cancel_is_best_effort(failure):
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/cancel"):
+            if failure == "connect":
+                raise httpx.ConnectError("gone", request=req)
+            return httpx.Response(500, text="boom")
+        return httpx.Response(200, json={"status": "generating"})
+
+    client, _ = make_client(handler, timeout=1.0)
+    assert client.cancel("g1") is False
+    with pytest.raises(VoiceboxError, match="did not finish"):  # timeout error still wins
+        client.wait("g1")
+
+
+def test_failed_generation_is_not_cancelled():
+    reqs: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        reqs.append(req)
+        return httpx.Response(200, json={"status": "failed", "error": "Generation cancelled"})
+
+    client, _ = make_client(handler)
+    with pytest.raises(VoiceboxError, match="Generation cancelled"):
+        client.wait("g1")
+    assert _cancels(reqs) == []

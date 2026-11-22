@@ -17,6 +17,7 @@ from autoclipper.config import Settings, VoiceProfile
 from autoclipper.jobstore import JobStore
 from autoclipper.models import Moment, Word
 from autoclipper.pipeline import Deps, rerender, run_job
+from autoclipper.stages import captions as captions_stage
 from autoclipper.stages import render as render_stage
 from autoclipper.stages.captions import build_ass, make_captions
 from autoclipper.stages.render import render_final
@@ -89,7 +90,11 @@ def test_resume_after_failed_downstream_rebuilds_stale_outputs(video: Path, fail
             mp.setattr(render_stage, "render_final", boom)
             tr = FakeTranscriber(duration=40)
         else:
-            tr = FailingTranscriber(duration=40)
+            # ASR errors now fall back to even word spread (FAILURES-7), so fail captions directly.
+            def boom_captions(**_kw):
+                raise RuntimeError("captions exploded")
+            mp.setattr(captions_stage, "make_captions", boom_captions)
+            tr = FakeTranscriber(duration=40)
         vb2 = FakeVoicebox()
         st2 = run_job("", settings=s, deps=deps(voicebox=vb2, transcriber=tr), job_id=job_id,
                       langs=["en"], log=quiet)
@@ -428,3 +433,371 @@ def test_pipeline_uses_aligned_words_for_en_and_hi(video: Path) -> None:
         for k, w in enumerate(ws):
             assert (w["start"], w["end"]) == pytest.approx((0.2 + 0.4 * k, 0.5 + 0.4 * k)), (lang, k, w)
         _assert_monotonic(ws)
+
+
+# =============================================================================================
+# Second review round (docs/TEAM_LOG.md, "Team Lead (triage)" #2) - fixer_a
+# =============================================================================================
+import os  # noqa: E402
+import threading  # noqa: E402
+
+from autoclipper import jobstore as jobstore_mod  # noqa: E402
+from autoclipper import pipeline as pipeline_mod  # noqa: E402
+from autoclipper.models import Job, StageState  # noqa: E402
+from autoclipper.pipeline import PipelineError  # noqa: E402
+
+
+# ------------------------------------------------------------------------------- PIPELINE-1
+def test_concurrent_saves_from_two_jobstores_never_collide() -> None:
+    first = JobStore.create("src.mp4")
+    job_id = first.job.id
+    stores = [JobStore.load(job_id), JobStore.load(job_id)]
+    errors: list[BaseException] = []
+    bad_reads: list[str] = []
+    stop = threading.Event()
+
+    def writer(store: JobStore, n: int) -> None:
+        try:
+            for i in range(200):
+                store.job.stages["ingest"].progress = (i % 100) / 100
+                store.job.stages["ingest"].message = f"writer {n} save {i}"
+                store.save()
+        except BaseException as e:  # noqa: BLE001 - the test reports any error
+            errors.append(e)
+
+    def reader() -> None:
+        path = first.dir / "job.json"
+        while not stop.is_set():
+            text = path.read_text(encoding="utf-8")
+            try:
+                Job.model_validate_json(text)
+            except ValueError:
+                bad_reads.append(text)
+
+    threads = [threading.Thread(target=writer, args=(s, n)) for n, s in enumerate(stores)]
+    r = threading.Thread(target=reader)
+    r.start()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    stop.set()
+    r.join()
+    assert errors == []
+    assert bad_reads == []
+    Job.model_validate_json((first.dir / "job.json").read_text(encoding="utf-8"))
+    assert list(first.dir.glob("*.tmp")) == []  # no tmp files left behind
+
+
+def test_concurrent_saves_from_two_processes_never_collide() -> None:
+    """QA: the in-process RLock serializes threads, so the thread test above also passes with the old
+    shared `job.json.tmp`. The real PIPELINE-1 race is two processes (worker + CLI rerender) saving
+    one job. With a shared tmp name one process's os.replace steals the other's tmp file
+    (FileNotFoundError); unique tmp names make that impossible."""
+    import sys
+
+    first = JobStore.create("src.mp4")
+    code = (
+        "from autoclipper.jobstore import JobStore\n"
+        f"s = JobStore.load({first.job.id!r})\n"
+        "for i in range(400):\n"
+        "    s.job.stages['ingest'].message = str(i)\n"
+        "    s.save()\n"
+    )
+    procs = [subprocess.Popen([sys.executable, "-c", code], stderr=subprocess.PIPE, text=True)
+             for _ in range(3)]
+    errs = [p.communicate(timeout=120)[1] for p in procs]
+    assert [p.returncode for p in procs] == [0, 0, 0], "\n".join(e[-500:] for e in errs if e)
+    Job.model_validate_json((first.dir / "job.json").read_text(encoding="utf-8"))
+    assert list(first.dir.glob("*.tmp")) == []
+
+
+def test_save_removes_its_tmp_file_when_replace_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    store = JobStore.create("src.mp4")
+
+    def broken(_src, _dst):
+        raise OSError("disk on fire")
+
+    monkeypatch.setattr(jobstore_mod.os, "replace", broken)
+    with pytest.raises(OSError, match="disk on fire"):
+        store.save()
+    assert list(store.dir.glob("*.tmp")) == []
+
+
+# ------------------------------------------------------------------------------- WINDOWS-2
+def test_save_retries_replace_on_permission_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    store = JobStore.create("src.mp4")
+    real_replace = os.replace
+    calls = {"n": 0}
+
+    def flaky(src, dst):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise PermissionError(13, "The process cannot access the file (WinError 32)")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(jobstore_mod, "REPLACE_RETRY_DELAY", 0.0)
+    monkeypatch.setattr(jobstore_mod.os, "replace", flaky)
+    store.job.error = "after retry"
+    store.save()
+    assert calls["n"] == 2
+    assert JobStore.load(store.job.id).job.error == "after retry"
+    assert list(store.dir.glob("*.tmp")) == []
+
+
+def test_save_gives_up_after_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    store = JobStore.create("src.mp4")
+    calls = {"n": 0}
+
+    def locked(_src, _dst):
+        calls["n"] += 1
+        raise PermissionError(13, "Access is denied")
+
+    monkeypatch.setattr(jobstore_mod, "REPLACE_RETRY_DELAY", 0.0)
+    monkeypatch.setattr(jobstore_mod.os, "replace", locked)
+    with pytest.raises(PermissionError):
+        store.save()
+    assert calls["n"] == jobstore_mod.REPLACE_RETRIES
+    assert list(store.dir.glob("*.tmp")) == []
+
+
+def test_progress_callback_swallows_save_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    store = JobStore.create("src.mp4")
+    logs: list[str] = []
+    rep = pipeline_mod._Reporter(store, logs.append)
+    on_progress = rep.progress("ingest")
+
+    def failing_set_stage(*_a, **_k):
+        raise PermissionError(13, "job.json is locked")
+
+    monkeypatch.setattr(store, "set_stage", failing_set_stage)
+    on_progress(0.5, "halfway")  # must not raise (it would abort ffmpeg)
+    on_progress(1.0, "end")
+    assert any("could not save progress" in line for line in logs)
+
+
+# ------------------------------------------------------------------------------- PIPELINE-2
+def test_recut_clip_regenerates_voice_captions_and_render(video: Path) -> None:
+    s = make_settings(count=2)
+    store = run_job(str(video), settings=s, deps=deps(), langs=["en"], log=quiet)
+    job_id = store.job.id
+    cut0 = store.clip_dir(0) / "cut.mp4"
+    final0 = store.clip_dir(0, "en") / "final.mp4"
+    final1 = store.clip_dir(1, "en") / "final.mp4"
+    script0 = (store.clip_dir(0, "en") / "script.json").read_bytes()
+    before0, before1 = final0.stat().st_mtime_ns, final1.stat().st_mtime_ns
+    cut0.unlink()
+
+    vb = FakeVoicebox()
+    llm = FakeLLM()
+    again = run_job("", settings=s, deps=deps(llm=llm, voicebox=vb), job_id=job_id, langs=["en"], log=quiet)
+    assert again.job.status == "done"
+    # clip 0 was re-cut, so its voice was regenerated (and only clip 0's)
+    assert vb.calls, "clip 0 was re-cut, so its voice must be generated again"
+    assert {Path(c["dst"]).parent.parent.name for c in vb.calls} == {"00"}
+    assert final0.stat().st_mtime_ns != before0
+    assert final1.stat().st_mtime_ns == before1
+    assert (store.clip_dir(0, "en") / "script.json").read_bytes() == script0  # script kept
+    assert not any(c[0] == "write_script" for c in llm.calls)
+    st = again.job.clips[0].langs["en"]
+    assert st.error is None and st.final == "clips/00/en/final.mp4"
+    assert all(x.status == "done" for x in st.stages.values() if x is not st.stages["script"])
+
+
+def test_recut_resets_downstream_state_before_voice_runs(video: Path) -> None:
+    s = make_settings()
+    store = run_job(str(video), settings=s, deps=deps(), langs=["en"], log=quiet)
+    (store.clip_dir(0) / "cut.mp4").unlink()
+    with pytest.raises(KeyboardInterrupt):
+        run_job("", settings=s, deps=deps(voicebox=InterruptingVoicebox()), job_id=store.job.id,
+                langs=["en"], log=quiet)
+    j = _job_json(store.job.id)
+    ls = j["clips"][0]["langs"]["en"]
+    assert ls["final"] is None
+    assert ls["stages"]["captions"]["status"] == "pending"
+    assert ls["stages"]["render"]["status"] == "pending"
+    d = store.clip_dir(0, "en")
+    for name in ("voice.json", "words.json", "captions.ass", "final.mp4"):
+        assert not (d / name).exists(), name
+    assert (d / "script.json").exists()
+
+
+# ------------------------------------------------------------------------------- PIPELINE-3
+def test_failed_voice_regeneration_resets_captions_and_render(video: Path) -> None:
+    s = make_settings()
+    store = run_job(str(video), settings=s, deps=deps(), langs=["en"], log=quiet)
+    d = store.clip_dir(0, "en")
+    script = json.loads((d / "script.json").read_text(encoding="utf-8"))
+    script["narration"] = "a new narration that needs a new voice"
+    (d / "script.json").write_text(json.dumps(script), encoding="utf-8")
+
+    seen: list[dict] = []
+
+    class Spy(FakeVoicebox):
+        def synthesize(self, *a, **kw):
+            seen.append(_job_json(store.job.id)["clips"][0]["langs"]["en"])  # state while voice runs
+            raise RuntimeError("voicebox down")
+
+    run_job("", settings=s, deps=deps(voicebox=Spy()), job_id=store.job.id, langs=["en"], log=quiet)
+    for ls in (seen[0], _job_json(store.job.id)["clips"][0]["langs"]["en"]):
+        assert ls["final"] is None
+        assert ls["stages"]["captions"]["status"] not in ("done", "skipped")
+        assert ls["stages"]["render"]["status"] not in ("done", "skipped")
+        assert ls["stages"]["captions"]["progress"] == 0.0
+    assert not (d / "final.mp4").exists()
+
+
+def test_captions_regeneration_resets_render(video: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    s = make_settings()
+    store = run_job(str(video), settings=s, deps=deps(), langs=["en"], log=quiet)
+    (store.clip_dir(0, "en") / "captions.ass").unlink()
+
+    def boom_captions(**_kw):
+        raise RuntimeError("captions exploded")
+
+    monkeypatch.setattr(captions_stage, "make_captions", boom_captions)
+    run_job("", settings=s, deps=deps(), job_id=store.job.id, langs=["en"], log=quiet)
+    ls = _job_json(store.job.id)["clips"][0]["langs"]["en"]
+    assert ls["error"].startswith("captions:")
+    assert ls["final"] is None
+    assert ls["stages"]["render"]["status"] == "pending" and ls["stages"]["render"]["progress"] == 0.0
+    assert not (store.clip_dir(0, "en") / "final.mp4").exists()
+
+
+# ------------------------------------------------------------------------------- PIPELINE-4
+class InterruptOnSecondCall(FakeVoicebox):
+    def synthesize(self, text, **kw):
+        if len(self.calls) >= 1:
+            raise KeyboardInterrupt
+        return super().synthesize(text, **kw)
+
+
+def test_rerender_keeps_failed_status_while_clips_are_unfinished(video: Path) -> None:
+    s = make_settings(count=2)
+    with pytest.raises(KeyboardInterrupt):
+        run_job(str(video), settings=s, deps=deps(voicebox=InterruptOnSecondCall()), langs=["en"], log=quiet)
+    [job_id] = JobStore.list_ids()
+    j = _job_json(job_id)
+    assert j["status"] == "failed"
+    assert j["clips"][0]["langs"]["en"]["error"] is None  # clip 0 finished, clip 1 interrupted
+
+    rerender(job_id, 0, "en", settings=s, deps=deps(), log=quiet)
+    j = _job_json(job_id)
+    assert j["status"] == "failed" and j["error"] == "interrupted"
+
+
+def test_rerender_marks_job_done_when_everything_is_finished(video: Path) -> None:
+    s = make_settings()
+    store = run_job(str(video), settings=s, deps=deps(), langs=["en"], log=quiet)
+    store.job.status = "failed"
+    store.job.error = "earlier failure"
+    store.save()
+    rerender(store.job.id, 0, "en", settings=s, deps=deps(), log=quiet)
+    j = _job_json(store.job.id)
+    assert j["status"] == "done" and j["error"] is None
+
+
+# ------------------------------------------------------------------------------- PIPELINE-5
+def test_rerender_unknown_language_leaves_no_phantom_state(video: Path) -> None:
+    s = make_settings()
+    store = run_job(str(video), settings=s, deps=deps(), langs=["en"], log=quiet)
+    with pytest.raises(PipelineError, match="script.json not found"):
+        rerender(store.job.id, 0, "hi", settings=s, deps=deps(), log=quiet)
+    j = _job_json(store.job.id)
+    assert set(j["clips"][0]["langs"]) == {"en"}
+    assert not (store.dir / "clips" / "00" / "hi").exists()
+
+
+# ------------------------------------------------------------------------------- FAILURES-3
+def test_truncated_moments_json_is_moved_aside_and_regenerated(video: Path) -> None:
+    s = make_settings()
+    store = run_job(str(video), settings=s, deps=deps(), langs=["en"], log=quiet)
+    moments = store.dir / "moments.json"
+    good = moments.read_text(encoding="utf-8")
+    moments.write_text(good[: len(good) // 2], encoding="utf-8")  # torn write
+    logs: list[str] = []
+    llm = FakeLLM()
+    again = run_job("", settings=s, deps=deps(llm=llm), job_id=store.job.id, langs=["en"], log=logs.append)
+    assert again.job.status == "done"
+    assert (store.dir / "moments.json.corrupt").read_text(encoding="utf-8") == good[: len(good) // 2]
+    assert json.loads(moments.read_text(encoding="utf-8"))  # valid again
+    assert any(c[0] == "pick_moments" for c in llm.calls)
+    assert any("moments.json is corrupt" in line for line in logs)
+
+
+def test_invalid_moment_entries_are_treated_as_corrupt(video: Path) -> None:
+    s = make_settings()
+    store = run_job(str(video), settings=s, deps=deps(), langs=["en"], log=quiet)
+    (store.dir / "moments.json").write_text('[{"start": "soon"}]', encoding="utf-8")
+    again = run_job("", settings=s, deps=deps(), job_id=store.job.id, langs=["en"], log=quiet)
+    assert again.job.status == "done"
+    assert (store.dir / "moments.json.corrupt").exists()
+
+
+def test_truncated_transcript_json_is_moved_aside_and_regenerated(video: Path) -> None:
+    s = make_settings()
+    store = run_job(str(video), settings=s, deps=deps(), langs=["en"], log=quiet)
+    tr = store.dir / "transcript.json"
+    tr.write_text(tr.read_text(encoding="utf-8")[:100], encoding="utf-8")
+    transcriber = FakeTranscriber(duration=40)
+    again = run_job("", settings=s, deps=deps(transcriber=transcriber), job_id=store.job.id, langs=["en"],
+                    log=quiet)
+    assert again.job.status == "done"
+    assert (store.dir / "transcript.json.corrupt").exists()
+    assert any(Path(a).name == "audio.wav" for a, _ in transcriber.calls)
+
+
+# ------------------------------------------------------------------------------- WINDOWS-1
+def test_check_fonts_finds_windows_system_fonts(tmp_path: Path) -> None:
+    assets = tmp_path / "assets_fonts"
+    assets.mkdir()
+    system = tmp_path / "system"
+    system.mkdir()
+    (system / "NotoSans-Regular.ttf").write_bytes(b"x")
+    (system / "NotoSansDevanagari-Regular.ttf").write_bytes(b"x")
+    c = cli.check_fonts(which=lambda _n: None, fonts_dir=assets, system_font_dirs=[system])
+    assert c.level == "ok", c.detail
+    assert "Noto Sans (system)" in c.detail and "Noto Sans Devanagari (system)" in c.detail
+    # only the Devanagari face: Noto Sans itself is still missing
+    (system / "NotoSans-Regular.ttf").unlink()
+    miss = cli.check_fonts(which=lambda _n: None, fonts_dir=assets, system_font_dirs=[system])
+    assert miss.level == "fail" and "Noto Sans" in miss.detail
+
+
+def test_windows_font_dirs_from_environment() -> None:
+    dirs = cli.windows_font_dirs({"WINDIR": r"C:\Windows", "LOCALAPPDATA": r"C:\Users\u\AppData\Local"})
+    assert [d.as_posix() for d in dirs] == [Path(r"C:\Windows").joinpath("Fonts").as_posix(),
+                                           Path(r"C:\Users\u\AppData\Local", "Microsoft", "Windows",
+                                                "Fonts").as_posix()]
+
+
+# ------------------------------------------------------------------------------- FAILURES-8
+def test_llm_max_tokens_setting(capsys: pytest.CaptureFixture[str]) -> None:
+    from autoclipper.config import load_settings
+
+    assert Settings().llm.max_tokens == 16000
+    assert cli.main(["settings", "set", "llm.max_tokens=32000"]) == 0
+    assert load_settings().llm.max_tokens == 32000
+    for bad in ("llm.max_tokens=100", "llm.max_tokens=100000", "llm.max_tokens=lots"):
+        assert cli.main(["settings", "set", bad]) == 1
+        assert "llm.max_tokens" in capsys.readouterr().err
+    assert load_settings().llm.max_tokens == 32000
+
+
+# ------------------------------------------------------------------------------- TESTS-2
+def test_suite_guard_blocks_real_clients_and_network() -> None:
+    import socket
+
+    assert not any(k.startswith("ANTHROPIC_") for k in os.environ)
+    with pytest.raises(RuntimeError, match="real client in tests"):
+        pipeline_mod._make_llm(Settings())
+    with pytest.raises(RuntimeError, match="network access in tests is blocked"):
+        socket.create_connection(("192.0.2.1", 443), timeout=0.5)
+
+
+@pytest.mark.real_clients
+def test_real_clients_marker_lifts_the_factory_guard() -> None:
+    from autoclipper.voicebox import VoiceboxClient
+
+    client = pipeline_mod._make_voicebox(Settings())  # builds the client object only; no request is made
+    assert isinstance(client, VoiceboxClient)

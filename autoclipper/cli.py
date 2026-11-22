@@ -340,18 +340,43 @@ def _font_files(fonts_dir: Path) -> list[str]:
             if p.suffix.lower() in (".ttf", ".otf")]
 
 
+def _family_in_stems(family: str, stems: list[str]) -> bool:
+    key = family.replace(" ", "").lower()
+    if family == "Noto Sans":
+        return any(s.startswith(key) and not s.startswith(key + "devanagari") for s in stems)
+    return any(s.startswith(key) for s in stems)
+
+
+def windows_font_dirs(environ: Mapping[str, str] | None = None) -> list[Path]:
+    """%WINDIR%\\Fonts (all users) and %LOCALAPPDATA%\\Microsoft\\Windows\\Fonts (current user)."""
+    env = os.environ if environ is None else environ
+    dirs = [Path(env.get("WINDIR") or env.get("SystemRoot") or r"C:\Windows") / "Fonts"]
+    if env.get("LOCALAPPDATA"):
+        dirs.append(Path(env["LOCALAPPDATA"]) / "Microsoft" / "Windows" / "Fonts")
+    return dirs
+
+
 def check_fonts(run: Runner = _run_cmd, which: Callable[[str], str | None] = shutil.which,
-                fonts_dir: Path = FONTS_DIR) -> Check:
+                fonts_dir: Path = FONTS_DIR, system_font_dirs: Sequence[Path] | None = None) -> Check:
+    """Fonts are found in assets/fonts, then (Windows, no fc-list) the Windows font folders by file
+    name, then through fc-list. `system_font_dirs` defaults to the Windows folders when os.name == 'nt'."""
     found: dict[str, str] = {}
     stems = _font_files(fonts_dir)
     for family in REQUIRED_FONTS:
-        key = family.replace(" ", "").lower()
-        if family == "Noto Sans":
-            hit = any(s.startswith(key) and not s.startswith(key + "devanagari") for s in stems)
-        else:
-            hit = any(s.startswith(key) for s in stems)
-        if hit:
+        if _family_in_stems(family, stems):
             found[family] = "assets/fonts"
+    if system_font_dirs is None:
+        system_font_dirs = windows_font_dirs() if os.name == "nt" else []
+    if len(found) < len(REQUIRED_FONTS) and system_font_dirs:
+        sys_stems: list[str] = []
+        for d in system_font_dirs:
+            try:
+                sys_stems += _font_files(Path(d))
+            except OSError:  # unreadable folder: treat as empty
+                pass
+        for family in REQUIRED_FONTS:
+            if family not in found and _family_in_stems(family, sys_stems):
+                found[family] = "system"
     fc = which("fc-list")
     if fc and len(found) < len(REQUIRED_FONTS):
         try:

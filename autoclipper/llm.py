@@ -17,6 +17,11 @@ from .models import ClipScript, Moment
 
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
 DEFAULT_MAX_TOKENS = 16000
+SHORTEN_MAX_TOKENS = 8000
+# The SDK refuses non-streaming calls it expects to take longer than ~10 min (max_tokens above
+# about 21333) unless an explicit timeout is passed.
+_NON_STREAMING_TOKEN_LIMIT = 21333
+_LONG_REQUEST_TIMEOUT = 1800.0  # seconds
 
 LANGUAGE_NAMES = {"en": "English", "hi": "Hindi"}
 
@@ -162,8 +167,15 @@ class AnthropicLLM:
 
     # ---- low level
 
+    @property
+    def max_tokens(self) -> int:
+        """Token budget for moments/scripts: llm.max_tokens from settings (default 16000)."""
+        return int(getattr(self.settings, "max_tokens", DEFAULT_MAX_TOKENS) or DEFAULT_MAX_TOKENS)
+
     def complete_json(self, *, system: str, user: str, schema: dict,
-                      max_tokens: int = DEFAULT_MAX_TOKENS) -> dict:
+                      max_tokens: int | None = None) -> dict:
+        if max_tokens is None:
+            max_tokens = self.max_tokens
         kwargs: dict[str, Any] = dict(
             model=self.settings.model,
             max_tokens=max_tokens,
@@ -172,6 +184,8 @@ class AnthropicLLM:
             output_config={"effort": self.settings.effort,
                            "format": {"type": "json_schema", "schema": schema}},
         )
+        if max_tokens > _NON_STREAMING_TOKEN_LIMIT:
+            kwargs["timeout"] = _LONG_REQUEST_TIMEOUT
         try:
             if self.settings.use_fallbacks:
                 resp = self.client.beta.messages.create(**kwargs, betas=[FALLBACK_BETA],
@@ -189,8 +203,8 @@ class AnthropicLLM:
             raise LLMRefusal("Claude declined this request" + (f" ({detail})" if detail else "")
                              + "; try a different video or moment")
         if stop == "max_tokens":
-            raise LLMTruncated(f"Claude's answer was cut off at max_tokens={max_tokens}; "
-                               "retry with a shorter input or a larger max_tokens")
+            raise LLMTruncated(f"Claude's answer was cut off at max_tokens={max_tokens}; raise it with "
+                               "`autoclipper settings set llm.max_tokens=32000` or lower llm.effort")
 
         text = "".join(getattr(b, "text", "") or "" for b in (getattr(resp, "content", None) or [])
                        if getattr(b, "type", None) == "text").strip()
@@ -255,7 +269,7 @@ class AnthropicLLM:
             f"<narration>\n{narration}\n</narration>"
         )
         data = self.complete_json(system=SHORTEN_SYSTEM, user=user, schema=SHORTEN_SCHEMA,
-                                  max_tokens=8000)
+                                  max_tokens=min(SHORTEN_MAX_TOKENS, self.max_tokens))
         text = str(data.get("narration") or "").strip()
         if not text:
             raise LLMError("Claude returned an empty shortened narration")

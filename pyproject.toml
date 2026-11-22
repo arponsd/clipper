@@ -26,7 +26,11 @@ build-backend = "hatchling.build"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["slow: needs real models or network"]
+addopts = "-m 'not slow'"
+markers = [
+    "slow: needs real models or network (skipped by default; run with `uv run pytest -m slow`)",
+    "real_clients: lets the test use pipeline._make_llm/_make_voicebox/_make_transcriber (blocked by conftest otherwise)",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["autoclipper"]

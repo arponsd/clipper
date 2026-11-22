@@ -78,6 +78,17 @@ def _copy_local(source: str, job_dir: Path, on_progress: ProgressFn | None) -> P
     return dst
 
 
+def _reject(path: Path) -> Path | None:
+    """Move an unusable download aside as ``source.rejected.<ext>`` so find_source skips it."""
+    dst = path.with_name(f"source.rejected{path.suffix}")
+    try:
+        os.replace(path, dst)
+        return dst
+    except OSError:
+        path.unlink(missing_ok=True)
+        return None
+
+
 def _download(url: str, job_dir: Path, on_progress: ProgressFn | None) -> Path:
     import yt_dlp  # imported lazily: heavy, and tests monkeypatch yt_dlp.YoutubeDL
 
@@ -113,7 +124,11 @@ def _download(url: str, job_dir: Path, on_progress: ProgressFn | None) -> Path:
     path = find_source(job_dir)
     if path is None:
         raise IngestError(f"yt-dlp finished but no source file was written to {job_dir} for {url}")
-    _check_has_video(path)
+    try:
+        _check_has_video(path)
+    except IngestError:
+        _reject(path)
+        raise
     _report(on_progress, 1.0, "downloaded")
     return path
 
@@ -123,6 +138,12 @@ def ingest(source: str, job_dir: Path, *, on_progress: ProgressFn | None = None)
     job_dir = Path(job_dir)
     existing = find_source(job_dir)
     if existing is not None:
+        try:
+            _check_has_video(existing)
+        except IngestError as e:
+            raise IngestError(
+                f"{existing.name} in {job_dir} has no video stream; delete it or start a new job ({e})"
+            ) from e
         _report(on_progress, 1.0, "source already present")
         return existing
     if not source or not source.strip():

@@ -215,3 +215,40 @@ def test_cut_clip_bad_range(video, tmp_path):
 
 def test_ingest_module_format_constant():
     assert ingest_mod.YTDLP_FORMAT == "bv*[height<=1080]+ba/b[height<=1080]/b"
+
+
+# --------------------------------------------------------------------------- FAILURES-4 audio-only downloads
+
+
+@pytest.fixture
+def audio_only_ydl(monkeypatch, tmp_path):
+    from fakes import make_tone
+
+    FakeYDL.instances = []
+    FakeYDL.sample = make_tone(tmp_path / "audio_only.m4a.wav", 1.0)
+    FakeYDL.fail = False
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", FakeYDL)
+    return FakeYDL
+
+
+def test_audio_only_download_is_moved_aside(audio_only_ydl, tmp_path):
+    job = tmp_path / "job"
+    with pytest.raises(IngestError, match="no video stream"):
+        ingest("https://example.com/podcast", job)
+    assert find_source(job) is None
+    assert (job / "source.rejected.mp4").is_file()
+    assert not (job / "source.mp4").exists()
+    # a retry downloads again instead of reusing the audio-only file
+    with pytest.raises(IngestError, match="no video stream"):
+        ingest("https://example.com/podcast", job)
+    assert len(audio_only_ydl.instances) == 2
+
+
+def test_existing_audio_only_source_gives_clear_error(tmp_path):
+    from fakes import make_tone
+
+    job = tmp_path / "job"
+    job.mkdir()
+    make_tone(job / "source.wav", 1.0)  # e.g. left over from an older version
+    with pytest.raises(IngestError, match=r"source\.wav .*has no video stream; delete it or start a new job"):
+        ingest("https://example.com/x", job)

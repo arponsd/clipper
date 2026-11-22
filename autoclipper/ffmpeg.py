@@ -16,6 +16,7 @@ import shlex
 import shutil
 import subprocess
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path, PurePath, PureWindowsPath
@@ -44,6 +45,7 @@ __all__ = [
 ]
 
 STDERR_TAIL_LINES = 20
+_REPLACE_RETRY_SECONDS = 1.0
 FONT_SUFFIXES = {".ttf", ".otf", ".ttc", ".otc"}
 _INSTALL_HINT = (
     "install FFmpeg and make sure it is on PATH "
@@ -62,6 +64,7 @@ class MediaInfo:
     height: int | None
     has_video: bool
     has_audio: bool
+    audio_channels: int = 0  # channels of the first audio stream (0 = none/unknown)
 
 
 # --------------------------------------------------------------------------- binaries / running
@@ -208,10 +211,26 @@ class _AtomicOutput:
         return self.tmp
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        if exc_type is None:
-            os.replace(self.tmp, self.dst)
-        else:
+        if exc_type is not None:
             self.tmp.unlink(missing_ok=True)
+            return
+        # On Windows os.replace fails while another program (a video player) has dst open.
+        deadline = time.monotonic() + _REPLACE_RETRY_SECONDS
+        while True:
+            try:
+                os.replace(self.tmp, self.dst)
+                return
+            except PermissionError as e:
+                if time.monotonic() < deadline:
+                    time.sleep(0.1)
+                    continue
+                err: OSError = e
+            except OSError as e:
+                err = e
+            break
+        self.tmp.unlink(missing_ok=True)
+        raise FFmpegError(f"could not replace {self.dst.name}: is it open in another program "
+                          f"(e.g. a video player)? Close it and retry ({err})") from err
 
 
 # --------------------------------------------------------------------------- probing
@@ -259,7 +278,14 @@ def probe(path: Path) -> MediaInfo:
     if video:
         width = int(video[0]["width"]) if video[0].get("width") else None
         height = int(video[0]["height"]) if video[0].get("height") else None
-    return MediaInfo(duration=dur, width=width, height=height, has_video=bool(video), has_audio=bool(audio))
+    channels = 0
+    if audio:
+        try:
+            channels = int(audio[0].get("channels") or 0)
+        except (TypeError, ValueError):
+            channels = 0
+    return MediaInfo(duration=dur, width=width, height=height, has_video=bool(video), has_audio=bool(audio),
+                     audio_channels=channels)
 
 
 def duration(path: Path) -> float:
@@ -363,6 +389,10 @@ def reframe_filter(mode: Literal["crop", "blur"], width: int, height: int) -> st
 _X264 = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"]
 _AAC = ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]
 _SILENCE = "anullsrc=channel_layout=stereo:sample_rate=48000"
+# Mono -> stereo at unity gain on both channels (ffmpeg's implicit upmix puts mono at -3 dB per side).
+_MONO_TO_STEREO = "aformat=channel_layouts=mono,pan=stereo|c0=c0|c1=c0"
+# Final safety limiter: peaks stay below 0 dBFS. level=0 turns off auto-level (no make-up gain).
+_LIMITER = "alimiter=limit=0.97:level=0"
 
 
 def cut_vertical(
@@ -435,8 +465,15 @@ def _abs(path: PurePath) -> PurePath:
 
 
 def ass_filter(ass_path: PurePath, fonts_dir: PurePath | None) -> str:
-    """``subtitles=filename='...'[:fontsdir='...']`` with paths escaped for the filtergraph."""
-    text = f"subtitles=filename={escape_filter_path(_abs(ass_path))}"
+    """``ass=filename='...':shaping=complex[:fontsdir='...']`` with paths escaped for the filtergraph.
+
+    The ``ass`` filter is used instead of ``subtitles`` because only it exposes ``shaping``. With
+    the default shaper some libass/FFmpeg builds (Ubuntu FFmpeg 7.1 + libass 0.17) shape simply,
+    which breaks Devanagari: the i-matra is not reordered and conjuncts show a visible virama
+    (भविष्य -> "भवष्ि्य", खत्म -> "खत्‌म"). Complex (HarfBuzz) shaping fixes it and is a no-op
+    for Latin text.
+    """
+    text = f"ass=filename={escape_filter_path(_abs(ass_path))}:shaping=complex"
     if fonts_dir is not None:
         text += f":fontsdir={escape_filter_path(_abs(fonts_dir))}"
     return text
@@ -485,9 +522,11 @@ def mix_burn(
         inputs += 1
     if info.has_audio:
         orig = "[0:a]"
+        orig_stereo = _MONO_TO_STEREO if info.audio_channels == 1 else "aformat=channel_layouts=stereo"
     else:
         args += ["-f", "lavfi", "-i", _SILENCE]
         orig = f"[{inputs}:a]"
+        orig_stereo = "aformat=channel_layouts=stereo"
         inputs += 1
 
     parts: list[str] = []
@@ -497,11 +536,14 @@ def mix_burn(
     else:
         video_map = "0:v:0"
     if voice_idx is not None:
-        parts.append(f"{orig}volume={_num(original_volume)}[a0]")
-        parts.append(f"[{voice_idx}:a]volume={_num(voice_volume)},apad[a1]")
-        parts.append("[a0][a1]amix=inputs=2:normalize=0:duration=first[a]")
+        # The voice is downmixed to mono and copied to both channels, so voice_volume=1.0 is unity.
+        # No apad: amix duration=first already keeps the original running after the voice ends, and
+        # an endless apad input with -t intermittently deadlocks ffmpeg 7.1 under load.
+        parts.append(f"{orig}{orig_stereo},volume={_num(original_volume)}[a0]")
+        parts.append(f"[{voice_idx}:a]{_MONO_TO_STEREO},volume={_num(voice_volume)}[a1]")
+        parts.append(f"[a0][a1]amix=inputs=2:normalize=0:duration=first,{_LIMITER}[a]")
     else:
-        parts.append(f"{orig}volume={_num(original_volume)}[a]")
+        parts.append(f"{orig}{orig_stereo},volume={_num(original_volume)},{_LIMITER}[a]")
 
     total = duration if duration is not None else info.duration
     with _AtomicOutput(dst) as tmp:

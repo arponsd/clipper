@@ -41,7 +41,7 @@ uv sync
 
 ### 2. FFmpeg (with libass)
 
-Captions are burned in with FFmpeg's `subtitles` filter, so the FFmpeg build must include libass.
+Captions are burned in with FFmpeg's `ass` filter with `shaping=complex` (HarfBuzz shaping, needed for correct Devanagari conjuncts and vowel signs), so the FFmpeg build must include libass.
 
 - **Linux (Debian/Ubuntu):** `sudo apt install ffmpeg`
 - **Windows:** `winget install Gyan.FFmpeg` installs the gyan.dev "full" build. You can also download it from https://www.gyan.dev/ffmpeg/builds/ and add its `bin` folder to `PATH`.
@@ -55,11 +55,12 @@ You can install them in either of two ways:
 - **Project-local (works the same on every OS):** download *Noto Sans* and *Noto Sans Devanagari* from Google Fonts and copy the `.ttf` files (for example `NotoSans-Regular.ttf`, `NotoSans-Bold.ttf`, `NotoSansDevanagari-Regular.ttf`, `NotoSansDevanagari-Bold.ttf`) into `assets/fonts/`. When that folder holds fonts, FFmpeg is pointed at it with `fontsdir`.
 - **System-wide:**
   - Linux: `sudo apt install fonts-noto-core` (or `fonts-noto`). Then check with `fc-list | grep -i "Noto Sans Devanagari"`.
-  - Windows: right-click the `.ttf` files and choose **Install for all users**.
+  - Windows: right-click the `.ttf` files and choose **Install for all users** (or plain **Install** for your user only). `autoclipper doctor` finds them by file name in `%WINDIR%\Fonts` and `%LOCALAPPDATA%\Microsoft\Windows\Fonts` (Windows has no `fc-list`).
 
 ### 4. Voicebox (local text to speech)
 
 1. Install Voicebox from its releases page (desktop app) or run its server, following the Voicebox README.
+   **Linux:** the releases have no Linux AppImage, so run the backend from source (`python -m backend.main` in its own venv). The exact steps used on the dev machine are in the "Ops (Voicebox)" notes in `docs/TEAM_LOG.md`.
 2. Start it. Auto Clipper expects it at `http://127.0.0.1:17493`. To use another address, change it with `autoclipper settings set voicebox.url=http://host:port`.
 3. In Voicebox, create one voice profile for English and one for Hindi. Hindi uses the multilingual **Chatterbox** engine.
 4. Find the profile ids and save them in the settings:
@@ -71,7 +72,25 @@ You can install them in either of two ways:
    uv run autoclipper settings set voicebox.english.engine=chatterbox
    ```
 
+Engine notes:
+- Valid engine ids: `qwen`, `qwen_custom_voice`, `luxtts`, `chatterbox`, `chatterbox_turbo`, `tada`, `kokoro`.
+- `chatterbox` is **Chatterbox Multilingual** (23 languages, including `hi`). That is why it is the default for both languages.
+- `chatterbox_turbo` is English only. Never use it for Hindi.
+- A cloned profile needs a reference sample uploaded (in the Voicebox app, or `POST /profiles/{id}/samples`) before `chatterbox` can use it.
+- If every generation fails with `'NoneType' object is not callable`, the chatterbox venv is missing `setuptools<81` (resemble-perth imports `pkg_resources`). Install `setuptools<81` into the Voicebox venv.
+- On CPU, a 60 s narration takes a few minutes per language. If generations time out, raise the limit, for example `uv run autoclipper settings set voicebox.timeout_seconds=1200`.
+
 Auto Clipper calls these endpoints: `POST /generate {text, profile_id, language, engine}`, then it polls `GET /history/{id}` until the status is `completed`, then it fetches `GET /audio/{id}`. It reads the profile list from `GET /profiles`.
+
+### Windows: faster-whisper and NVIDIA GPUs
+
+With an NVIDIA GPU, faster-whisper (CTranslate2) needs the **CUDA 12 cuBLAS** and **cuDNN 9** runtime libraries, which pip does not install. Without them, transcription fails with errors such as `cublas64_12.dll is not found`. Either install those runtimes, or run on the CPU:
+
+```bash
+uv run autoclipper settings set whisper.device=cpu
+```
+
+With the default `whisper.device=auto`, Auto Clipper falls back to the CPU automatically when loading the CUDA libraries fails.
 
 ### 5. Anthropic credentials
 
@@ -206,8 +225,9 @@ Change settings with `autoclipper settings set key.path=value`. The value is par
 | `llm.effort` | `medium` | `low` / `medium` / `high` / `xhigh` / `max` |
 | `llm.use_fallbacks` | `true` | Server-side fallback if a request is declined |
 | `llm.api_key_env` | `ANTHROPIC_API_KEY` | Name of the environment variable that holds the key |
+| `llm.max_tokens` | `16000` | Output token budget per Claude call (1024-64000). Long sources (2 h+) at high effort may need more, e.g. `llm.max_tokens=32000` |
 | `whisper.model` | `small` | `tiny` / `base` / `small` / `medium` / `large-v3` |
-| `whisper.device` | `auto` | `auto` / `cpu` / `cuda` (auto uses CUDA only if a GPU is found) |
+| `whisper.device` | `auto` | `auto` / `cpu` / `cuda` (auto uses CUDA if a GPU is found, and falls back to CPU if the CUDA libraries fail to load) |
 | `whisper.compute_type` | `auto` | auto = `int8` on CPU, `float16` on CUDA |
 | `whisper.language` | `null` | Source language; `null` = auto-detect |
 | `voicebox.url` | `http://127.0.0.1:17493` | Voicebox server |
@@ -237,10 +257,11 @@ Change settings with `autoclipper settings set key.path=value`. The value is par
 ## Development
 
 ```bash
-uv run pytest -q
+uv run pytest -q        # fast suite; tests marked slow are skipped by default
+uv run pytest -m slow   # only the slow tests (real models or network)
 ```
 
-Tests never call the real Anthropic API, a real Voicebox server, or download whisper models or videos. They use the fakes in `tests/fakes.py` and a synthetic video made by ffmpeg. Each test gets its own data dir through `AUTOCLIPPER_DATA_DIR`, set in `tests/conftest.py`. Network or model tests must be marked `@pytest.mark.slow`.
+Tests never call the real Anthropic API, a real Voicebox server, or download whisper models or videos. They use the fakes in `tests/fakes.py` and a synthetic video made by ffmpeg. Each test gets its own data dir through `AUTOCLIPPER_DATA_DIR`, set in `tests/conftest.py`. The same conftest also guards the whole suite. It removes `ANTHROPIC_*` variables and points `HOME` at a temp dir. It makes `pipeline._make_llm/_make_voicebox/_make_transcriber` raise unless a test has `@pytest.mark.real_clients`, and it blocks socket connections to anything but loopback. Network or model tests must be marked `@pytest.mark.slow`.
 
 The pipeline gets its LLM, Voicebox client and transcriber injected (`autoclipper.pipeline.Deps`). When none are passed, the real clients are built lazily, and only when a stage actually needs them.
 

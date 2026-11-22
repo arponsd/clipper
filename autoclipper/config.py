@@ -28,6 +28,8 @@ class LLMSettings(BaseModel):
     # Server-side refusal fallback (routes a declined request to another model).
     use_fallbacks: bool = True
     api_key_env: str = "ANTHROPIC_API_KEY"
+    # Output token budget per LLM call. Long (2 h+) sources at high effort may need 32000+.
+    max_tokens: int = Field(16000, ge=1024, le=64000)
 
 
 class WhisperSettings(BaseModel):

@@ -333,3 +333,248 @@ def test_end_to_end_voice_captions_render(tmp_path: Path):
     assert json.loads(raw) == {"language": "hi", "title": "शीर्षक", "description": "d",
                                "hashtags": ["#a", "#b"]}
     assert "शीर्षक" in raw
+
+
+# ------------------------------------------------------------------------------------ FAILURES-5
+
+
+def test_voice_shorten_failure_falls_back_to_tempo_and_trim(tmp_path: Path, caplog):
+    from autoclipper.llm import LLMRefusal
+
+    def refusing(text: str, max_words: int) -> str:
+        raise LLMRefusal("Claude declined this request")
+
+    vb = FakeVoicebox(0.3)
+    msgs: list[str] = []
+    with caplog.at_level("WARNING"):
+        r = make_voice(client=vb, narration=words(20), lang="en", voice=EN, clip_duration=3.0,
+                       out_dir=tmp_path, max_speedup=1.25, shorten=refusing,
+                       on_progress=lambda f, m: msgs.append(m))
+    assert r.trimmed and not r.shortened and r.tempo == 1.25
+    assert r.narration == words(20) and len(vb.calls) == 1
+    assert r.final_duration == pytest.approx(3.0, abs=0.05)
+    assert any("shortening failed: Claude declined" in m and "trimming instead" in m for m in msgs)
+    assert "shortening failed" in caplog.text
+
+
+# ------------------------------------------------------------------------------------ HINDI_CAPTIONS-1
+
+HI22 = ("यह वीडियो आपको दिखाता है कि कैसे एक छोटा सा बदलाव आपकी पूरी ज़िंदगी को हमेशा के लिए "
+        "बदल सकता है दोस्तों")
+
+
+class _PrefixTranscriber:
+    """Whisper on a trimmed take only hears the words that were actually spoken."""
+
+    def __init__(self, heard: list[str], step: float = 0.4):
+        self.words = [Word(start=i * step, end=i * step + step - 0.02, text=w) for i, w in enumerate(heard)]
+
+    def transcribe(self, audio, language=None, on_progress=None):
+        from autoclipper.models import Segment, Transcript
+
+        return Transcript(language=language or "hi", duration=4.0, segments=[
+            Segment(start=0, end=4, text=" ".join(w.text for w in self.words), words=self.words)])
+
+
+def test_estimate_spoken_prefix():
+    from autoclipper.stages.voice import estimate_spoken_prefix
+
+    text = "aa bb cc dd"  # equal weights: each word 1/4 of the spoken time
+    assert estimate_spoken_prefix(text, 8.0, 1.0, 4.0) == "aa bb"
+    assert estimate_spoken_prefix(text, 8.0, 2.0, 4.0) == text
+    assert estimate_spoken_prefix(text, 80.0, 1.0, 1.0) == "aa"  # never empty
+
+
+def test_trimmed_voice_records_spoken_narration(tmp_path: Path):
+    assert len(HI22.split()) == 22
+    r = make_voice(client=FakeVoicebox(seconds_per_word=0.5), narration=HI22, lang="hi", voice=HI,
+                   clip_duration=4.0, out_dir=tmp_path, max_speedup=1.25, shorten=lambda t, n: t)
+    assert r.trimmed and r.tempo == 1.25
+    assert r.narration == HI22 and r.narration_hash == narration_hash(HI22)  # unchanged
+    spoken = r.spoken_narration.split()
+    assert 8 <= len(spoken) <= 11 and HI22.startswith(r.spoken_narration)
+    assert load_voice_result(tmp_path).spoken_narration == r.spoken_narration
+
+
+def test_untrimmed_voice_has_no_spoken_narration_and_old_json_validates(tmp_path: Path):
+    r = make_voice(client=FakeVoicebox(0.3), narration=words(5), lang="en", voice=EN, clip_duration=5.0,
+                   out_dir=tmp_path, max_speedup=1.25)
+    assert r.spoken_narration is None
+    old = r.model_dump()
+    del old["spoken_narration"]
+    (tmp_path / "voice.json").write_text(json.dumps(old), encoding="utf-8")
+    assert load_voice_result(tmp_path).spoken_narration is None
+
+
+def _no_zero_length_events(ass: str) -> None:
+    def cs(t: str) -> int:
+        h, m, s = t.split(":")
+        return round((int(h) * 3600 + int(m) * 60 + float(s)) * 100)
+
+    for line in _dialogues(ass):
+        start, end = line.split(",")[1:3]
+        assert cs(end) >= cs(start) + 1, line
+
+
+def test_trimmed_22_words_4s_captions_only_spoken_words(tmp_path: Path):
+    r = make_voice(client=FakeVoicebox(seconds_per_word=0.5), narration=HI22, lang="hi", voice=HI,
+                   clip_duration=4.0, out_dir=tmp_path, max_speedup=1.25, shorten=lambda t, n: t)
+    heard = HI22.split()[:10]  # 4 s * 1.25 / 0.5 s per word
+    ass = make_captions(narration=r.narration, voice_wav=Path(r.path), lang="hi",
+                        transcriber=_PrefixTranscriber(heard), settings=Settings(), out_dir=tmp_path)
+    ws = json.loads((tmp_path / "words.json").read_text(encoding="utf-8"))
+    texts = [w["text"] for w in ws]
+    assert texts == heard[:len(texts)] and 8 <= len(texts) <= 10
+    assert "ज़िंदगी" not in texts and "दोस्तों" not in texts  # never spoken
+    assert all(w["end"] <= 4.05 for w in ws)
+    _no_zero_length_events(ass.read_text(encoding="utf-8"))
+
+
+def test_trimmed_22_words_without_recognition_spreads_only_spoken_prefix(tmp_path: Path):
+    r = make_voice(client=FakeVoicebox(seconds_per_word=0.5), narration=HI22, lang="hi", voice=HI,
+                   clip_duration=4.0, out_dir=tmp_path, max_speedup=1.25)
+    make_captions(narration=r.narration, voice_wav=Path(r.path), lang="hi", transcriber=FakeTranscriber(),
+                  settings=Settings(), out_dir=tmp_path)
+    ws = json.loads((tmp_path / "words.json").read_text(encoding="utf-8"))
+    assert " ".join(w["text"] for w in ws) == r.spoken_narration
+    assert len(ws) < 12
+
+
+def test_captions_ignore_voice_json_for_other_narration(tmp_path: Path):
+    make_voice(client=FakeVoicebox(seconds_per_word=0.5), narration=HI22, lang="hi", voice=HI,
+               clip_duration=4.0, out_dir=tmp_path, max_speedup=1.25)
+    other = "बिलकुल अलग नया पाठ"
+    make_captions(narration=other, voice_wav=tmp_path / "voice.wav", lang="hi", transcriber=FakeTranscriber(),
+                  settings=Settings(), out_dir=tmp_path)
+    ws = json.loads((tmp_path / "words.json").read_text(encoding="utf-8"))
+    assert [w["text"] for w in ws] == other.split()
+
+
+def test_align_trimmed_drops_words_after_last_match():
+    script = "one two three four five six".split()
+    rec = [Word(start=0.0, end=0.4, text="one"), Word(start=0.5, end=0.9, text="two"),
+           Word(start=1.0, end=1.4, text="three")]
+    full = align_words(script, rec, 4.0)
+    assert [w.text for w in full] == script
+    cut = align_words(script, rec, 4.0, trimmed=True)
+    assert [w.text for w in cut] == ["one", "two", "three"]
+
+
+def test_build_ass_never_writes_zero_length_events():
+    ws = [Word(start=1.004, end=1.004, text="a"), Word(start=1.006, end=1.006, text="b"),
+          Word(start=1.006, end=1.009, text="c"), Word(start=3.995, end=3.995, text="d")]
+    ass = build_ass(ws, lang="en", settings=CaptionSettings(words_per_line=2))
+    _no_zero_length_events(ass)
+    assert len(_dialogues(ass)) == 4
+
+
+# ------------------------------------------------------------------------------------ HINDI_CAPTIONS-2
+
+
+@pytest.mark.parametrize("a,b", [("ज़िंदगी", "जिंदगी"), ("हिन्दी", "हिंदी"), ("फ़ोन", "फोन"),
+                                 ("हँसी", "हंसी"), ("क़ीमत", "कीमत")])
+def test_norm_folds_devanagari_variants(a, b):
+    assert a != b
+    assert captions._norm(a) == captions._norm(b) != ""
+
+
+def test_norm_strips_zero_width_and_keeps_distinct_words():
+    assert captions._norm("क्‍या") == captions._norm("क्या")  # ZWJ
+    assert captions._norm("क्‌ष") == captions._norm("क्ष")  # ZWNJ
+    assert captions._norm("काम") != captions._norm("कम")
+    assert captions._norm("Hello,") == "hello"
+    # a nasal + virama that is not followed by a consonant stays as written
+    assert captions._norm("न्") != captions._norm("ं")
+
+
+def test_align_hindi_spelling_variants_seven_words():
+    script = "ज़िंदगी फ़ोन क़ीमत हिन्दी ख़ास ज़रूर है".split()
+    heard = "जिंदगी फोन कीमत हिंदी खास जरूर है".split()
+    rec = [Word(start=i * 1.0, end=i * 1.0 + 0.3, text=w) for i, w in enumerate(heard)]
+    a = [captions._norm(w) for w in script]
+    b = [captions._norm(w.text) for w in rec]
+    assert sum(x == y for x, y in zip(a, b)) / len(script) >= 0.3
+    out = align_words(script, rec, 12.0)
+    assert [w.text for w in out] == script  # display text unchanged
+    assert out[-1].text == "है" and out[-1].start == pytest.approx(6.0, abs=0.05)
+    assert [w.start for w in out] == pytest.approx([0, 1, 2, 3, 4, 5, 6])
+
+
+# ------------------------------------------------------------------------------------ FAILURES-7
+
+
+def test_make_captions_survives_voice_transcription_failure(tmp_path: Path, caplog):
+    from autoclipper.stages.transcribe import TranscribeError
+
+    class Broken:
+        def transcribe(self, audio, language=None, on_progress=None):
+            raise TranscribeError("could not decode audio voice.wav")
+
+    voice = make_tone(tmp_path / "voice.wav", seconds=2.0)
+    with caplog.at_level("WARNING"):
+        ass = make_captions(narration="alpha beta gamma", voice_wav=voice, lang="en", transcriber=Broken(),
+                            settings=Settings(), out_dir=tmp_path)
+    assert ass.is_file() and len(_dialogues(ass.read_text(encoding="utf-8"))) == 3
+    ws = json.loads((tmp_path / "words.json").read_text(encoding="utf-8"))
+    assert [w["text"] for w in ws] == ["alpha", "beta", "gamma"]
+    assert ws[-1]["end"] == pytest.approx(2.0, abs=0.05)
+    assert "voice transcription failed" in caplog.text
+
+
+def test_make_captions_survives_unexpected_transcriber_error(tmp_path: Path):
+    class Boom:
+        def transcribe(self, audio, language=None, on_progress=None):
+            raise RuntimeError("CUDA driver crashed")
+
+    voice = make_tone(tmp_path / "voice.wav", seconds=1.0)
+    assert make_captions(narration="hi there", voice_wav=voice, lang="en", transcriber=Boom(),
+                         settings=Settings(), out_dir=tmp_path).is_file()
+
+
+# ------------------------------------------------------------------------------------ FAILURES-3
+
+
+def _boom(*a, **k):
+    raise ValueError("cannot serialize")
+
+
+def test_captions_writers_leave_no_partial_file(tmp_path: Path, monkeypatch):
+    voice = make_tone(tmp_path / "voice.wav", seconds=1.0)
+    out = tmp_path / "en"
+    make_captions(narration="alpha beta", voice_wav=voice, lang="en", transcriber=FakeTranscriber(),
+                  settings=Settings(), out_dir=out)
+    before = {p.name: p.read_bytes() for p in out.iterdir()}
+    monkeypatch.setattr(captions.json, "dumps", _boom)
+    with pytest.raises(ValueError):
+        make_captions(narration="gamma delta", voice_wav=voice, lang="en", transcriber=FakeTranscriber(),
+                      settings=Settings(), out_dir=out)
+    assert {p.name: p.read_bytes() for p in out.iterdir()} == before
+    monkeypatch.undo()
+    monkeypatch.setattr(captions, "build_ass", _boom)
+    with pytest.raises(ValueError):
+        make_captions(narration="gamma delta", voice_wav=voice, lang="en", transcriber=FakeTranscriber(),
+                      settings=Settings(), out_dir=out)
+    assert (out / "captions.ass").read_bytes() == before["captions.ass"]
+    assert sorted(p.name for p in out.iterdir()) == ["captions.ass", "words.json"]
+
+
+def test_voice_json_writer_leaves_no_partial_file(tmp_path: Path, monkeypatch):
+    from autoclipper.stages import voice as voice_mod
+
+    monkeypatch.setattr(voice_mod.json, "dumps", _boom)
+    with pytest.raises(ValueError):
+        make_voice(client=FakeVoicebox(0.3), narration=words(5), lang="en", voice=EN, clip_duration=5.0,
+                   out_dir=tmp_path, max_speedup=1.25)
+    assert not (tmp_path / "voice.json").exists()
+    assert not [p for p in tmp_path.iterdir() if p.name.endswith(".tmp")]
+
+
+def test_metadata_writer_is_atomic(tmp_path: Path, monkeypatch):
+    s = ClipScript(narration="n", title="t", description="d", hashtags=["#a"])
+    dst = tmp_path / "out" / "metadata.json"
+    write_metadata(s, "en", dst)
+    before = dst.read_bytes()
+    monkeypatch.setattr(render.json, "dumps", _boom)
+    with pytest.raises(ValueError):
+        write_metadata(s, "en", dst)
+    assert dst.read_bytes() == before and sorted(p.name for p in dst.parent.iterdir()) == ["metadata.json"]

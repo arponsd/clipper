@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import difflib
 import json
+import logging
+import re
 import unicodedata
 from pathlib import Path
 
@@ -10,8 +12,11 @@ from .. import ffmpeg
 from ..config import CaptionSettings, Settings
 from ..interfaces import Transcriber
 from ..models import Word
+from ._atomic import write_text_atomic
 from .transcribe import transcribe_voice
+from .voice import load_voice_result, narration_hash
 
+log = logging.getLogger(__name__)
 MIN_MATCH_RATIO = 0.3
 # Keep a line on screen across short pauses between lines so captions do not flicker.
 _LINE_HOLD = 0.5
@@ -44,17 +49,36 @@ def distribute_words(words: list[str], duration: float, start: float = 0.0) -> l
     return out
 
 
+_NUKTA = "\u093c"
+_CHANDRABINDU = "\u0901"
+_ANUSVARA = "\u0902"
+_ZW = dict.fromkeys(map(ord, "\u200c\u200d"))  # ZWNJ, ZWJ
+# nasal consonant (न म ङ ञ ण) + virama before a consonant -> anusvara: हिन्दी ~ हिंदी
+_NASAL_CLUSTER = re.compile("[\u0928\u092e\u0919\u091e\u0923]\u094d(?=[\u0915-\u0939])")
+
+
 def _norm(token: str) -> str:
-    """Lowercase, keep letters/marks/numbers (Devanagari vowel signs are marks)."""
+    """Matching key used only for alignment (the displayed text never changes).
+
+    Folds Devanagari spelling variants that Whisper often emits differently from the script:
+    nukta (ज़/ज, फ़/फ, क़/क), chandrabindu vs anusvara (हँ/हं), nasal+virama vs anusvara
+    (हिन्दी/हिंदी), and ZWJ/ZWNJ. Then lowercase and keep letters/marks/numbers.
+    """
+    token = unicodedata.normalize("NFD", token).translate(_ZW)
+    token = token.replace(_NUKTA, "").replace(_CHANDRABINDU, _ANUSVARA)
+    token = _NASAL_CLUSTER.sub(_ANUSVARA, token)
     token = unicodedata.normalize("NFC", token).casefold()
     return "".join(ch for ch in token if unicodedata.category(ch)[0] in "LMN")
 
 
-def align_words(script_words: list[str], recognized: list[Word], duration: float) -> list[Word]:
+def align_words(script_words: list[str], recognized: list[Word], duration: float, *,
+                trimmed: bool = False) -> list[Word]:
     """Map the exact script words onto recognized timings, monotonically.
 
     Matched words take the recognized timing; runs of unmatched words are spread by character
     length between their matched neighbours. Fewer than 30% matches -> plain distribution.
+    With ``trimmed`` (the voice was cut before the end of the text), script words after the last
+    matched word are dropped: they were never spoken.
     """
     if not script_words:
         return []
@@ -72,6 +96,8 @@ def align_words(script_words: list[str], recognized: list[Word], duration: float
                 timing[i] = recognized[j]
     if len(timing) < MIN_MATCH_RATIO * len(script_words):
         return distribute_words(script_words, duration)
+    if trimmed:
+        script_words = script_words[:max(timing) + 1]
 
     end_limit = max(duration, max(w.end for w in recognized))
     out: list[Word] = []
@@ -166,30 +192,49 @@ def build_ass(words: list[Word], *, lang: str, settings: CaptionSettings, width:
                 end = w.end
                 if next_line_start is not None and next_line_start - end <= _LINE_HOLD:
                     end = next_line_start
-            end = max(end, start + 0.01)
+            # times are written in centiseconds: never let an event round to zero length
+            start_cs = max(0, int(round(start * 100)))
+            end_cs = max(int(round(end * 100)), start_cs + 1)
             parts = [f"{{\\c{hl}}}{t}{{\\c{base}}}" if k == wi else t
                      for k, t in enumerate(escaped)]
-            events.append(f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},Default,,0,0,0,,"
+            events.append(f"Dialogue: 0,{_ass_time(start_cs / 100)},{_ass_time(end_cs / 100)},Default,,0,0,0,,"
                           + " ".join(parts))
     return header + "\n" + "\n".join(events) + ("\n" if events else "")
 
 
 def make_captions(*, narration: str, voice_wav: Path, lang: str, transcriber: Transcriber,
                   settings: Settings, out_dir: Path) -> Path:
-    """Write out_dir/words.json and out_dir/captions.ass; return the .ass path."""
+    """Write out_dir/words.json and out_dir/captions.ass; return the .ass path.
+
+    If out_dir/voice.json says the take for this narration was trimmed, only the estimated spoken
+    prefix (VoiceResult.spoken_narration) is captioned. An ASR failure on the voice falls back to
+    spreading the words over the voice duration.
+    """
     voice_wav = Path(voice_wav)
     if not voice_wav.is_file():
         raise CaptionsError(f"voice file not found: {voice_wav} (run the voice stage first)")
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     dur = ffmpeg.duration(voice_wav)
+    trimmed = False
+    vr = load_voice_result(out_dir)
+    if vr is not None and vr.trimmed and vr.narration_hash == narration_hash(narration):
+        trimmed = True
+        if vr.spoken_narration:
+            narration = vr.spoken_narration
     script_words = split_words(narration)
-    recognized = transcribe_voice(voice_wav, lang, transcriber) if script_words else []
-    words = align_words(script_words, recognized, dur)
-    (out_dir / "words.json").write_text(
-        json.dumps([w.model_dump() for w in words], indent=2, ensure_ascii=False), encoding="utf-8")
+    recognized: list[Word] = []
+    if script_words:
+        try:
+            recognized = transcribe_voice(voice_wav, lang, transcriber)
+        except Exception as e:  # noqa: BLE001 - incl. TranscribeError: timing falls back to distribution
+            log.warning("voice transcription failed for %s (%s); spreading caption words evenly",
+                        voice_wav.name, e)
+            recognized = []
+    words = align_words(script_words, recognized, dur, trimmed=trimmed)
+    write_text_atomic(out_dir / "words.json",
+                      json.dumps([w.model_dump() for w in words], indent=2, ensure_ascii=False))
     ass = out_dir / "captions.ass"
-    ass.write_text(build_ass(words, lang=lang, settings=settings.captions,
-                             width=settings.clips.width, height=settings.clips.height),
-                   encoding="utf-8")
+    write_text_atomic(ass, build_ass(words, lang=lang, settings=settings.captions,
+                                     width=settings.clips.width, height=settings.clips.height))
     return ass

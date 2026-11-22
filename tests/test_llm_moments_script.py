@@ -19,7 +19,7 @@ from autoclipper.models import ClipScript, Moment, Segment, Transcript, Word
 from autoclipper.stages import moments as mom
 from autoclipper.stages import script as scr
 from autoclipper.stages import transcribe as tr
-from fakes import FakeLLM, FakeTranscriber, fake_transcript
+from fakes import FakeLLM, FakeTranscriber, fake_transcript, make_tone
 
 
 # ============================================================================ fake client
@@ -170,10 +170,56 @@ def test_refusal_checked_before_content():
 
 
 def test_max_tokens_raises_truncated():
-    with pytest.raises(LLMTruncated, match="max_tokens"):
+    with pytest.raises(LLMTruncated, match="max_tokens") as ei:
         AnthropicLLM(settings(), client=FakeClient(resp('{"a":', "max_tokens"))).complete_json(
             system="s", user="u", schema=SHORTEN_SCHEMA)
+    msg = str(ei.value)
+    assert "cut off at max_tokens=16000" in msg
+    assert "`autoclipper settings set llm.max_tokens=32000`" in msg and "lower llm.effort" in msg
     assert issubclass(LLMTruncated, LLMError) and issubclass(LLMRefusal, LLMError)
+
+
+def test_max_tokens_setting_is_the_budget_and_long_budgets_get_a_timeout():
+    # FAILURES-8: llm.max_tokens drives moments/scripts; shorten stays <= 8000
+    client = FakeClient(resp('{"moments": []}'), resp('{"narration": "x"}'))
+    llm = AnthropicLLM(settings(max_tokens=32000), client=client)
+    llm.pick_moments("[0-1] hi", count=1, min_seconds=1, max_seconds=2, video_duration=10)
+    llm.shorten(lang="en", narration="a b c", max_words=2)
+    big, small = client.beta.messages.calls
+    assert big["max_tokens"] == 32000 and big["timeout"] == 1800
+    assert small["max_tokens"] == 8000 and "timeout" not in small
+    with pytest.raises(LLMTruncated, match="max_tokens=32000"):
+        AnthropicLLM(settings(max_tokens=32000), client=FakeClient(resp('{"a":', "max_tokens"))).complete_json(
+            system="s", user="u", schema=SHORTEN_SCHEMA)
+
+
+def test_small_max_tokens_setting_caps_shorten_and_has_no_timeout():
+    client = FakeClient(resp('{"narration": "x"}'), resp('{"a": 1}'))
+    llm = AnthropicLLM(settings(max_tokens=4000, use_fallbacks=False), client=client)
+    llm.shorten(lang="en", narration="a b c", max_words=2)
+    llm.complete_json(system="s", user="u", schema=SHORTEN_SCHEMA)
+    assert [c["max_tokens"] for c in client.messages.calls] == [4000, 4000]
+    assert all("timeout" not in c for c in client.messages.calls)
+
+
+def test_max_tokens_falls_back_when_setting_missing():
+    client = FakeClient(resp('{"a": 1}'))
+    llm = AnthropicLLM(SimpleNamespace(model="m", effort="low", use_fallbacks=False), client=client)
+    llm.complete_json(system="s", user="u", schema=SHORTEN_SCHEMA)
+    assert client.messages.calls[0]["max_tokens"] == 16000
+
+
+def test_sdk_accepts_long_budget_with_timeout():
+    # the real SDK (MockTransport, no network) must not reject max_tokens=32000 as "too long"
+    seen = {}
+
+    def handler(request):
+        seen["body"] = json.loads(request.content)
+        return httpx2.Response(200, json=_message_json('{"moments": []}'))
+
+    llm = AnthropicLLM(settings(max_tokens=32000), client=_sdk_client(handler))
+    assert llm.pick_moments("[0-1] x", count=1, min_seconds=1, max_seconds=2, video_duration=5) == []
+    assert seen["body"]["max_tokens"] == 32000
 
 
 @pytest.mark.parametrize("text,match", [("not json at all", "invalid JSON"),
@@ -384,8 +430,8 @@ def fake_whisper(monkeypatch):
 
 
 def test_whisper_transcriber_lazy_and_options(tmp_path, fake_whisper):
-    audio = tmp_path / "audio.wav"
-    audio.write_bytes(b"RIFF")
+    # a real 4 s 16 kHz wav: the transcriber now decodes it itself and passes an ndarray
+    audio = make_tone(tmp_path / "audio.wav", seconds=4.0, sample_rate=16000)
     wt = tr.WhisperTranscriber(WhisperSettings(model="tiny", language="hi"))
     assert isinstance(wt, Transcriber)
     assert fake_whisper.instances == []  # lazy: nothing loaded yet
@@ -444,11 +490,19 @@ def test_run_transcribe_keeps_hindi_unescaped(tmp_path):
     assert "नमस्ते" in raw and "\\u" not in raw
 
 
-def test_corrupt_transcript_raises(tmp_path):
+def test_corrupt_transcript_is_moved_aside_and_regenerated(tmp_path):
+    # FAILURES-3: a truncated transcript.json no longer blocks the job
     out = tmp_path / "transcript.json"
     out.write_text("{oops", encoding="utf-8")
+    fake = FakeTranscriber(duration=20)
+    msgs = []
+    t = tr.run_transcribe(tmp_path / "audio.wav", out, fake, on_progress=lambda f, m: msgs.append(m))
+    assert len(fake.calls) == 1
+    assert (tmp_path / "transcript.json.corrupt").read_text(encoding="utf-8") == "{oops"
+    assert tr.load_transcript(out) == t
+    assert any("transcript.json.corrupt" in m for m in msgs)
     with pytest.raises(tr.TranscribeError, match="delete it"):
-        tr.run_transcribe(tmp_path / "audio.wav", out, FakeTranscriber())
+        tr.load_transcript(tmp_path / "transcript.json.corrupt")
 
 
 def test_transcribe_voice_flattens_and_forces_language(tmp_path):
@@ -669,3 +723,39 @@ def test_end_to_end_with_anthropic_llm_and_fake_client(tmp_path):
     s = scr.write_script(llm=llm, transcript=t, moment=m, lang="en", out_json=tmp_path / "script.json")
     assert s.hashtags == ["#a", "#b", "#c"]
     assert len(client.messages.calls) == 2
+
+
+# ============================================================================ FAILURES-3 atomic writers
+
+
+def _boom(*a, **k):
+    raise ValueError("cannot serialize")
+
+
+def test_moments_and_script_writers_leave_no_partial_file(tmp_path, monkeypatch):
+    out = tmp_path / "job"
+    m = [Moment(start=0, end=30, hook="h", reason="r", score=0.9)]
+    s = ClipScript(narration="n", title="t", description="d", hashtags=["#a"])
+    mom.save_moments(m, out / "moments.json")
+    scr.save_script(s, out / "script.json")
+    before = {p.name: p.read_bytes() for p in out.iterdir()}
+    monkeypatch.setattr(mom.json, "dumps", _boom)
+    monkeypatch.setattr(scr.json, "dumps", _boom)
+    with pytest.raises(ValueError):
+        mom.save_moments(m * 2, out / "moments.json")
+    with pytest.raises(ValueError):
+        scr.save_script(s, out / "script.json")
+    with pytest.raises(ValueError):
+        mom.save_moments(m, out / "new_moments.json")
+    assert {p.name: p.read_bytes() for p in out.iterdir()} == before
+
+
+def test_atomic_helper_cleans_tmp_when_replace_fails(tmp_path, monkeypatch):
+    from autoclipper.stages import _atomic
+
+    out = tmp_path / "job"
+    out.mkdir()
+    monkeypatch.setattr(_atomic.os, "replace", lambda a, b: (_ for _ in ()).throw(OSError("locked")))
+    with pytest.raises(OSError):
+        scr.save_script(ClipScript(narration="n", title="t", description="d"), out / "script.json")
+    assert list(out.iterdir()) == []

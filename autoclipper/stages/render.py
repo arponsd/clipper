@@ -8,6 +8,7 @@ from .. import config, ffmpeg
 from ..config import AudioSettings
 from ..interfaces import ProgressFn
 from ..models import ClipScript
+from ._atomic import write_text_atomic
 
 _FONT_SUFFIXES = {".ttf", ".otf", ".ttc"}
 
@@ -50,5 +51,4 @@ def write_metadata(script: ClipScript, lang: str, dst: Path) -> Path:
     dst.parent.mkdir(parents=True, exist_ok=True)
     data = {"language": lang, "title": script.title, "description": script.description,
             "hashtags": list(script.hashtags)}
-    dst.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    return dst
+    return write_text_atomic(dst, json.dumps(data, indent=2, ensure_ascii=False))

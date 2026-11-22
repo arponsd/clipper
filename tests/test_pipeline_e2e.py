@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -76,6 +77,15 @@ def shared_job(tmp_path_factory: pytest.TempPathFactory) -> Shared:
 def job(shared_job: Shared, monkeypatch: pytest.MonkeyPatch) -> Shared:
     monkeypatch.setenv("AUTOCLIPPER_DATA_DIR", str(shared_job.data_dir))
     return shared_job
+
+
+@pytest.fixture
+def private_job(shared_job: Shared, _isolated_data_dir: Path) -> Shared:
+    """A copy of the shared job in this test's own data dir, for tests that change files or job.json.
+    The shared job stays untouched, so test outcomes do not depend on the order tests run in."""
+    src = shared_job.data_dir / "jobs" / shared_job.job_id
+    shutil.copytree(src, _isolated_data_dir / "jobs" / shared_job.job_id)
+    return Shared(_isolated_data_dir, shared_job.job_id, shared_job.deps, [], shared_job.settings)
 
 
 @pytest.fixture
@@ -159,7 +169,8 @@ def test_rerun_is_idempotent_and_builds_no_clients(job: Shared, monkeypatch: pyt
                for st in ls.stages.values())
 
 
-def test_rerender_title_edit_keeps_voice(job: Shared) -> None:
+def test_rerender_title_edit_keeps_voice(private_job: Shared) -> None:
+    job = private_job
     store = JobStore.load(job.job_id)
     d = store.clip_dir(1, "en")
     script = json.loads((d / "script.json").read_text(encoding="utf-8"))
@@ -178,7 +189,8 @@ def test_rerender_title_edit_keeps_voice(job: Shared) -> None:
     assert st.stages["voice"].status == "done"
 
 
-def test_rerender_narration_edit_regenerates_voice(job: Shared) -> None:
+def test_rerender_narration_edit_regenerates_voice(private_job: Shared) -> None:
+    job = private_job
     store = JobStore.load(job.job_id)
     d = store.clip_dir(0, "hi")
     script = json.loads((d / "script.json").read_text(encoding="utf-8"))
@@ -195,6 +207,38 @@ def test_rerender_narration_edit_regenerates_voice(job: Shared) -> None:
     words = json.loads((d / "words.json").read_text(encoding="utf-8"))
     assert [w["text"] for w in words] == "यह नया संपादित वर्णन है".split()
     assert ffprobe(d / "final.mp4")["streams"][0]["width"] in (1080, 1920)
+
+
+def test_mutating_tests_leave_shared_job_untouched(job: Shared, private_job: Shared) -> None:
+    assert private_job.data_dir != job.data_dir
+    shared_hi = job.data_dir / "jobs" / job.job_id / "clips" / "00" / "hi" / "script.json"
+    assert "परीक्षण" in shared_hi.read_text(encoding="utf-8")
+
+
+def test_voice_shortening_writes_back_and_resume_is_free(small_video: Path) -> None:
+    """TESTS-3: a slow voice forces shortening. script.json, voice.json and words.json must agree on
+    the shortened narration, and a resume must not pay Voicebox or the LLM again."""
+    s = make_settings()
+    s.clips.count = 1
+    vb, llm = FakeVoicebox(seconds_per_word=0.8), FakeLLM()
+    store = run_job(str(small_video), settings=s, deps=Deps(llm=llm, voicebox=vb,
+                    transcriber=FakeTranscriber(duration=40)), langs=["en"], log=lambda _l: None)
+    assert store.job.status == "done", store.job
+    assert any(name == "shorten" for name, _ in llm.calls)
+    d = store.clip_dir(0, "en")
+    voice = json.loads((d / "voice.json").read_text(encoding="utf-8"))
+    assert voice["shortened"] is True
+    script = json.loads((d / "script.json").read_text(encoding="utf-8"))
+    assert script["narration"] == voice["narration"]
+    words = json.loads((d / "words.json").read_text(encoding="utf-8"))
+    assert " ".join(w["text"] for w in words) == " ".join(voice["narration"].split())
+
+    vb2, llm2 = FakeVoicebox(seconds_per_word=0.8), FakeLLM()
+    again = run_job("", settings=s, job_id=store.job.id, langs=["en"], log=lambda _l: None,
+                    deps=Deps(llm=llm2, voicebox=vb2, transcriber=FakeTranscriber(duration=40)))
+    assert again.job.status == "done"
+    assert vb2.calls == []
+    assert [c for c in llm2.calls if c[0] == "shorten"] == []
 
 
 def test_rerender_errors(job: Shared) -> None:
@@ -442,15 +486,35 @@ def test_doctor_voicebox_and_key() -> None:
     assert profile.level == "ok" and "ant auth login" in profile.detail
 
 
+def _patch_doctor_all_ok(monkeypatch: pytest.MonkeyPatch) -> None:
+    ok = lambda name: cli.Check(name, "ok", "fake")  # noqa: E731
+    monkeypatch.setattr(cli, "check_binaries", lambda *a, **k: [ok("ffmpeg"), ok("ffprobe")])
+    monkeypatch.setattr(cli, "check_filters", lambda *a, **k: ok("ffmpeg filters"))
+    monkeypatch.setattr(cli, "check_fonts", lambda *a, **k: ok("fonts"))
+    monkeypatch.setattr(cli, "check_voicebox", lambda *a, **k: [ok("voicebox")])
+    monkeypatch.setattr(cli, "check_node", lambda *a, **k: ok("node"))
+
+
 def test_doctor_command_runs(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-    monkeypatch.setattr(cli, "check_voicebox", lambda s: [cli.Check("voicebox", "ok", "fake")])
+    _patch_doctor_all_ok(monkeypatch)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
-    code = cli.main(["doctor"])
+    assert cli.main(["doctor"]) == 0
     out = capsys.readouterr().out
-    assert "[OK  ] ffmpeg" in out and "node" in out
-    assert code in (0, 1)
+    assert "[OK  ] ffmpeg" in out and "node" in out and "all checks passed" in out
     assert "sk-test" not in out  # never print the key
     assert os.environ["ANTHROPIC_API_KEY"] == "sk-test"
+
+    # one required check fails -> exit 1
+    monkeypatch.setattr(cli, "check_fonts", lambda *a, **k: cli.Check("fonts", "fail", "missing"))
+    assert cli.main(["doctor"]) == 1
+    assert "[FAIL] fonts" in capsys.readouterr().out
+
+    # only a warning (node) -> still exit 0
+    monkeypatch.setattr(cli, "check_fonts", lambda *a, **k: cli.Check("fonts", "ok", "fake"))
+    monkeypatch.setattr(cli, "check_node", lambda *a, **k: cli.Check("node", "warn", "v16"))
+    assert cli.main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "[WARN] node" in out and "0 problem(s), 1 warning(s)" in out
 
 
 def test_cli_debug_flag_after_command(capsys: pytest.CaptureFixture[str]) -> None:

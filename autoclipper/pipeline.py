@@ -14,17 +14,18 @@ When no deps are passed, each real client is built lazily, only when a stage nee
 from __future__ import annotations
 
 import json
+import os
 import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from pydantic import ValidationError
 
 from .config import Settings, load_settings
 from .interfaces import LLM, LogFn, ProgressFn, Transcriber, VoiceboxAPI
-from .jobstore import CLIP_STAGES, JobStore
+from .jobstore import CLIP_STAGES, JOB_STAGES, JobStore
 from .models import ClipLangState, ClipScript, ClipState, Moment, StageState, Transcript
 
 SUPPORTED_LANGS = ("en", "hi")
@@ -180,6 +181,35 @@ def _unlink_outputs(out_dir: Path, *names: str) -> None:
         (out_dir / name).unlink(missing_ok=True)
 
 
+# Per clip-lang files that depend on cut.mp4 (script.json does not: it comes from the transcript).
+_CUT_DEPENDENT_OUTPUTS = ("voice.wav", "voice.json", "words.json", "captions.ass", "final.mp4")
+
+
+def _invalidate(store: JobStore, clip: ClipState, lang: str, stages: Sequence[str]) -> None:
+    """Reset the given clip-lang stages to pending (progress 0) and clear `final`, then save.
+
+    Called whenever their outputs are unlinked, so job.json never claims a deleted output is done.
+    """
+    state = clip.langs.get(lang)
+    if state is None:
+        return
+    for name in stages:
+        st = state.stages.setdefault(name, StageState())
+        st.status = "pending"
+        st.progress = 0.0
+        st.message = ""
+    state.final = None
+    store.save()
+
+
+def _move_corrupt(path: Path, log: LogFn, job_id: str, error: BaseException) -> None:
+    """A JSON output that does not parse is renamed to <name>.corrupt (kept for inspection) and redone."""
+    dst = path.with_name(path.name + ".corrupt")
+    os.replace(path, dst)
+    log(f"[{job_id}] warning: {path.name} is corrupt ({_error_text(error).splitlines()[0]}); "
+        f"moved to {dst.name} and regenerating it")
+
+
 def _sweep_running(store: JobStore) -> None:
     """Any stage still marked 'running' becomes 'failed' / 'interrupted' (nothing stays running)."""
     job = store.job
@@ -266,7 +296,13 @@ class _Reporter:
             now = time.monotonic()
             if pct // 5 != last_save[0] // 5 or now - last_save[1] >= 1.0:
                 last_save[0], last_save[1] = pct, now
-                self.store.set_stage(stage, "running", f, message, clip=clip, lang=lang)
+                try:
+                    self.store.set_stage(stage, "running", f, message, clip=clip, lang=lang)
+                except OSError as e:
+                    # A failed progress save (e.g. job.json locked by a reader on Windows) must never
+                    # abort the running stage; the next save brings job.json up to date.
+                    self.log(f"[{self.store.job.id}] warning: could not save progress to job.json: "
+                             f"{_error_text(e)}")
             if pct // 10 != last_line[0] // 10:
                 last_line[0] = pct
                 self.line(stage, f, message, clip, lang)
@@ -300,9 +336,13 @@ def _job_stage_ingest(store: JobStore, rep: _Reporter) -> Path:
 def _job_stage_transcribe(store: JobStore, rep: _Reporter, settings: Settings, deps: _LazyDeps) -> Transcript:
     out = store.dir / "transcript.json"
     if output_exists(out):
-        transcript = Transcript.model_validate_json(out.read_text(encoding="utf-8"))
-        rep.skip("transcribe", message="transcript.json")
-        return transcript
+        try:
+            transcript = Transcript.model_validate_json(out.read_text(encoding="utf-8"))
+        except (ValueError, UnicodeDecodeError) as e:  # pydantic ValidationError is a ValueError
+            _move_corrupt(out, rep.log, store.job.id, e)
+        else:
+            rep.skip("transcribe", message="transcript.json")
+            return transcript
     from .stages.transcribe import run_transcribe
 
     rep.start("transcribe", message=f"whisper {settings.whisper.model}")
@@ -319,10 +359,19 @@ def _job_stage_moments(store: JobStore, rep: _Reporter, settings: Settings, deps
     """Returns (moments, fresh): fresh is True when moments were (re)generated in this run."""
     out = store.dir / "moments.json"
     fresh = False
+    moments: list[Moment] | None = None
     if output_exists(out):
-        moments = [Moment.model_validate(m) for m in json.loads(out.read_text(encoding="utf-8"))]
-        rep.skip("moments", message=f"{len(moments)} moments in moments.json")
-    else:
+        try:
+            raw = json.loads(out.read_text(encoding="utf-8"))
+            if not isinstance(raw, list):
+                raise ValueError("expected a JSON list of moments")
+            moments = [Moment.model_validate(m) for m in raw]
+        except (ValueError, TypeError, UnicodeDecodeError) as e:  # JSONDecodeError/ValidationError too
+            _move_corrupt(out, rep.log, store.job.id, e)
+            moments = None
+        else:
+            rep.skip("moments", message=f"{len(moments)} moments in moments.json")
+    if moments is None:
         from .stages.moments import run_moments
 
         rep.start("moments", message=f"asking {settings.llm.model} for {settings.clips.count} moments")
@@ -403,6 +452,18 @@ def _populate_clips(store: JobStore, moments: list[Moment], langs: list[str], *,
     store.save()
 
 
+def _invalidate_after_cut(store: JobStore, clip: ClipState) -> None:
+    """cut.mp4 was (re)made: everything built from the old cut is stale (script.json is kept)."""
+    clip_root = store.clip_dir(clip.index)
+    langs = set(clip.langs)
+    for d in clip_root.iterdir():
+        if d.is_dir():
+            _unlink_outputs(d, *_CUT_DEPENDENT_OUTPUTS)
+            langs.add(d.name)
+    for lang in sorted(langs):
+        _invalidate(store, clip, lang, ("voice", "captions", "render"))
+
+
 def _job_stage_cut(store: JobStore, rep: _Reporter, settings: Settings, source: Path,
                    langs: list[str]) -> list[int]:
     """Cut every clip. Returns indexes that have a cut.mp4. A failed cut fails only that clip."""
@@ -444,6 +505,7 @@ def _job_stage_cut(store: JobStore, rep: _Reporter, settings: Settings, source: 
                     state.stages["script"].message = msg
                 store.save()
                 continue
+            _invalidate_after_cut(store, clip)  # re-cut: voice/captions/render must follow the new cut
         clip.cut = store.rel(dst)
         ok.append(clip.index)
     store.save()
@@ -484,6 +546,7 @@ def _run_voice(store: JobStore, rep: _Reporter, settings: Settings, deps: _LazyD
     out_dir = store.clip_dir(clip.index, lang)
     cut = store.clip_dir(clip.index) / "cut.mp4"
     _unlink_outputs(out_dir, "words.json", "captions.ass", "final.mp4")
+    _invalidate(store, clip, lang, ("captions", "render"))
     rep.start("voice", clip.index, lang, f"engine {_engine_label(settings, lang)}")
     result = make_voice(client=deps.voicebox, narration=script.narration, lang=lang,
                         voice=settings.voice_for(lang), clip_duration=ffmpeg.duration(cut), out_dir=out_dir,
@@ -513,6 +576,7 @@ def _run_captions(store: JobStore, rep: _Reporter, settings: Settings, deps: _La
 
     out_dir = store.clip_dir(clip.index, lang)
     _unlink_outputs(out_dir, "final.mp4")
+    _invalidate(store, clip, lang, ("render",))
     rep.start("captions", clip.index, lang)
     ass = make_captions(narration=script.narration, voice_wav=out_dir / "voice.wav", lang=lang,
                         transcriber=deps.transcriber, settings=settings, out_dir=out_dir)
@@ -698,17 +762,17 @@ def rerender(job_id: str, clip: int, lang: str, *, settings: Settings | None = N
     if not 0 <= clip < len(job.clips):
         raise PipelineError(f"clip {clip} does not exist in job {job_id} (valid: 0..{len(job.clips) - 1})")
     cs = job.clips[clip]
-    if not output_exists(store.clip_dir(clip) / "cut.mp4"):
+    # Validate before touching job.json: a failed check must not leave a phantom ClipLangState behind.
+    if not output_exists(store.dir / "clips" / f"{clip:02d}" / "cut.mp4"):
         raise PipelineError(f"clip {clip:02d} has no cut.mp4 - resume the job first")
+    script_path = store.dir / "clips" / f"{clip:02d}" / lang / "script.json"
+    if not output_exists(script_path):
+        raise PipelineError(f"{store.rel(script_path)} not found - run the job for language {lang!r} first")
     state = cs.langs.setdefault(lang, ClipLangState())
     for st in CLIP_STAGES:
         state.stages.setdefault(st, StageState())
     store.save()
-
     out_dir = store.clip_dir(clip, lang)
-    script_path = out_dir / "script.json"
-    if not output_exists(script_path):
-        raise PipelineError(f"{store.rel(script_path)} not found - run the job for language {lang!r} first")
 
     rep = _Reporter(store, log, debug)
     lazy = _LazyDeps(s, deps)
@@ -738,8 +802,29 @@ def rerender(job_id: str, clip: int, lang: str, *, settings: Settings | None = N
         raise
 
     state.final = store.rel(final)
-    if job.status == "failed" and any(not st.error for c in job.clips for st in c.langs.values()):
+    if job.status == "failed" and _job_complete(store):
         job.status = "done"
         job.error = None
     store.save()
     return final
+
+
+def _job_complete(store: JobStore) -> bool:
+    """True only when every job stage is done/skipped and every clip has a finished render, with no
+    error, in every language of the job (the languages any clip has state for)."""
+    job = store.job
+    finished = ("done", "skipped")
+    if any(job.stages.get(s) is None or job.stages[s].status not in finished for s in JOB_STAGES):
+        return False
+    langs = {lang for c in job.clips for lang in c.langs}
+    if not job.clips or not langs:
+        return False
+    for c in job.clips:
+        for lang in langs:
+            st = c.langs.get(lang)
+            if st is None or st.error:
+                return False
+            render = st.stages.get("render")
+            if render is None or render.status not in finished:
+                return False
+    return True

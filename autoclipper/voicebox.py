@@ -5,6 +5,7 @@ API used:
     GET  /history/{id}    -> {"status": "pending|generating|completed|failed|error", ...}
     GET  /audio/{id}      -> audio bytes
     GET  /profiles        -> [ {...}, ... ] or {"profiles": [...]}
+    POST /generate/{id}/cancel  (best effort, on timeout or Ctrl+C while waiting)
 """
 from __future__ import annotations
 
@@ -22,8 +23,15 @@ _DONE = "completed"
 _FAILED = {"failed", "error"}
 
 
+_CANCEL_TIMEOUT = 5.0
+
+
 class VoiceboxError(RuntimeError):
     """Any Voicebox failure, with a message the user can act on."""
+
+
+class _WaitTimeout(VoiceboxError):
+    """Internal: polling exceeded the timeout (re-raised as a plain VoiceboxError after cancelling)."""
 
 
 class VoiceboxClient:
@@ -114,7 +122,32 @@ class VoiceboxClient:
             raise VoiceboxError(f"Voicebox /generate returned no id: {str(data)[:200]}")
         return str(gen_id)
 
+    def cancel(self, gen_id: str) -> bool:
+        """Ask Voicebox to stop a generation (POST /generate/{id}/cancel). Best effort: never raises."""
+        try:
+            resp = self._http.post(f"/generate/{gen_id}/cancel", timeout=_CANCEL_TIMEOUT)
+            return resp.status_code < 400
+        except Exception:  # noqa: BLE001 - the server may be gone; cancelling is only a courtesy
+            return False
+
     def wait(self, gen_id: str, on_progress: ProgressFn | None = None) -> dict:
+        """Poll /history/{id} until completed. On timeout or interrupt the generation is cancelled.
+
+        Voicebox only reports generating/completed/failed, so the deadline runs from the start of
+        waiting (right after POST /generate returned).
+        """
+        try:
+            return self._wait(gen_id, on_progress)
+        except _WaitTimeout as e:
+            self.cancel(gen_id)
+            raise VoiceboxError(str(e)) from None
+        except VoiceboxError:
+            raise  # failed generation or transport error: nothing left to cancel
+        except BaseException:
+            self.cancel(gen_id)  # KeyboardInterrupt, progress callback errors, ...
+            raise
+
+    def _wait(self, gen_id: str, on_progress: ProgressFn | None) -> dict:
         deadline = self._clock() + self.timeout
         while True:
             data = self._json("GET", f"/history/{gen_id}")
@@ -131,7 +164,7 @@ class VoiceboxClient:
             if on_progress:
                 on_progress(_fraction(data.get("progress")), status or "waiting")
             if self._clock() >= deadline:
-                raise VoiceboxError(
+                raise _WaitTimeout(
                     f"Voicebox generation {gen_id} did not finish within {self.timeout:.0f}s "
                     f"(last status: {status or 'unknown'})")
             self._sleep(self.poll_interval)
