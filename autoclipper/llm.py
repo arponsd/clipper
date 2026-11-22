@@ -108,12 +108,21 @@ SHORTEN_SYSTEM = (
 )
 
 
+LENGTHEN_SYSTEM = (
+    "You expand voice-over narration for short videos that is too short for its clip. Keep the "
+    "language, script, meaning, hook, tone and ending; add vivid, relevant detail or context about "
+    "the moment instead of filler or repetition. Return plain spoken text only."
+)
+
+
 def language_rules(lang: str) -> str:
     if lang == "hi":
         return (
             "Write everything (narration, title, description) in natural, conversational Hindi as "
             "people actually speak it, in Devanagari script. Common English loanwords are fine but "
-            "must also be written in Devanagari. Never use romanized Hindi (Hinglish in Latin letters)."
+            "must also be written in Devanagari. Never use romanized Hindi (Hinglish in Latin letters). "
+            "Use standard Hindi spelling (for example अट्ठाईस, not अठ्ठाईस), and do not add Urdu "
+            "nuktas (क़, ज़, फ़) unless the word is normally written with them."
         )
     name = LANGUAGE_NAMES.get(lang, lang)
     return f"Write everything (narration, title, description) in natural, conversational {name}."
@@ -242,12 +251,11 @@ class AnthropicLLM:
         return out
 
     def write_script(self, *, lang: str, clip_transcript: str, moment: Moment,
-                     duration: float, target_words: int) -> ClipScript:
+                     duration: float, target_words: int,
+                     target_seconds: float | None = None) -> ClipScript:
         user = (
             f"{language_rules(lang)}\n\n"
-            f"Clip length: {duration:.1f} seconds. Write a narration of about {target_words} words "
-            f"(never more than {int(target_words * 1.1)}) so it fits the clip when read aloud at a "
-            "natural pace.\n"
+            f"{_length_instruction(lang, duration, target_words, target_seconds)}\n"
             "Also write: a title of at most 70 characters that makes people click, a 1-3 sentence "
             "description, and 3 to 8 relevant hashtags (each starting with #, no spaces).\n\n"
             f"Why this moment was picked: {moment.reason or '-'}\n"
@@ -274,6 +282,45 @@ class AnthropicLLM:
         if not text:
             raise LLMError("Claude returned an empty shortened narration")
         return text
+
+
+    def lengthen(self, *, lang: str, narration: str, target_words: int) -> str:
+        """Optional `interfaces.Lengthener`: a longer narration of about target_words words."""
+        lo, hi = word_range(target_words)
+        user = (
+            f"{language_rules(lang)}\n\n"
+            f"This narration is too short for its clip: it has {len(narration.split())} words. "
+            f"Rewrite it so it has between {lo} and {hi} words (target {target_words}). Keep the same "
+            "hook and ending line.\n\n"
+            f"<narration>\n{narration}\n</narration>"
+        )
+        data = self.complete_json(system=LENGTHEN_SYSTEM, user=user, schema=SHORTEN_SCHEMA,
+                                  max_tokens=min(SHORTEN_MAX_TOKENS, self.max_tokens))
+        text = str(data.get("narration") or "").strip()
+        if not text:
+            raise LLMError("Claude returned an empty lengthened narration")
+        return text
+
+
+def word_range(target_words: int) -> tuple[int, int]:
+    """Accepted word range around the target: round(target*0.95) .. round(target*1.05)."""
+    return max(1, round(target_words * 0.95)), max(1, round(target_words * 1.05))
+
+
+def _length_instruction(lang: str, duration: float, target_words: int,
+                        target_seconds: float | None) -> str:
+    if target_seconds is None or target_seconds <= 0:  # step-1 wording
+        return (f"Clip length: {duration:.1f} seconds. Write a narration of about {target_words} words "
+                f"(never more than {int(target_words * 1.1)}) so it fits the clip when read aloud at a "
+                "natural pace.")
+    lo, hi = word_range(target_words)
+    wps = target_words / target_seconds
+    name = LANGUAGE_NAMES.get(lang, lang)
+    return (f"Clip length: {duration:.1f} seconds. The narration must be spoken for about "
+            f"{target_seconds:.1f} seconds, i.e. it fills most of the clip and ends just before it does. "
+            f"The {name} narrator speaks about {wps:.2f} words per second, so write between {lo} and "
+            f"{hi} words (target {target_words}). Count the words: too short leaves the end of the "
+            "clip silent, too long gets cut.")
 
 
 def _map_sdk_error(e: Exception, settings: LLMSettings) -> LLMError:

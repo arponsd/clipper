@@ -278,26 +278,31 @@ def test_resolve_fonts_dir(tmp_path: Path, monkeypatch):
     assert resolve_fonts_dir() == tmp_path / "fonts"
 
 
-def test_render_final_delegates_to_mix_burn(tmp_path: Path, monkeypatch):
+def test_render_final_builds_ducking_graph(tmp_path: Path, monkeypatch):
+    # Step 2 (product fix 1): render_final builds its own ducking graph instead of ffmpeg.mix_burn.
     cut = make_video(tmp_path / "cut.mp4", seconds=2.0, width=320, height=568)
     voice = make_tone(tmp_path / "voice.wav", seconds=1.0)
     ass = tmp_path / "captions.ass"
     ass.write_text("x", encoding="utf-8")
     seen: dict = {}
 
-    def fake_mix_burn(video, dst, **kw):
-        seen.update(video=video, dst=dst, **kw)
-        return dst
+    def fake_run(args, **kw):
+        seen.update(args=[str(a) for a in args], **kw)
+        Path(args[-1]).write_bytes(b"x")
 
-    monkeypatch.setattr(render.ffmpeg, "mix_burn", fake_mix_burn)
+    monkeypatch.setattr(render.ffmpeg, "run", fake_run)
     monkeypatch.setattr(render, "resolve_fonts_dir", lambda: None)
     dst = tmp_path / "en" / "final.mp4"
     out = render_final(cut=cut, voice=voice, ass=ass, dst=dst,
                        audio=AudioSettings(original_volume=0.2, voice_volume=1.1))
-    assert out == dst and dst.parent.is_dir()
-    assert seen["video"] == cut and seen["voice"] == voice and seen["ass"] == ass
-    assert (seen["original_volume"], seen["voice_volume"], seen["fonts_dir"]) == (0.2, 1.1, None)
-    assert seen["duration"] == pytest.approx(2.0, abs=0.1)
+    assert out == dst and dst.is_file()
+    args = seen["args"]
+    assert args[args.index("-i") + 1] == str(cut) and str(voice) in args
+    graph = args[args.index("-filter_complex") + 1]
+    assert "ass=filename=" in graph and "fontsdir" not in graph
+    assert "volume=1.1[a1]" in graph and ",0.2," in graph and ":eval=frame" in graph
+    assert float(args[args.index("-t") + 1]) == pytest.approx(2.0, abs=0.1)
+    assert seen["total"] == pytest.approx(2.0, abs=0.1)
 
 
 def test_render_final_missing_inputs(tmp_path: Path):

@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="autoclipper-token" content="__AUTOCLIPPER_TOKEN__">
+  <meta name="color-scheme" content="light dark">
+  <title>Auto Clipper</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="#/jobs" aria-label="Auto Clipper home">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span class="brand-name">Auto Clipper</span>
+      </a>
+      <nav class="nav" aria-label="Main">
+        <a href="#/new" data-nav="new">New job</a>
+        <a href="#/jobs" data-nav="jobs">Jobs</a>
+        <a href="#/settings" data-nav="settings">Settings</a>
+        <a href="#/doctor" data-nav="doctor">Doctor</a>
+      </nav>
+      <div class="topbar-tools">
+        <a class="queue-pill" id="queue-pill" href="#/jobs" aria-live="polite" title="Task queue">Queue idle</a>
+        <button type="button" class="btn btn-ghost btn-icon" id="theme-toggle" aria-label="Theme: auto">
+          <span class="theme-icon" aria-hidden="true"></span>
+          <span class="theme-label">Auto</span>
+        </button>
+      </div>
+    </div>
+  </header>
+  <div id="banner" class="banner" role="alert" hidden></div>
+  <main id="main" class="main" tabindex="-1">
+    <noscript><p class="notice notice-error">Auto Clipper needs JavaScript enabled.</p></noscript>
+    <p class="muted">Loading…</p>
+  </main>
+  <div id="toasts" class="toasts" aria-live="polite" aria-atomic="false"></div>
+</body>
+</html>

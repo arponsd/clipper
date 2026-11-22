@@ -12,7 +12,7 @@ from pydantic import BaseModel, ValidationError
 
 from .. import ffmpeg
 from ..config import VoiceProfile
-from ..interfaces import ProgressFn, ShortenFn, VoiceboxAPI
+from ..interfaces import LengthenFn, ProgressFn, ShortenFn, VoiceboxAPI
 from ..voicebox import VoiceboxError
 from ._atomic import write_text_atomic
 
@@ -40,6 +40,7 @@ class VoiceResult(BaseModel):
     tempo: float
     shortened: bool
     trimmed: bool
+    lengthened: bool = False  # a too-short take was replaced by a lengthened narration (step 2)
     # When trimmed: the estimated prefix of `narration` that is actually heard before the cut.
     # Captions use it instead of `narration`. None for untrimmed takes and older voice.json files.
     spoken_narration: str | None = None
@@ -88,11 +89,18 @@ def _settings_key(lang: str) -> str:
 
 def make_voice(*, client: VoiceboxAPI, narration: str, lang: str, voice: VoiceProfile,
                clip_duration: float, out_dir: Path, max_speedup: float,
-               shorten: ShortenFn | None = None, on_progress: ProgressFn | None = None) -> VoiceResult:
+               shorten: ShortenFn | None = None, on_progress: ProgressFn | None = None,
+               lengthen: LengthenFn | None = None, lengthen_below: float = 0.75,
+               fill_ratio: float = 0.88) -> VoiceResult:
     """Generate the narration voice and fit it to ``clip_duration``.
 
     Fitting order: as-is if it fits -> atempo (<= max_speedup) -> shorten once via ``shorten`` and
     regenerate -> atempo max_speedup + trim to clip with a 0.3 s fade-out.
+
+    Too short: when ``lengthen`` is given and the take is shorter than clip x ``lengthen_below``,
+    the narration is lengthened once (to fill clip x ``fill_ratio``) and regenerated. The longer
+    take is kept only if it fits within max_speedup; otherwise (or on any error) the original take
+    is kept. A lengthen never leads to a shorten or a trim.
     """
     progress = on_progress or (lambda _f, _m="": None)
     text = narration.strip()
@@ -135,7 +143,13 @@ def make_voice(*, client: VoiceboxAPI, narration: str, lang: str, voice: VoicePr
     check_not_empty(d)
     shortened = False
 
-    if d > clip_duration * max_speedup + _EPS and shorten is not None:
+    lengthened = False
+
+    if lengthen is not None and d < clip_duration * lengthen_below:
+        text, d, lengthened = _try_lengthen(
+            text=text, d=d, clip_duration=clip_duration, max_speedup=max_speedup, fill_ratio=fill_ratio,
+            lengthen=lengthen, generate=generate, raw=raw, norm=norm, out_dir=out_dir, progress=progress)
+    elif d > clip_duration * max_speedup + _EPS and shorten is not None:
         max_words = math.floor(_count_words(text) * clip_duration * max_speedup / d * 0.95)
         max_words = max(1, max_words)
         progress(0.6, f"voice {d:.1f}s > clip {clip_duration:.1f}s, shortening to {max_words} words")
@@ -178,12 +192,60 @@ def make_voice(*, client: VoiceboxAPI, narration: str, lang: str, voice: VoicePr
         path=str(final.resolve()), narration=text, narration_hash=narration_hash(text),
         raw_duration=round(d, 3), final_duration=round(ffmpeg.duration(final), 3),
         clip_duration=round(clip_duration, 3), tempo=round(tempo, 4),
-        shortened=shortened, trimmed=trimmed,
+        shortened=shortened, trimmed=trimmed, lengthened=lengthened,
         spoken_narration=estimate_spoken_prefix(text, d, tempo, clip_duration) if trimmed else None)
     write_text_atomic(out_dir / "voice.json",
                       json.dumps(result.model_dump(), indent=2, ensure_ascii=False))
     progress(1.0, "voice ready")
     return result
+
+
+def _try_lengthen(*, text: str, d: float, clip_duration: float, max_speedup: float, fill_ratio: float,
+                  lengthen: LengthenFn, generate, raw: Path, norm: Path, out_dir: Path,
+                  progress: ProgressFn) -> tuple[str, float, bool]:
+    """One lengthen retry. Returns (text, duration, lengthened); the original take's files are
+    restored whenever the longer take is not used."""
+    words = _count_words(text)
+    target = max(words + 1, math.ceil(words * clip_duration * fill_ratio / max(d, 1e-6)))
+    progress(0.6, f"voice {d:.1f}s fills only {d / clip_duration:.0%} of the {clip_duration:.1f}s clip, "
+                  f"lengthening to {target} words")
+    try:
+        candidate = " ".join((lengthen(text, target) or "").split())
+    except Exception as e:  # noqa: BLE001 - refusal, network, bad output: keep the original take
+        msg = f"lengthening failed: {e}; keeping the original voice"
+        log.warning(msg)
+        progress(0.6, msg)
+        return text, d, False
+    if not candidate or candidate == " ".join(text.split()) or _count_words(candidate) <= words:
+        log.warning("lengthen returned no longer narration; keeping the original voice")
+        return text, d, False
+
+    backup_raw = out_dir / "voice_raw.orig.wav"
+    backup_norm = out_dir / "voice_norm.orig.wav"
+    shutil.copyfile(raw, backup_raw)
+    shutil.copyfile(norm, backup_norm)
+
+    def restore(reason: str) -> tuple[str, float, bool]:
+        log.warning("%s; keeping the original voice", reason)
+        progress(0.85, f"{reason}; keeping the original voice")
+        backup_raw.replace(raw)
+        backup_norm.replace(norm)
+        return text, d, False
+
+    try:
+        try:
+            d2 = generate(candidate, 0.6, 0.85)
+        except Exception as e:  # noqa: BLE001 - the original take is still good
+            return restore(f"generating the lengthened voice failed: {e}")
+        if d2 < MIN_VOICE_SECONDS:
+            return restore(f"the lengthened voice was empty ({d2:.1f}s)")
+        if d2 > clip_duration * max_speedup + _EPS:
+            return restore(f"the lengthened voice ({d2:.1f}s) does not fit the {clip_duration:.1f}s clip "
+                           f"even at x{max_speedup:g}")
+        return candidate, d2, True
+    finally:
+        backup_raw.unlink(missing_ok=True)
+        backup_norm.unlink(missing_ok=True)
 
 
 def load_voice_result(out_dir: Path) -> VoiceResult | None:

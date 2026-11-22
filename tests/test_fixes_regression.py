@@ -424,6 +424,7 @@ def test_pipeline_uses_aligned_words_for_en_and_hi(video: Path) -> None:
     s = make_settings()
     s.clips.min_seconds = 10
     llm = FakeLLM(narration_words=8)
+    llm.lengthen = None  # step 2: an 8-word take would be lengthened; this test is about alignment only
     store = run_job(str(video), settings=s, deps=deps(llm=llm, transcriber=EchoTranscriber(duration=40)),
                     langs=["en", "hi"], log=quiet)
     assert store.job.status == "done"

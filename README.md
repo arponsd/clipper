@@ -8,12 +8,12 @@ Auto Clipper is a local app that turns one long video into short vertical clips.
 4. cuts each moment into a 9:16 1080x1920 clip,
 5. writes a **narration** script for each clip in English and Hindi. The narration is new commentary spoken over the clip, not a dub of what is said in it. It also writes a title, a description and hashtags,
 6. generates the voice with a local [Voicebox](https://github.com/jamiepine/voicebox) server. Hindi always uses the `chatterbox` engine,
-7. burns word-by-word captions in the clip's language (Noto Sans for English, Noto Sans Devanagari for Hindi) and keeps the original audio quietly under the voice,
+7. burns word-by-word captions in the clip's language (Noto Sans for English, Noto Sans Devanagari for Hindi) and mixes in the original audio: it is ducked to `audio.original_volume` while the narration plays and comes back to `audio.original_volume_after` before and after it (with `audio.duck_ramp_seconds` ramps), then the mix is loudness-normalised,
 8. writes `final.mp4` and `metadata.json` for each clip in each language.
 
-If a voice-over is longer than its clip, it is sped up slightly, never more than `audio.max_speedup`. If it would need more than that, it is first shortened by the LLM, and trimmed with a fade only as a last resort.
+The narration is sized to the clip from the voice's words per second (`script.wps_en` / `script.wps_hi`, `script.fill_ratio`). If a voice-over is longer than its clip, it is sped up slightly, never more than `audio.max_speedup`. If it would need more than that, it is first shortened by the LLM, and trimmed with a fade only as a last resort. If a new voice-over is much shorter than its clip (below `script.lengthen_below`), the LLM lengthens the narration once; the longer take is kept only if it fits, otherwise the original take stays. Lengthening happens only when the script was just written or regenerated, or no voice exists yet: resuming a job (`run --job`) never rewrites a narration you edited, and `rerender` never lengthens.
 
-Step 1, the command-line pipeline, is what exists today. See the [Roadmap](#roadmap) for what comes next.
+Step 1 (the command-line pipeline) and step 2 (a local web UI, see [Usage: Web UI](#usage-web-ui)) exist today. See the [Roadmap](#roadmap) for what comes next.
 
 ---
 
@@ -184,6 +184,25 @@ Clip indexes are 0-based and match the `clips/NN` folders.
 
 ---
 
+## Usage: Web UI
+
+```bash
+uv run autoclipper serve                 # http://127.0.0.1:8765/ , opens a browser tab
+uv run autoclipper serve --no-browser --port 8765
+```
+
+The page lets you start a job from an uploaded file or a URL, follow its progress, review each clip in each language (the video plays in the page), edit the narration, title, description and hashtags, re-render one clip, change the settings and run the doctor checks. Jobs and re-renders run one at a time in a single background worker, in order. The CLI and the web UI share `data/`; a `job.lock` file stops both from running the same job at once.
+
+The server binds to loopback only by default. The page gets an access token (stored in `data/web/token`) when it is loaded from the same machine; API calls without it get 401, and with a wrong one 403. Stop the server with Ctrl-C, or `kill -INT <pid>` when it runs in the background.
+
+**Currently running (started by the team lead on 2026-11-22):** `autoclipper serve --host 127.0.0.1 --port 8765 --no-browser`, PID `1796838` (also in `/tmp/claude-1000/ac_serve.pid`), log in `/tmp/claude-1000/ac_serve.log`. Stop it with:
+
+```bash
+kill -INT 1796838      # or: pkill -INT -f "autoclipper serve --host 127.0.0.1 --port 8765"
+```
+
+---
+
 ## Data layout
 
 Everything is stored under `data/`, or under `$AUTOCLIPPER_DATA_DIR` if that is set:
@@ -231,24 +250,34 @@ Change settings with `autoclipper settings set key.path=value`. The value is par
 | `whisper.compute_type` | `auto` | auto = `int8` on CPU, `float16` on CUDA |
 | `whisper.language` | `null` | Source language; `null` = auto-detect |
 | `voicebox.url` | `http://127.0.0.1:17493` | Voicebox server |
-| `voicebox.poll_interval` | `1.0` | Seconds between history polls |
-| `voicebox.timeout_seconds` | `600` | Max wait per generation |
+| `voicebox.poll_interval` | `1.0` | Seconds between history polls (0.1-10) |
+| `voicebox.timeout_seconds` | `600` | Max wait per generation, in seconds (10-7200) |
 | `voicebox.english.profile_id` | `""` | English voice profile id (see `profiles`) |
 | `voicebox.english.engine` | `chatterbox` | English TTS engine |
 | `voicebox.hindi.profile_id` | `""` | Hindi voice profile id |
 | `voicebox.hindi.engine` | `chatterbox` | Always forced to `chatterbox` for Hindi |
 | `clips.count` | `5` | Clips per video (1-30) |
 | `clips.min_seconds` / `clips.max_seconds` | `20` / `60` | Clip length bounds |
-| `clips.width` / `clips.height` | `1080` / `1920` | Output size |
+| `clips.width` / `clips.height` | `1080` / `1920` | Output size (240-3840, even numbers) |
 | `clips.reframe` | `crop` | `crop` = center crop; `blur` = whole frame over a blurred fill |
-| `audio.original_volume` | `0.15` | Original audio level under the voice (0-1) |
+| `audio.original_volume` | `0.15` | Original audio level WHILE the voice speaks (ducked, 0-1) |
+| `audio.original_volume_after` | `1.0` | Original audio level before and after the narration (0-2) |
+| `audio.duck_ramp_seconds` | `0.4` | Fade time between the two levels (0-2 s) |
 | `audio.voice_volume` | `1.0` | Voice level (0-2) |
 | `audio.max_speedup` | `1.25` | Max atempo used to fit the voice into the clip |
+| `audio.loudnorm` | `true` | Normalize the loudness of the final mix (a limiter always keeps peaks below 0 dBFS) |
+| `audio.target_lufs` | `-14` | Loudness target for `audio.loudnorm` (-30 to -8 LUFS) |
+| `script.wps_en` / `script.wps_hi` | `3.0` / `3.35` | Words per second of the voice, used to size the narration (measured on chatterbox; 1-6) |
+| `script.fill_ratio` | `0.88` | Share of the clip the narration should fill (0.5-1) |
+| `script.lengthen_below` | `0.75` | A new voice shorter than this share of the clip gets one "lengthen" retry (0.3-0.95; never on rerender) |
 | `captions.font_en` / `captions.font_hi` | `Noto Sans` / `Noto Sans Devanagari` | Caption fonts |
-| `captions.font_size` | `78` | Caption font size (px at 1080x1920) |
-| `captions.words_per_line` | `3` | Words shown per caption line |
-| `captions.primary_color` / `captions.highlight_color` | white / yellow | ASS `&HAABBGGRR` colors |
-| `captions.margin_v` | `520` | Distance of the captions from the bottom, in px |
+| `captions.font_size` | `78` | Caption font size (px at 1080x1920, 20-200) |
+| `captions.words_per_line` | `3` | Words shown per caption line (1-8) |
+| `captions.primary_color` / `captions.highlight_color` | white / yellow | ASS `&HAABBGGRR` colors (`&H` + 8 hex digits) |
+| `captions.position_pct` | `72` | Vertical centre of the caption line, in % of the height from the top (5-95). `null` = use `captions.margin_v` |
+| `captions.margin_v` | `520` | Distance of the captions from the bottom, in px, 0 to `clips.height` (only when `captions.position_pct` is `null`) |
+| `web.max_upload_mb` | `4096` | Largest upload the web UI accepts, in MB (1-102400) |
+| `web.allowed_extensions` | `[".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".ogv"]` | Video file types the web UI accepts (lower-case, with the dot) |
 
 `--clips`, `--min`, `--max` and `--langs` on `run` override these settings for that run only.
 
@@ -269,7 +298,7 @@ The pipeline gets its LLM, Voicebox client and transcriber injected (`autoclippe
 
 ## Roadmap
 
-- **Step 1 (done): CLI pipeline end to end.** This is what this README describes.
-- **Step 2: web UI.** A FastAPI app with one background worker thread (no Redis) that runs `pipeline.run_job`. The UI reads progress from `job.json` and lets you edit `script.json` and settings in the browser, then re-render.
+- **Step 1 (done): CLI pipeline end to end.**
+- **Step 2 (done): web UI.** A FastAPI app with one background worker thread (no Redis) that runs `pipeline.run_job`. The UI reads progress from `job.json` and lets you edit `script.json` and settings in the browser, then re-render.
 - **Step 3: HyperFrames animated captions.** These will reuse `words.json` and need Node 22+.
 - **Step 4: auto-publish.** English clips go to one channel and Hindi clips to another, on YouTube, Facebook and Instagram Reels, using `metadata.json`.

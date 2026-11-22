@@ -17,6 +17,8 @@ from .models import ClipScript, Moment, Transcript
 ProgressFn = Callable[[float, str], None]
 # shorten(narration, max_words) -> shorter narration (same language)
 ShortenFn = Callable[[str, int], str]
+# lengthen(narration, target_words) -> longer narration (same language), step 2 product fix
+LengthenFn = Callable[[str, int], str]
 # log(line) - pipeline/CLI progress lines
 LogFn = Callable[[str], None]
 
@@ -33,12 +35,26 @@ class LLM(Protocol):
         ...
 
     def write_script(self, *, lang: str, clip_transcript: str, moment: Moment,
-                     duration: float, target_words: int) -> ClipScript:
-        """Narration (new commentary, not a dub) + title/description/hashtags in `lang`."""
+                     duration: float, target_words: int,
+                     target_seconds: float | None = None) -> ClipScript:
+        """Narration (new commentary, not a dub) + title/description/hashtags in `lang`.
+
+        target_seconds (step 2, optional): the spoken length the narration should fill.
+        """
         ...
 
     def shorten(self, *, lang: str, narration: str, max_words: int) -> str:
         """Return a shorter narration with at most max_words words, same language/meaning."""
+        ...
+
+
+@runtime_checkable
+class Lengthener(Protocol):
+    """Optional LLM capability (step 2). Not part of LLM so older fakes/clients stay valid;
+    callers use getattr(llm, "lengthen", None)."""
+
+    def lengthen(self, *, lang: str, narration: str, target_words: int) -> str:
+        """Return a longer narration of about target_words words, same language/meaning/tone."""
         ...
 
 

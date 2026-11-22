@@ -431,3 +431,410 @@ I checked all 28 accepted fixes by reproducing each failure scenario on the curr
 
 ### Sign-off
 - Step 1 is APPROVED for the CLI pipeline: it works end to end with the real services. The un-duck item above is the top item for the next round.
+
+## Team Lead (step 2 plan: local web UI + round-2 product fixes)
+
+### Plan
+- Step 2 = `uv run autoclipper serve` (FastAPI + uvicorn, 127.0.0.1:8765): one static page (vanilla JS/CSS, offline,
+  no build) + a token-protected JSON API + ONE worker thread with an in-process FIFO queue that is the single
+  writer of job.json (CONTRACT 1a). Plus 4 product fixes from the real run (un-duck tail, narration length per
+  language, caption position, Hindi spelling).
+- The contract is **docs/CONTRACT_WEB.md** (routes, limits, JSON shapes, status codes, error format, worker API,
+  auth, static layout, new settings fields). Builders work from it in parallel. CONTRACT.md still applies.
+
+### Assignments (files must not overlap)
+- **backend**: autoclipper/web/{__init__,server,worker,auth,errors}.py, cli.py `serve` subcommand only,
+  pyproject deps, tests/test_web_*.py.
+- **frontend**: autoclipper/web/static/{index.html,app.js,styles.css} only.
+- **product**: stages/{render,script,voice,captions}.py, llm.py prompts + `lengthen`, config.py (new fields only,
+  CONTRACT_WEB section 8), pipeline.py (lengthen wiring / script settings only), tests/test_product_fixes.py,
+  README settings rows.
+
+### Lead changes already made (tests green: 329 passed)
+- interfaces.py: `LengthenFn`, optional `Lengthener` protocol (kept OUT of `LLM` so existing fakes and
+  isinstance checks stay valid), `LLM.write_script(..., target_seconds=None)`.
+- tests/fakes.py: `FakeLLM.lengthen(...)`; `FakeLLM.write_script(..., target_seconds=None)` (recorded in calls
+  only when given, so existing call assertions still match).
+
+### Decisions everyone must know
+- Upload = 2 steps: raw-body streaming `POST /api/uploads?filename=` (no multipart, size limit enforced while
+  streaming -> 413), then `POST /api/jobs {upload_id|url, options}` with `Idempotency-Key`. The upload is moved
+  into the job dir as `source.<ext>`; ingest reuses it via find_source. The API never accepts a local path.
+- Job options are persisted in `data/jobs/<id>/options.json` (job.json has no options field) so Resume reuses them.
+  The worker creates the job at submit (status queued) and always calls `run_job(..., job_id=...)`.
+- Auth: token in `data/web/token` (0600), injected into index.html meta tag; `X-Auth-Token` on /api (401 missing,
+  403 wrong); `?token=` accepted ONLY on the video/download GETs (media elements cannot send headers).
+  Host guard (403) on every request, Origin/Sec-Fetch-Site guard (403) on writes, strict CSP (no inline JS/CSS).
+- 409 is used for conflicts (save/rerender while that clip is being processed, reused Idempotency-Key with a
+  different body, resume of a complete job); 503 for Voicebox unreachable on the profiles route.
+- Cancel is cooperative: the worker's `log` raises `TaskCancelled(BaseException)`; the pipeline already records
+  BaseException as "interrupted" and ffmpeg.run kills its child. Server start marks leftover running/queued
+  jobs failed/"interrupted" (skips job.json touched < 30 s ago: a CLI may own it).
+- Measured from the sample job 20261122-185849-65a6bd (read-only): chatterbox EN 2.97/3.03 wps, HI 3.52/3.21 wps
+  (pooled 3.00 and 3.36). Old constants (en 2.6, hi 2.2) explain HI fill 61-65 % vs EN 78-86 %. The LLM also
+  overshoots the requested words by about 5-8 %. New defaults: script.wps_en=3.0, wps_hi=3.35, fill_ratio=0.88.
+  (The brief's 2.5-2.7 EN estimate is lower than what this Voicebox actually produced.)
+- Ducking: `audio.original_volume` now means "while the voice plays"; `audio.original_volume_after` (1.0) applies
+  before/after the voice with 0.4 s ramps; loudnorm (-14 LUFS) + the existing limiter on the final mix.
+  Implemented in stages/render.py with its own graph; ffmpeg.py is not edited.
+- Captions: `captions.position_pct` (72, centre of the line, % from top) via `\an5\pos`; None = legacy margin_v.
+
+### Review checklist for step 2
+- Every route in CONTRACT_WEB section 4 exists with the listed status codes; every error is
+  `{"message","errors"}`; no traceback text in any response (test a forced exception -> 500 clean JSON).
+- Tests per route: happy, 422 (missing/wrong type/empty/very long/negative/zero/huge/extra keys), 401, 403
+  (token, Host, Origin), 404, exact JSON keys+types, disk side effects. Range 206 test.
+- No request thread writes job.json of an existing job. Settings writes are atomic.
+- Page works with the network off (no CDN), CSP passes (no inline script/style), Devanagari fields use
+  Noto Sans Devanagari, dark/light, 360 px wide.
+- Product: before/during/after loudness measured in tests; HI target words use wps_hi; one lengthen max,
+  never on rerender; caption position both modes; full suite green; the real job dir untouched.
+
+## Builder (product)
+
+### Done (CONTRACT_WEB sections 8 and 9)
+- **config.py (new fields only + bounds):** audio.original_volume_after=1.0, duck_ramp_seconds=0.4, loudnorm=True,
+  target_lufs=-14; new `script` section (wps_en 3.0, wps_hi 3.35, fill_ratio 0.88, lengthen_below 0.75, `wps(lang)`);
+  captions.position_pct=72 (nullable; None = legacy margin_v); new `web` section (max_upload_mb 4096,
+  allowed_extensions + validator: lower-case `.` + 1-9 [a-z0-9], 1-30 items, no duplicates). Bounds added:
+  font_size 20-200, words_per_line 1-8, poll_interval 0.1-10, timeout_seconds 10-7200, clips.width/height 240-3840
+  and even. A step-1 settings.json (no new keys) loads (tested).
+- **Ducking (render.py):** render_final builds its own graph (ffmpeg.py untouched; imports `_X264/_AAC/_MONO_TO_STEREO/
+  _LIMITER/_SILENCE/_AtomicOutput/_num`). Voice window [0, speech_end]; speech_end = last word end in words.json next
+  to the voice (clamped to the voice length), else silencedetect -45 dB/0.3 s on the voice. Original gain =
+  `volume='<piecewise-linear>':eval=frame` (public helpers `duck_envelope`, `build_audio_graph`), amix normalize=0 ->
+  loudnorm I=target TP=-1.5 LRA=11 + aresample=48000 (when enabled) -> limiter. No voice -> original at
+  original_volume_after. New optional kwarg `render_final(..., words_json=None)`.
+  Measured in tests on fake media (440 Hz original / 660 Hz voice, bandpassed): tail = original level +-1.5 dB, during =
+  -16.5 dB +-2.5, mid-ramp in between, peak <= -0.2 dBFS (also with loud inputs, voice_volume 2, after 2.0).
+  Real sample (read-only inputs from job 20261122-185849-65a6bd clip 01/hi, output to scratchpad then deleted):
+  speech_end 18.56 s, narrated part -13.9 LUFS, tail -18.4 LUFS (was about -43 LUFS), peak -1.4 dBFS.
+- **Narration length:** `target_words(duration, lang, *, wps=None, fill_ratio=FILL_RATIO)`;
+  `write_script(..., script_settings=None)` passes `target_seconds=round(duration*fill_ratio, 1)` only when settings are
+  given (step-1 calls unchanged). Prompt states clip seconds, target spoken seconds, words/s for the language and
+  "between round(t*0.95) and round(t*1.05) words (target t)". `AnthropicLLM.lengthen` + `LENGTHEN_SYSTEM`.
+  `make_voice(..., lengthen=None, lengthen_below=0.75, fill_ratio=0.88)`: one retry, target
+  `ceil(words*clip*fill/d)`; the longer take is used only if it fits within max_speedup, else the ORIGINAL raw/norm
+  files are restored; LLM or Voicebox errors in the retry -> warning + original take; never shortens/trims after a
+  lengthen. `VoiceResult.lengthened=False` (old voice.json files still load).
+  Pipeline: `write_script(..., script_settings=settings.script)`; `_run_voice(..., allow_lengthen)` uses
+  `getattr(deps.llm, "lengthen", None)` lazily; narration write-back to script.json as for shorten.
+- **Captions:** position_pct set -> style Alignment 5 and every Dialogue starts with
+  `{\an5\pos(w//2, round(h*pct/100))}` (540,1382 at 1080x1920); None -> Alignment 2 + margin_v. A real libass burn puts
+  the text centre at 72 % and 30 % (+-3 %).
+- **Hindi spelling:** language_rules("hi") adds standard spelling (अट्ठाईस, not अठ्ठाईस) and no Urdu nuktas unless normal.
+- README "Settings reference": new rows + bounds.
+
+### Deviation to review (lead)
+- `allow_lengthen` from run_job is `regenerated or not voice.json exists` instead of always True: on a resume
+  (`run --job`) after the user edited script.json, a short user narration must not be rewritten by the LLM. This is
+  what kept test_fixes_regression::test_resume_after_failed_downstream_rebuilds_stale_outputs green unchanged.
+  rerender is always False.
+
+### Step-1 tests changed (and why)
+- tests/test_voice_captions_render.py: `test_render_final_delegates_to_mix_burn` replaced by
+  `test_render_final_builds_ducking_graph` - render_final no longer calls ffmpeg.mix_burn (spec 9.1); it now checks the
+  same inputs/volumes/duration in the ffmpeg args.
+- tests/test_fixes_regression.py::test_pipeline_uses_aligned_words_for_en_and_hi: one line `llm.lengthen = None` - its
+  8-word narration on a ~12 s clip is now (correctly) lengthened, and the test is about word alignment only.
+
+### Tests
+- tests/test_product_fixes.py: 80 tests (settings bounds/compat/disk round trip, envelope + graph strings, speech_end,
+  real-ffmpeg levels before/during/after + peaks, prompts via a fake SDK client, lengthen paths, pipeline wiring incl.
+  rerender/resume never lengthening user edits and an LLM without `lengthen`, caption position both modes + real burn).
+- Full suite `uv run pytest -q`: **633 passed** (includes the other builders' web tests present at the time).
+
+### Requests / notes for others
+- README intro line 7 ("keeps the original audio quietly under the voice") and the "If a voice-over is longer..."
+  paragraph are not my rows: lead, please reword (ducked only while the narration plays; one lengthen retry for new
+  scripts).
+- /tmp (tmpfs 7.4 GB) hit 0 MB free during my run: /tmp/pytest-of-ptl-admin holds ~6.2 GB of pytest base temps from
+  everyone's runs. I deleted only my own scratch render; nothing else removed.
+
+## Builder (frontend)
+
+The single-page UI is built per CONTRACT_WEB sections 3, 4, 6 and 8. I edited only `autoclipper/web/static/index.html`, `app.js` and `styles.css`, and nothing is committed.
+
+- **Constraints:** vanilla ES2020 and CSS, with no build step, CDN or web fonts. CSP-clean: no inline script, no `style=`, no `on*=`. Styles are set through classes or the CSSOM only. All server text goes through `textContent`, with no `innerHTML`. The `<meta name="autoclipper-token">` placeholder plus `/static/styles.css` and `/static/app.js` (defer) are in place.
+- **Routes:** `#/new`, `#/jobs`, `#/jobs/<id>`, `#/jobs/<id>/clips/<n>/<lang>`, `#/settings`, `#/doctor`. Leaving the page with unsaved settings, an unsaved script, or an upload in progress asks for confirmation.
+- **API and errors:** every fetch sends `X-Auth-Token`, and JSON bodies set Content-Type. On non-2xx the page shows `message`, and each `errors` key is mapped by its dotted path (longest prefix) onto its field. Errors it cannot map go in a summary list. On 401/403 a sticky "reload the page" banner appears. When the server cannot be reached, an "offline" banner appears and clears on the next success.
+- **New job:**
+  - Pick a file or drop it anywhere on the page. The extension and size are checked against `settings.web`.
+  - The file is uploaded with XHR as a raw body to `/api/uploads?filename=`, showing upload %, speed and a Cancel button.
+  - Then `POST /api/jobs {upload_id|url, options}` is sent with a fresh `crypto.randomUUID()` Idempotency-Key per click (with a fallback when that API is missing). The button stays disabled while the request is in flight.
+  - If the job POST fails, a retry reuses the same `upload_id`. A 404 means the upload is gone, so the next press uploads again.
+  - Option defaults come from the settings.
+- **Jobs list and detail:**
+  - The job is polled every 1.5 s and `/api/queue` every 2 s. A shared queue pill in the header shows queue state.
+  - Polling pauses when the tab is hidden and when nothing is queued or running, and resumes after any action and when queue activity is seen.
+  - The detail page shows stage cards with chips, bars and % plus messages; a clip × lang grid with mini stage bars, errors, `voice_stale`, Review, Download and Cancel/Stop; and the queue position.
+  - Resume appears for failed, interrupted or partially failed jobs. Cancel/Stop appears for active tasks; stopping a running task asks for confirmation.
+  - The log tail (`?tail=200`) shows in a `<details>` and refreshes on every poll while open.
+  - Rebuilds keep keyboard focus (`data-fk` keys) and only happen when the JSON changed.
+- **Clip review:**
+  - `<video controls preload=metadata>` with `?token=&v=<bust>`. The bust is set to the task's `finished_at` after a re-render.
+  - The narration has a word count plus estimated seconds from `settings.script.wps_<lang>` (3.0 fallback), compared against the clip length and `max_speedup`.
+  - The title has a /70 counter, plus description and hashtags (space or comma separated, with a chip preview).
+  - Save is a PUT and shows the voice_stale notice.
+  - Re-render saves pending edits first ("Save & re-render"), POSTs, then polls `/api/tasks/{id}` and the job (for stage bars). Both buttons stay disabled while a task or a run_job for the job is active. A 200 response means "already queued".
+  - Download uses `download_url?token=`. Previous/next links cover the clip-lang pairs.
+  - Hindi fields get `lang="hi"`, and the computed font is `"Noto Sans Devanagari", "Noto Sans", sans-serif` (checked in the browser).
+- **Settings:**
+  - The form is generated from `/api/settings/schema`. It resolves `$ref`/`$defs`/`allOf` and handles `anyOf`-null as nullable.
+  - Fields render by schema type: numbers get min/max/step, enums and consts get selects, bools get checkboxes, an array of enum gets checkboxes, and an array of str gets text.
+  - Labels and help text are owned by the frontend, with a fallback to the schema title. Datalists cover whisper model/device/compute_type and the voice engines.
+  - The two `profile_id` fields are dropdowns filled from `/api/voicebox/profiles`. On 503 they fall back to text inputs with the server's message.
+  - `captions.position_pct` gets a slider plus a number input, a 9:16 preview and a "legacy bottom margin" (null) toggle.
+  - Save PUTs the whole object (loaded settings with the form values applied). Fields missing from the schema are not rendered.
+- **Doctor:** a table with ok/warn/fail badges plus a summary and a Re-run button.
+- **Look and feel:** dark/light follows `prefers-color-scheme`, and a toggle (Auto/Light/Dark) is stored in localStorage. There is a visible focus ring and a skip link. At 360 px there is no horizontal scroll.
+
+**Manual check:** I ran a scratch launcher outside the repo with `create_app(worker=Worker(deps_factory=<tests/fakes>), voicebox_factory=FakeVoicebox)`. `AUTOCLIPPER_DATA_DIR` pointed to a scratch copy of the sample job (I only read the real job dir). The server ran on ports 8790/8791 in the in-app browser. There was no real Anthropic API call and no Voicebox synthesis; the doctor's read-only Voicebox health check did run.
+- **Verified:**
+  - The jobs list and detail render the sample job, all 4 clip-langs done.
+  - The clip review video loads (readyState 4, 30.24 s, seekable via Range).
+  - An edit, then Save, shows voice_stale. The first re-render failed with "no Voicebox profile set for hi", and the error appeared in the task line and a toast.
+  - I set the profiles in Settings via the dropdown and saved; settings.json on disk changed as expected, and null `whisper.language` stayed null.
+  - Settings 422s landed on their fields: `captions.font_size` ">= 20", and the cross-field `clips.max_seconds` error.
+  - The second re-render progressed voice → captions → render and finished, the video src was re-busted and voice_stale cleared.
+  - New job from an uploaded mp4 (1 clip, EN) went to the detail page and ran to done with live stage updates, and the log tail showed. After done, 0 requests were made in 5 s, so polling paused.
+  - Client checks rejected `.txt` and `file://`.
+  - The doctor table works.
+  - 503 profiles showed the text-input fallback plus the notice.
+  - A token rotated on the server showed the 403 banner.
+  - At 360 px, scrollWidth is 360 on every page. Dark theme renders.
+- **Tests:** `uv run pytest -q` gives **633 passed**. The first run hit `OSError: No space left on device`: the `/tmp` tmpfs (7.4 GB) is full, mostly `/tmp/pytest-of-ptl-admin` (6.2 GB). I re-ran with `--basetemp` on the home disk, deleted my own scratch data afterwards, and did not touch the other dirs. **Lead:** someone should clear old pytest basetemps, or the suite will keep failing for everyone.
+
+**Requests for backend (I don't own these files):**
+1. Static responses seem cacheable. After I edited app.js, the browser kept running the old copy until a forced reload. Please send `Cache-Control: no-cache` on `/static/*`, or no-store as `/` already has, so an upgraded install picks up the new JS.
+2. Optional: `HEAD /static/app.js` returns 405. This is harmless.
+
+## Builder (backend)
+
+Step 2 backend is built to CONTRACT_WEB sections 1-5 and 7. Nothing committed.
+- **Files:** `autoclipper/web/{__init__,errors,auth,worker,server}.py`, the `serve` subcommand in `autoclipper/cli.py` (additions only: `_port`, `cmd_serve`, the parser entry), and `tests/test_web_{support,auth,jobs,clips,settings,worker}.py`. pyproject.toml is unchanged: fastapi, uvicorn and httpx were already there, and python-multipart is not used.
+- **Tests:** `uv run pytest -q` gives **633 passed** (224 of them are web tests). Every route has tests for: happy path; 422 cases (missing fields, wrong types incl. "3" and true for ints, empty and very long strings, 0, negative and 10**30 values, bad enums, extra keys, malformed JSON, non-object bodies); 401/403 (token, Host, Origin, Sec-Fetch-Site); 404; exact keys and types; disk side effects. There are also tests for a forced exception returning a clean 500, Range 206/416, FIFO order and positions, rerender and resume idempotency, cancelling queued and running tasks (a stub that logs in a loop), crash recovery, a failing or SystemExit task not killing the thread, the single writer (JobStore.save is spied on: the only save from a request thread is JobStore.create), one real end-to-end run (upload -> job -> review -> edit -> rerender, with the fakes), and `serve --help`/args with uvicorn.run patched.
+- **Manual check:** I started `autoclipper serve --port <free port> --no-browser` against the real data dir and only sent GETs and rejected writes. Results: GET / injects the token and sends the CSP and no-store headers; 401/403 for missing or wrong token, bad Host and cross Origin; job list and detail show the sample job 20261122-185849-65a6bd (done, 4/4 rendered, Hindi title renders); video Range gives 206; download gives a `20261122-185849-65a6bd_clip01_hi.mp4` attachment; a file: URL gives 422, malformed JSON 422, resume of the complete job 409, unknown path 404, wrong method 405; profiles came from the live Voicebox; doctor showed 0 problems and 1 warning. Ctrl-C shut the worker down and the process exited 0. The sample job was not modified. Voicebox was not touched. The only new file in the real data dir is `data/web/token` (0600).
+- **Choices within the contract (lead: please confirm or veto):**
+  1. A cancelled queued `run_job` would leave job.json `queued`, and the request thread may not write it. So the worker thread marks that job `failed`/"interrupted" between tasks, which lets the UI offer Resume. The same happens when a run_job ends before the pipeline can record it (settings or deps failure).
+  2. `log` raises TaskCancelled only once. It does not raise again while that TaskCancelled is being handled (checked with `sys.exc_info`). Without this, the pipeline's `rep.interrupted()` -> `log` inside its `except BaseException` would raise again before `_mark_job_interrupted` saves job.json.
+  3. Extra 409 on resume when job.json says `running`, no worker task exists, and the file changed less than 30 s ago (a CLI process is running the job, so there must not be a second writer).
+  4. Resume idempotency looks only at `run_job` tasks for the job. A queued or running rerender does not block a resume; the resume is queued after it.
+  5. Uploads keep a small `upload.json` (the original filename) beside `source<ext>`. The job source becomes `upload:<original name>`. Allowed Content-Types are missing, application/octet-stream, video/* and application/ogg; multipart and anything else get 415. A malformed Range is ignored (full 200). An unsatisfiable Range gets a JSON 416 with `Content-Range: bytes */size` (Starlette would send plain text).
+  6. GET /api/settings when settings.json is invalid: 500 with the dotted field errors (PUT can still fix it). PUT validates with `strict=True`, so `"78"` for an int is 422.
+  7. `create_app` takes an additive `static_dir=` kwarg for tests. GET / serves a tiny fallback page (still with the token meta) when index.html is missing. HEAD is also accepted on the video and download routes.
+  8. An unreadable job.json shows in the list and detail as `failed` / "job.json unreadable". Other routes return 409 for it.
+- **Ops note:** `/tmp` (tmpfs, 7.4 G) is 98 % full. About 6.2 G of it is pytest's retained `/tmp/pytest-of-ptl-admin/pytest-*` dirs, which come from the e2e/ffmpeg tests of all builders. A plain `uv run pytest -q` aborted with "No space left on device". I deleted nothing. I ran the suite with `--basetemp` and `TMPDIR` under `~/.cache/autoclipper-backend-pytest/`. The user should decide whether to clear the old pytest dirs.
+
+## Reviewer (api)
+
+I reviewed the step-2 web backend against the API rules and CONTRACT_WEB sections 2-5. I changed no source files. I tested by driving `create_app` in-process with TestClient, a stub worker and a data dir under `~/.cache/autoclipper-review/`, which I deleted afterwards. The real `data/` and Voicebox were not touched.
+
+Overall the backend is solid. Routes I probed came back with the expected codes and the clean `{"message","errors"}` body: bad ids, traversal attempts, NaN/Infinity, `true` for an int, both or neither of url/upload_id, bad Idempotency-Key, Range 206/416, multi-range, query-token scope, Host/Origin guards, 405/404. The defects below are real.
+
+- **API-1 (high) Binding to a non-loopback address hands the token to anyone on the network.** Started with `serve --host 0.0.0.0` (or a LAN IP), `GET /` is public. The Host guard checks only the Host header, which the client chooses, and not the peer address. Proof: a TestClient with peer 192.168.1.99 sent `GET /` with `Host: 127.0.0.1:8765`. It got 200 and the real token in the meta tag. `GET /api/settings` with that token then returned 200. The CLI warning "the API is token-protected but reachable from the network" is therefore false. In the same mode, a request with the real Host (`192.168.1.20:8765`) gets 403 "forbidden host", so only spoofed requests work. Fix: when the bind is not loopback, either refuse to inject the token into `/` (or refuse to serve `/`) for non-loopback peers (`scope["client"]`), or require the token to be typed in. Fix the warning text, and add a test with a non-loopback `client=`.
+- **API-2 (medium) Some malformed JSON bodies get 400, not 422.** The contract says malformed JSON is 422. FastAPI turns any non-`JSONDecodeError` from `json.loads` into `HTTPException(400, "There was an error parsing the body")`. Proof: `POST /api/jobs` with `{"url":"https://a.b/x","options":{"clips":<5000 digits>}}` gives 400. So does `{"url":[[[[...100000 deep]]]]}` (RecursionError), and `PUT /api/settings` with a 5000-digit int. Fix: in `_http_error`, map a 400 with that detail to 422 `{"message":"validation failed","errors":{"body":["invalid JSON"]}}`. Add tests for both cases.
+- **API-3 (medium) `PUT /api/settings` saves values that can never work.** Free fields have no format or bounds check. Proof (all returned 200 and were written to settings.json):
+  - `voicebox.url = "file:///etc/passwd"`. The typo `"127.0.0.1:17493"` (no scheme) is also accepted, after which every voice stage and `/api/voicebox/profiles` fail.
+  - `captions.margin_v = -5` and `= 10**30`. Both go into the ASS header.
+  - A 100 000-char `llm.model`, and `captions.primary_color = ""`.
+
+  Fix: validate in the API layer, as for jobs (CONTRACT_WEB section 8 lets the product builder own config.py): voicebox.url must be http/https with a host, `margin_v` must be in 0..height, colours must match `^&H[0-9A-Fa-f]{8}$`, and free strings need max lengths. Add 422 tests for each.
+- **API-4 (low) A job URL with an invalid port passes validation.** `POST /api/jobs {"url":"http://a.b:99999/x"}` gives 201 and a queued job, which only fails later in yt-dlp. `_check_url` never reads `urlsplit(url).port`, which is the call that raises ValueError for out-of-range or non-numeric ports. Fix: read `parts.port` inside the try and return 422 `errors.url`.
+
+Checked and OK: path params use regex and int bounds, so `..`, `%2e%2e%2f` and huge clip numbers get 404/422. `/static` resolves the path and checks the parent. The upload filename blocks `/`, `\`, NUL, `..` and control characters, a duplicate `filename=` query is caught, and the extension comes from the allow-list. Uploads stream with both a Content-Length check and a streamed-byte 413, and a partial file is removed on error. `?token=` works only on the media GET/HEAD routes. Idempotency replay gives 200, a different body gives 409, and keys persist. A rerender while one is queued returns the same task. Errors never echo the input or a traceback.
+
+## Reviewer (worker)
+
+Lens: worker and concurrency (job.json single writer, queue, rerender vs run, shutdown, crash recovery, leaks, sync vs async handlers, slow Voicebox). No project source edited. Repros ran from the scratchpad with `AUTOCLIPPER_DATA_DIR` set to a temp dir and stub `run_job`. The real `data/` was not touched.
+
+- **WORKER-1 (medium, proven) After a stop and a quick restart, a job can stay "queued" (or "running") forever with no task and no Resume button.** `Worker.stop()` cancels only the running task. Queued `run_job` tasks are dropped from memory, and their job.json stays `queued`. `_loop` also returns before it handles `_finalize`. On restart, `recover_interrupted` skips any job.json changed less than 30 s ago, and it only runs at startup. Repro: submit A and B, `stop()`, then a new `Worker.recover_interrupted()`. Result: A is failed/interrupted, B is `queued`, `recovered: []`, `active_task_for(B)` is None. `app.js` has `canResume = !d.task && (status=='failed' || interrupted || failed>0)`, which is False for B. The UI shows "queued" until a later restart that comes more than 30 s after B's last write. A hard kill or a 10 s join timeout during an LLM call (see WORKER-2) leaves a `running` job in the same state. Fix: in `stop()`, after the join (worker = writer), mark every still-queued `run_job` job interrupted with `_mark_interrupted(only_if=("queued",))`, and run `_finalize` before returning. Also show Resume for `queued`/`running` jobs that have no task, since the API already allows resume for `queued`, and for `running` after 30 s. Another option is to re-run recovery lazily (for example from GET /api/jobs/{id}) once the 30 s have passed.
+- **WORKER-2 (medium) The 30 s mtime heuristic marks a live CLI job interrupted, and Resume then gives two writers.** Several pipeline spans never write job.json: the moments LLM call (`rep.start("moments")`, then `run_moments` with no progress), the whisper model load or first-run download before the first segment, `extract_audio_for_asr`, the per-clip `write_script` and `lengthen` LLM calls, and Voicebox `generate`. Each can last more than 30 s. Scenario: `autoclipper run <url>` in a terminal is on the moments call. The user starts `autoclipper serve`, and `recover_interrupted` marks that job failed/"interrupted". The UI offers Resume, and the resume 409 guard only covers `status=="running"`. The worker then runs run_job on the same job while the CLI still runs it: two job.json writers and two ffmpeg/Voicebox runs into the same outputs. The CLI later overwrites the status. Fix: use a real per-job ownership marker instead of mtime. For example, a `job.lock` with pid and hostname, written by both CLI `run` and the worker around `run_job`/`rerender`, removed in `finally`, and treated as stale only when the pid is dead. Or heartbeat-touch job.json from a timer while a stage runs.
+- **WORKER-3 (low, plausible) Ctrl-C on `serve` records the current clip as a normal ffmpeg failure, and the pipeline starts the next clip before the cancel arrives.** SIGINT reaches the whole foreground process group, so the ffmpeg child dies at once. The worker thread gets no KeyboardInterrupt, though. It sees `FFmpegError` (an `Exception`), so `_process_clip_lang` stores `render: ffmpeg ...` (or `_job_stage_cut` records a cut error and moves on to the next clip), and the next ffmpeg or Voicebox generation starts. Only later does uvicorn finish its graceful shutdown, call `worker.stop()`, and set the flag. Result: the clip-lang shows as "failed" with a misleading ffmpeg error instead of "interrupted", and extra work is started and then killed. Fix: in `_execute`, after a task finishes with an Exception while `_stopping` or the cancel flag is set, report it as cancelled/interrupted. Or have `cmd_serve` set the worker's stopping/cancel flag from a SIGINT handler before uvicorn's graceful wait. ffmpeg.py is frozen, so `start_new_session` cannot be added there in step 2.
+- **WORKER-4 (low, proven) The task table and cancel events grow without bound.** `_tasks` is never pruned, and `cancel_ex` on a queued task never pops `_cancel[task.id]`. Repro: 500 queued-then-cancelled resumes leave `tasks kept: 501, cancel events kept: 500`, while `recent` stays at 20. Fix: pop `_cancel` in the queued-cancel path, and drop a finished task from `_tasks` when it falls out of `_recent`, or keep a bounded LRU. GET /api/tasks/{id} can then return 404 for evicted tasks.
+
+Checked and OK: only the worker thread writes existing job.json files. Request threads read through `read_job` (atomic replace, retry on parse error), and `submit_job` is the only create. `exclusive()` holds the worker lock, so no task can start during a script PUT, and it checks `_running` under the same lock (no TOCTOU). Rerender is 409 while a run_job is queued or running. A queued rerender for the same key is reused, and a running one does not block a new one. Resume re-checks under the lock, so two concurrent resumes give one task. Cancel-then-resume before finalize is safe (`_safe_finalize` skips when a run_job is active). TaskCancelled before the pipeline's own handlers, and the raise-once `sys.exc_info` guard, both still end with job.json failed/interrupted. A failing task does not kill the thread. Idempotent job creation is serialized by `idem_lock`. The upload handler is async, with writes in the threadpool. The Voicebox profiles route and the doctor route are sync or threadpool with a 10 s timeout, so a slow Voicebox does not block the event loop. During a task, Voicebox polling calls `on_progress` on every poll, so cancel works there. GuardMiddleware is pure ASGI, so streaming bodies work.
+
+## Reviewer (ux)
+
+Browser review: headless Google Chrome via playwright-core (in `~/.cache/autoclipper-ux-review`, outside the repo). I ran two `autoclipper serve` instances. The first (:18765) used the real data dir with GETs only. The second (:18766) used `AUTOCLIPPER_DATA_DIR` pointed at a scratch copy of the sample job (id `20261122-999999-uxcopy`, also under `~/.cache/autoclipper-ux-review`), and all edits and settings saves went there. Both servers are stopped. The real job and data/settings.json have the same md5 as before, no job was created and Voicebox is still running. No re-render was triggered, because the copied voice.json has absolute paths into the real job. Screenshots are in `~/.cache/autoclipper-ux-review/shots/`.
+
+**Works:**
+- No console errors or page errors on any route.
+- The jobs list and detail show the sample job.
+- The review video plays: readyState 4, 1080x1920, 206 Range.
+- Devanagari renders correctly in the narration, title, description and hashtag chips, and in the burned-in captions.
+- Save writes script.json and shows voice_stale.
+- The unsaved-changes guard works on the clip and settings pages.
+- Settings round-trip: font_size, wps_hi and whisper.language "hi" then back to null are saved on disk. A 422 lands on its field. Empty and decimal ints are caught on the client.
+- The slider can be moved with the arrow keys.
+- At 360 and 320 px (also in dark mode) there is no horizontal scroll on any page.
+- The focus ring is visible, and the theme toggle and log `<details>` work from the keyboard.
+
+**Defects:**
+- **UX-1 (medium):** the hashtag limit does not match. The clip editor says "up to 30", previews 30 chips and validates 30 on the client. ClipScriptIn also accepts 30. But `normalize_script` keeps only 8 (`MAX_HASHTAGS = 8`), and the toast just says "Saved.". Proven: I entered 12 tags and only #टैग1-#टैग8 were saved to script.json; 4 tags were dropped without notice. Fix: make the UI hint, client check and server model say 8, or return 422 above 8. Or the toast could report dropped or merged tags, as it already does for the shortened title.
+- **UX-2 (medium, a11y):** the "Skip to content" link (`href="#main"`) goes through the hash router. Pressing it on any page shows "Page not found", which loses the page. With unsaved edits it brings up the "Leave without saving?" dialog. Proven in a screenshot (`k_skiplink.png`). Fix: a click handler that calls preventDefault and runs `main.focus()`, or have route() ignore `#main`.
+- **UX-3 (low, a11y):** on New job, after the "Choose file…" button there is a second tab stop on the visually hidden 1x1 `<input type=file>`. Its focus ring is invisible. Fix: give the input `tabindex=-1`, because the button already opens the picker.
+- **UX-4 (low):** Revert on the clip editor does not call `updateButtons()`. The primary button keeps saying "Save & re-render" after Revert, even though nothing is dirty and the "Unsaved changes" label has cleared.
+- **UX-5 (low, privacy):** the video and download URLs carry `?token=`, so uvicorn's access log prints the full auth token on every video request (8 lines in a short session). Users paste terminal output into bug reports. Fix: filter the query out of the access log, or use `access_log=False` / a log filter for `token=`.
+- **UX-6 (low, a11y):** form errors add a CSS class but never set `aria-invalid="true"` on the control, on the clip editor or in settings. Errors are still announced through `role=alert` and `aria-describedby`, so this is minor.
+
+**Note (not a defect):** saving settings unchanged writes every default (for example script.*, web.*, audio.loudnorm) into settings.json, so those values no longer follow future default changes. This is as the contract specifies (PUT of the whole object). I am only mentioning it.
+
+## Team Lead (step 2 review triage)
+
+I checked every finding against the code myself (auth.py `_reject`/index(), errors.py `_http_error`, server.py `_check_url`/`put_settings`/ClipScriptIn, worker.py `stop`/`_loop`/`cancel_ex`/`recover_interrupted`, app.js route/FormErrors/clip editor). I also confirmed in Python that `urlsplit('http://a.b:99999/x').hostname` succeeds and only `.port` raises, and that `json.loads` on a 5000-digit int raises a plain ValueError, not JSONDecodeError. FastAPI routing.py maps that to 400 "There was an error parsing the body". **All 14 findings are accepted.** None is a false positive.
+
+**Backend (auth.py, errors.py, server.py, worker.py, cli.py, tests/test_web_*):**
+- API-1 (high): index() injects the token for any request whose Host header passes, and Host is chosen by the client. Fix: in `index(request)`, inject the token only when `request.client.host` is loopback (`is_loopback`). Otherwise replace the placeholder with "" so the existing "no access token" banner shows. Change the cli.py warning to: "binding <host>: the UI token is only given to loopback clients; other machines cannot use the app". Tests: `TestClient(app, client=("192.168.1.99", 1))` with `Host: 127.0.0.1:8765` must not contain the token. The loopback-peer case still gets it.
+- API-2: in `_http_error`, map status 400 with detail "There was an error parsing the body" to 422 `{"message":"validation failed","errors":{"body":["invalid JSON"]}}`. Tests: a 5000-digit int and 100000 nested `[` on POST /api/jobs and PUT /api/settings must return 422 with that exact shape.
+- API-3: in put_settings, after model validation, add these checks with dotted 422 errors and no write: `voicebox.url` http/https with a host, and port valid if given; `captions.margin_v` 0..clips.height; `captions.primary_color`/`highlight_color` match `^&H[0-9A-Fa-f]{8}$`; max lengths on free strings (llm.model, api_key_env, font names, whisper.* strings, profile ids ≤ 200; urls ≤ 2048). Before adding the colour regex, check that the current defaults pass it. Tests must cover each field and assert settings.json is unchanged on 422.
+- API-4: in `_check_url`, evaluate `parts.port` inside the try. Tests: `:99999` and `:abc` -> 422 errors.url, and no job dir created.
+- UX-5: remove the token from uvicorn access logs. Add a `logging.Filter` on `uvicorn.access` that rewrites `token=[^&\s"]+` to `token=***` in record.args, installed in cmd_serve. Test the filter function directly.
+- Builder (frontend) request: add `Cache-Control: no-cache` to /static/* responses, and let the static route accept HEAD (currently 405). Add a test for each.
+- WORKER-1: in `stop()`, after join (if the thread exited), mark every still-queued run_job's job interrupted with `_mark_interrupted(only_if=("queued",))` and drain `_finalize`. In app.js, canResume must also be true for `queued`/`running` jobs with no `d.task` (the resume 409 guard still protects a live CLI). Test: submit A+B, stop(); B's job.json must be failed/interrupted.
+- WORKER-2: replace the 30 s mtime heuristic with a `job.lock` file `{pid, host, started}` in the job dir. The worker writes it in `_execute` and the CLI writes it in `cmd_run`/`cmd_rerender`; both remove it in finally. recover_interrupted and the resume/rerender 409 guards treat a lock as live when the host matches and `os.kill(pid, 0)` succeeds. A lock from a dead pid is stale and is overwritten. Keep RECOVER_MIN_AGE only as a fallback when no lock exists. Tests: a live-pid lock blocks recovery and resume (409), and a dead-pid lock does not.
+- WORKER-3: in `_execute`, if the task ends (Exception or normal return with failures) while `_stopping` or its cancel flag is set, set the task to cancelled and mark the job interrupted with `_mark_interrupted(only_if=("running",))`. In cmd_serve, also set the worker's stopping flag first through uvicorn's shutdown hook. Test with a stub run_job that raises after stop() sets the flag.
+- WORKER-4: pop `_cancel[task.id]` in cancel_ex's queued branch, and evict finished tasks from `_tasks` when they drop off `_recent` (in both places that appendleft). Test: 500 cancel cycles leave len(_tasks) ≤ history+queue and len(_cancel)==0, and an evicted id gets 404 from GET /api/tasks/{id}.
+- Sign-offs: approved are the queued-cancel finalize -> interrupted behaviour, the raise-once TaskCancelled guard, and the listed additions beyond the contract (resume 409, upload.json, Range/416, settings 500, static_dir kwarg, HEAD). Add them to docs/CONTRACT_WEB.md.
+
+**Frontend (app.js, index.html):**
+- UX-1: use the hashtag limit 8 everywhere. Hint "up to 8", `list.slice(0, 8)`, validateClient `> 8` -> "At most 8 hashtags.". Backend: ClipScriptIn.hashtags `max_length=MAX_HASHTAGS` imported from stages/script.py, plus a 422 test for 9 tags. Also, after save, if the returned hashtags differ from what was sent (dedupe/merge), say so in the toast, the same way the shortened-title toast does.
+- UX-2: add a click handler on `.skip-link` that calls preventDefault() and `document.getElementById('main').focus()`. Also make route() and the hashchange listener ignore `#main` (restore lastHash, no re-route, no guard).
+- UX-3: give `#nj-file` the attribute `tabindex: '-1'`.
+- UX-4: call `updateButtons()` at the end of fillForm(), which also covers the post-load case.
+- UX-6: in FormErrors.show() set `aria-invalid="true"` on the first input/select/textarea of each matched container, and remove it in clear().
+- Manual check still open: Stop on a running task from the queue panel. Do it in the next UX pass on a scratch data dir with a stub/short job.
+
+**Product:**
+- allow_lengthen = `regenerated or not voice.json exists` in run_job: approved. It protects user-edited narration on resume. Document it in README/CONTRACT.
+- The two changed step-1 tests are approved; the old assertions described behaviour that is now replaced.
+- README intro line 7 and the paragraph on long voice-overs: the product builder now owns those lines and should update them to the step-2 behaviour (ducking, lengthening).
+- git stash/pop while others were editing: backend and frontend must each diff their own tracked files (cli.py, TEAM_LOG.md) against what they last wrote, and re-apply anything lost. Nobody stashes again while builders are active.
+
+**Not a code issue, user decision:** /tmp (tmpfs 7.4G) is ~98% full, with ~6.2G in old `/tmp/pytest-of-ptl-admin/pytest-*`. Nobody deletes it. Until the user decides, run the suite with `--basetemp` (and TMPDIR) under `~/.cache/autoclipper-*-pytest/`.
+
+## Fixer (step 2 review fixes)
+
+All 14 review findings and the 4 lead items are applied. I fixed code, not tests, except for the 4 test lines below. Nothing is committed and I did not use git stash. The real data/, the sample job and Voicebox were not touched.
+
+- **API-1:** `index(request)` injects the token only for a loopback peer (`is_loopback(request.client.host)`) and puts "" in the meta tag for anyone else. The cli.py warning now says "the UI token is only given to loopback clients; other machines cannot use the app".
+- **API-2:** `_http_error` turns 400 "There was an error parsing the body" into 422 `{"message":"validation failed","errors":{"body":["invalid JSON"]}}`.
+- **API-3:** `put_settings` calls `_settings_value_errors` and writes nothing on any error. It checks:
+  - `voicebox.url`: http/https, a host, a valid port, at most 2048 chars;
+  - `margin_v`: 0..clips.height;
+  - colours: `^&H[0-9A-Fa-f]{8}$` (both defaults pass);
+  - at most 200 chars: llm.model, llm.api_key_env, font_en/font_hi, whisper.*, and voicebox english/hindi profile_id and engine.
+- **API-4:** `_check_url` reads `parts.port` inside the try.
+- **UX-1:** `ClipScriptIn.hashtags` uses `max_length=MAX_HASHTAGS` (8, from stages.script). In app.js, `MAX_HASHTAGS = 8` sets the hint, the chip preview and the client check. The save toast now says when the server changed the hashtags.
+- **UX-2:** a `.skip-link` click handler calls preventDefault and focuses `#main`. On hashchange, `#main` restores lastHash with no guard or route. A first load on `#main` goes to `#/jobs`.
+- **UX-3:** `#nj-file` has tabindex -1.
+- **UX-4:** fillForm() calls updateButtons().
+- **UX-6:** FormErrors sets and clears aria-invalid.
+- **UX-5:** `auth.TokenRedactFilter` / `install_access_log_filter()` on `uvicorn.access`, installed in cmd_serve. I checked that it survives uvicorn's dictConfig.
+- **Static:** `/static/*` accepts GET and HEAD and sends `Cache-Control: no-cache`.
+- **WORKER-1:** `stop()` = `begin_stop()` + join. If the thread has exited, it drains `_finalize` and cancels every still-queued task ("server stopped"), and a queued run_job's job.json goes to failed/interrupted. app.js `canResume` is also true for queued/running jobs with no task.
+- **WORKER-2:** new `autoclipper/joblock.py`: `job.lock` `{pid, host, started}`, `hold_job_lock`, `live_lock`, and `pid_alive` (os.kill(pid, 0) on POSIX, OpenProcess on Windows, because os.kill(pid, 0) sends CTRL_C on Windows). Who uses it:
+  - The worker `_execute` holds the lock around run_job/rerender. If another process holds a live lock, it raises `JobLocked`: the task fails and job.json is not touched.
+  - cli `run` creates a new job first, the same way the worker does, so the lock covers the whole run. cli `run --job` and `rerender` also hold the lock. A foreign live lock gives exit 1.
+  - recover_interrupted, resume and rerender treat a live lock as "another process" (409), unless the worker itself has a task for the job.
+  - The 30 s mtime check is used only when there is no job.lock file.
+- **WORKER-3:** a task that ends with an Exception or a normal return while `stopping` or its cancel flag is set becomes `cancelled`. Its job.json goes to failed/interrupted (`only_if=("queued","running")`). I added "queued" because a run that never reached the pipeline's own writes would otherwise stay queued. `cmd_serve` passes `create_app(stop_on_signal=True)`. The lifespan then chains SIGINT/SIGTERM in front of uvicorn's handler with `install_stop_hook`, so `worker.begin_stop()` runs as soon as the signal arrives. I kept `uvicorn.run`, so the serve tests still patch it. ffmpeg.py is untouched.
+- **WORKER-4:** cancel_ex's queued branch pops `_cancel`. `_remember()` replaces both appendleft calls and evicts a finished task that falls out of `_recent`.
+- **Docs:** CONTRACT_WEB.md has a new section 10 that lists every approved addition, the job.lock rules and the allow_lengthen rule, and sections 1, 4.4 and 5 are updated. README intro item 7 and the voice-over paragraph now describe ducking and loudnorm, the one lengthen retry, and when lengthening is allowed. The README also gives the bounds for margin_v and the colour format.
+- **Stash check (BUILDER-product-stash):** the backend's tracked cli.py still has the whole serve block (`_port`, `cmd_serve`, parser entry), and TEAM_LOG.md has every builder and reviewer section. The frontend files are untracked, so git stash never touched them. Nothing was lost.
+- **Tests changed (they were wrong after API-1):** tests/test_web_auth.py now uses `client=("127.0.0.1", 50000)` for the 3 index tests, because TestClient's default peer "testclient" is not loopback. tests/test_web_worker.py: the network-bind warning test now checks the new text.
+- **New tests:** tests/test_web_review_fixes.py has 79 tests, one or more per fix:
+  - non-loopback/loopback peers;
+  - 5000-digit and 100000-deep bodies on jobs and settings, checking that no job dir is created and settings.json is byte-identical;
+  - every settings field and its boundaries;
+  - ports;
+  - 9 hashtags;
+  - the redact filter;
+  - static HEAD/no-cache;
+  - stop with A+B;
+  - live, dead, other-host and garbage locks for recovery, resume and rerender;
+  - the lock written by the worker and the CLI;
+  - an exception or a normal return after stop;
+  - the signal hook;
+  - 500 queue+cancel cycles, with a 404 for an evicted task.
+- **Suite:** `uv run pytest -q` passed with **712 tests**. I ran it with `--basetemp` and TMPDIR under `~/.cache/autoclipper-fixer-pytest/`, because /tmp is still 98 % full.
+
+## QA co-lead (step 2 review-fix sign-off)
+
+I reproduced every accepted item's failure scenario on my own, outside the fixer's tests. All of them are fixed, apart from the two gaps below, which I fixed myself with tests. Nothing is committed, git stash was not used, and data/, the sample job 20261122-185849-65a6bd and Voicebox (still running) were not touched.
+
+**Confirmed fixed (repro -> now correct):**
+- API-1: LAN peers (192.168.1.99, 10.0.0.5, ::ffff:192.168.1.9, "testclient") with a spoofed `Host: 127.0.0.1:8765` get an empty token. Loopback peers (127.0.0.1, ::1, and ::ffff:127.0.0.1 for a dual-stack bind) get it.
+- API-2: a 100000-deep body and a 5000-digit int give 422 `{"body":["invalid JSON"]}` on POST /api/jobs (even with an Idempotency-Key, and no job dir is created), on PUT /api/settings, and also on PUT .../script, where script.json stays byte-identical.
+- API-3/API-4: bad voicebox URLs, margin_v checked against a `clips.height` changed in the same PUT (1000 is accepted, 1001 is 422), bad colours, and ports :99999/:abc/:-1. All give 422 with the dotted key, and the file stays byte-identical.
+- UX-1: 9 tags give 422 and 8 are accepted and written.
+- UX-5: a record shaped exactly like uvicorn's access log is redacted. In the live server log, `?token=***` appears for the video request.
+- WORKER-1/3: with A running and B queued, stop() leaves both tasks cancelled, both job.json files failed/interrupted, and no job.lock left behind.
+- WORKER-4: 200 queue+cancel cycles through the API leave `_cancel` empty and `_tasks` within the history size, and the evicted id gives 404 with the standard shape.
+- Static: HEAD on a file gives 200 with no body and no-cache, and HEAD on a missing file gives 404.
+- WORKER-2: the fixer's live, dead, other-host and garbage lock tests cover it. I reviewed `joblock.py`.
+- **Browser UX pass** (scratch data dir under my scratchpad, `serve --port 8799`, a fake job; deleted afterwards). These were the fixer's open item:
+  - UX-4: Revert turns "Save & re-render" back into "Re-render".
+  - UX-6: 9 tags set aria-invalid="true" with "At most 8 hashtags.", and a later good save clears it.
+  - UX-1: the hint says "up to 8", and the toast for "a a b" says the hashtags were adjusted.
+  - UX-3: `#nj-file` has tabindex -1.
+  - UX-2: the skip link focuses #main and keeps `#/new`, and a hand-typed `#main` goes back to `#/new` without re-routing.
+  - Ctrl-C (SIGINT) shuts down cleanly. One accidental Save & re-render ran on the fake job. It skipped the voice step and failed at ffprobe on the fake wav, so no Voicebox or LLM call was made.
+
+**Found and fixed by QA (with tests in tests/test_qa_step2_signoff.py):**
+- `ASS_COLOR_RE` used `$`, so `"&H00FFFFFF\n"` passed and a newline would have been written into settings.json and the ASS style line. It is now `\Z`. The same fix is applied to `IDEMPOTENCY_RE` (server.py) and to config.py `_EXT_RE` (`".mp4\n"` was accepted as an extension).
+- `_check_url` accepted port 0 (`http://a.b:0/x` for jobs, `http://127.0.0.1:0` for voicebox.url). It is now 422 "port must be 1-65535". CONTRACT_WEB.md section 10 is updated for both.
+
+**Suite:** `uv run pytest -q` passed with **754 tests** (712 + 42 new QA tests). It ran with `--basetemp`/TMPDIR under `~/.cache/autoclipper-qa-pytest/`, because /tmp is still 98 % full and that is the user's decision.
+
+**Still open (not a blocker):** `hold_job_lock` reads and then replaces the lock file, which is not atomic. Two processes that start the same job at the same instant could both take it. This is acceptable for one user. An `O_EXCL` create would close it if anyone wants it.
+
+## Team Lead (step 2 sign-off)
+
+**Suite:** `uv run pytest -q` passed with **754 tests** in 165 s. It ran with `--basetemp`/TMPDIR under `~/.cache/autoclipper-lead-pytest/`, because /tmp is still 98 % full.
+
+**Browser walk-through.** I used headless Chrome (playwright-core from `~/.cache/autoclipper-ux-review`) against the live `serve` on 127.0.0.1:8765 and looked at every screenshot. There were no console or page errors and no unexpected 4xx/5xx.
+- Jobs list: both jobs show as done with 4 rendered each.
+- Sample job detail: the 4 job stages and the per-clip-lang progress bars render, and the log expands.
+- Review of clip 01 en and hi: the video plays (readyState 4, 1080x1920, 28.84 s). Devanagari renders correctly in the narration, title, description and chips, and in the burned captions.
+- Settings: every section renders, including the new audio/script/web fields and the position slider with its preview.
+- Doctor: 0 problems and 1 warning (node v16, which only step 3 needs).
+- While the rerender ran, the job detail showed "Task running" with Stop, and the review page showed "Rendering…" with live per-stage percentages and the "Narration changed" hint.
+- The server log has `token=***` 13 times and no raw token.
+
+**Real check of the product fixes through the API.**
+- I copied the sample job to `20261122-203600-leadqa` (`cp -a`, voice.json paths rewritten to the copy).
+- I wrote one fresh hi script for clip 01 with real Claude (`write_script` with `settings.script`): target 85 words, got 87.
+- I saved it with `PUT .../clips/1/hi/script` (200, voice_stale) and ran one `POST .../rerender` (202) on the real worker with the real Voicebox. The task was done in 205 s.
+- I sent a second POST by accident, milliseconds after the first had started running. As the contract says, it was queued as a new task, so I cancelled it while it was still queued (200 cancelled). No second render ran.
+
+Results (clip 01/hi, clip 28.84 s):
+
+| Check | Old render (sample) | New render (copy) |
+|---|---|---|
+| Voice length | 18.72 s, about 65 % of the clip | 25.10 s, **87 %** (last word ends 25.08 s; tempo 1.0, not shortened, no lengthen needed) |
+| Loudness while narrated (2-20 s) | -17.5 LUFS | -13.9 LUFS |
+| Tail loudness (26.2-28.8 s) | -46.9 LUFS | **-25.4 LUFS** |
+| Peak | | -1.5 dBFS |
+
+- **The original audio returns after the voice ends.** The tail went from -46.9 to -25.4 LUFS. The cut.mp4 tail on its own is -30.4 LUFS, so the tail now plays the original at full level plus the loudnorm gain.
+- **The captions sit below the face.** I extracted frames at 6, 15 and 24 s and looked at them. The line is centred at `\pos(540,1382)` (72 %), on the collar and tie, clear of the face. The Devanagari conjuncts are correct (शब्द, जाएँ, अट्ठाईस).
+- The live API negatives were all correct: 404 for clip 9, 422 for lang xx, clip -1 and a 20-digit clip, 401 with no token, and 422 for a whitespace-only narration.
+- The original job 20261122-185849-65a6bd is unchanged: the md5 of every file is the same before and after. The copy job stays in data/jobs as the demo of the fixes. Delete it whenever you like.
+
+**Fixes:** no code defects found in this pass, so no code was changed.
+- README: added "Usage: Web UI" (how to run, auth, stop) and the running-server note. The Step 1/Step 2 status lines are updated.
+
+**Server left RUNNING for the user:** `autoclipper serve --host 127.0.0.1 --port 8765 --no-browser`. Its details:
+- PID **1796838**, whose parent is the `uv run` wrapper, PID 1796830.
+- The PID is also in `/tmp/claude-1000/ac_serve.pid`.
+- The log is `/tmp/claude-1000/ac_serve.log`.
+- Stop it with `kill -INT 1796838`, or `pkill -INT -f "autoclipper serve --host 127.0.0.1 --port 8765"`.
+
+Voicebox is untouched and still running.
+
+**Sign-off: step 2 APPROVED.** Still open, not blocking:
+- QA's non-atomic `hold_job_lock`.
+- The /tmp cleanup decision, which is the user's.
+- A native-speaker check of the Hindi pronunciation.

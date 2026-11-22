@@ -6,6 +6,7 @@ import re
 import unicodedata
 from pathlib import Path
 
+from ..config import ScriptSettings
 from ..interfaces import LLM, ShortenFn
 from ..models import ClipScript, Moment, Transcript
 from ._atomic import write_text_atomic
@@ -27,9 +28,16 @@ def count_words(text: str) -> int:
     return len(text.split())
 
 
-def target_words(duration: float, lang: str) -> int:
-    wps = WORDS_PER_SECOND.get(lang, WORDS_PER_SECOND["en"])
-    return max(MIN_TARGET_WORDS, round(max(0.0, duration) * wps * FILL_RATIO))
+def target_words(duration: float, lang: str, *, wps: float | None = None,
+                 fill_ratio: float = FILL_RATIO) -> int:
+    """Narration word count for a clip: duration x fill_ratio x words-per-second.
+
+    Without ``wps`` the step-1 per-language constants are used (settings.script supplies the
+    measured rates in the pipeline).
+    """
+    if wps is None:
+        wps = WORDS_PER_SECOND.get(lang, WORDS_PER_SECOND["en"])
+    return max(MIN_TARGET_WORDS, round(max(0.0, duration) * wps * fill_ratio))
 
 
 def _clean_title(title: str) -> str:
@@ -95,13 +103,24 @@ def load_script(path: Path) -> ClipScript:
 
 
 def write_script(*, llm: LLM, transcript: Transcript, moment: Moment, lang: str,
-                 out_json: Path) -> ClipScript:
-    """Ask the LLM for the script, shorten once if far too long, normalize and write out_json."""
+                 out_json: Path, script_settings: ScriptSettings | None = None) -> ClipScript:
+    """Ask the LLM for the script, shorten once if far too long, normalize and write out_json.
+
+    With ``script_settings`` the word target uses its per-language words/s and fill_ratio, and the
+    LLM is also told the spoken duration to fill (target_seconds). Without it, step-1 constants.
+    """
     duration = moment.end - moment.start
-    target = target_words(duration, lang)
     clip_transcript = format_transcript(transcript, moment.start, moment.end)
-    script = llm.write_script(lang=lang, clip_transcript=clip_transcript, moment=moment,
-                              duration=duration, target_words=target)
+    if script_settings is None:
+        target = target_words(duration, lang)
+        script = llm.write_script(lang=lang, clip_transcript=clip_transcript, moment=moment,
+                                  duration=duration, target_words=target)
+    else:
+        target = target_words(duration, lang, wps=script_settings.wps(lang),
+                              fill_ratio=script_settings.fill_ratio)
+        target_seconds = round(duration * script_settings.fill_ratio, 1)
+        script = llm.write_script(lang=lang, clip_transcript=clip_transcript, moment=moment,
+                                  duration=duration, target_words=target, target_seconds=target_seconds)
     if not script.narration.strip():
         raise ScriptError(f"the LLM returned an empty {lang} narration")
     if count_words(script.narration) > target * SHORTEN_THRESHOLD:
@@ -120,3 +139,4 @@ def make_shorten_fn(llm: LLM, lang: str) -> ShortenFn:
         return llm.shorten(lang=lang, narration=narration, max_words=max_words)
 
     return shorten
+

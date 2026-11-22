@@ -73,8 +73,11 @@ class FakeLLM:
             start += span + 1.0
         return out
 
-    def write_script(self, *, lang, clip_transcript, moment, duration, target_words):
-        self.calls.append(("write_script", dict(lang=lang, duration=duration, target_words=target_words)))
+    def write_script(self, *, lang, clip_transcript, moment, duration, target_words, target_seconds=None):
+        call = dict(lang=lang, duration=duration, target_words=target_words)
+        if target_seconds is not None:  # recorded only when given, so older call assertions still match
+            call["target_seconds"] = target_seconds
+        self.calls.append(("write_script", call))
         n = self.narration_words or max(3, target_words)
         base = "यह एक परीक्षण वाक्य है" if lang == "hi" else "this is a test sentence"
         words = (base.split() * (n // len(base.split()) + 1))[:n]
@@ -84,6 +87,12 @@ class FakeLLM:
     def shorten(self, *, lang, narration, max_words):
         self.calls.append(("shorten", dict(lang=lang, max_words=max_words)))
         return " ".join(narration.split()[:max_words])
+
+    def lengthen(self, *, lang, narration, target_words):
+        """Step 2: repeat the narration's words until it has target_words words."""
+        self.calls.append(("lengthen", dict(lang=lang, target_words=target_words)))
+        words = narration.split() or ["word"]
+        return " ".join((words * (target_words // len(words) + 1))[:max(target_words, len(words))])
 
 
 class FakeVoicebox:

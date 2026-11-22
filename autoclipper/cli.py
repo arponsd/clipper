@@ -5,6 +5,7 @@ Exit codes: 0 ok, 1 error, 2 usage error.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -106,19 +107,32 @@ def _load_settings() -> Settings:
 # commands
 # ---------------------------------------------------------------------------------------------
 def cmd_run(args: argparse.Namespace) -> int:
+    from .joblock import hold_job_lock
+    from .jobstore import JobStore
     from .pipeline import run_job
 
-    store = run_job(args.source, settings=_load_settings(), langs=args.langs, count=args.clips,
-                    min_seconds=args.min, max_seconds=args.max, job_id=args.job, log=_out, debug=args.debug)
+    settings = _load_settings()
+    job_id = args.job
+    source = args.source
+    if not job_id and source:
+        # Create the job first (as the web worker does) so job.lock covers the whole run: a web server
+        # started meanwhile then sees a live owner and neither marks it interrupted nor resumes it.
+        job_id = JobStore.create(source).job.id
+    with hold_job_lock(job_id) if job_id else contextlib.nullcontext():
+        store = run_job(source, settings=settings, langs=args.langs, count=args.clips,
+                        min_seconds=args.min, max_seconds=args.max, job_id=job_id, log=_out, debug=args.debug)
     _out()
     _print_status(store.job, store.dir)
     return 0 if store.job.status == "done" else 1
 
 
 def cmd_rerender(args: argparse.Namespace) -> int:
+    from .joblock import hold_job_lock
     from .pipeline import rerender
 
-    final = rerender(args.job, args.clip, args.lang, settings=_load_settings(), log=_out, debug=args.debug)
+    settings = _load_settings()
+    with hold_job_lock(args.job):
+        final = rerender(args.job, args.clip, args.lang, settings=settings, log=_out, debug=args.debug)
     _out(f"final: {final}")
     return 0
 
@@ -486,6 +500,57 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------------------------
+# serve (step 2 web UI)
+# ---------------------------------------------------------------------------------------------
+def _port(value: str) -> int:
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a port number, got {value!r}") from None
+    if not 1 <= n <= 65535:
+        raise argparse.ArgumentTypeError(f"port must be 1..65535, got {n}")
+    return n
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    import threading
+    import webbrowser
+
+    import uvicorn
+
+    from .web.auth import allowed_hosts_for, install_access_log_filter, is_loopback
+    from .web.server import create_app
+
+    _load_settings()  # fail early with a clear message when settings.json is broken
+    host = args.host
+    if not is_loopback(host):
+        _err(f"warning: binding {host}: the UI token is only given to loopback clients; "
+             "other machines cannot use the app")
+    shown = host if is_loopback(host) and host != "localhost" else "127.0.0.1"
+    if ":" in shown and not shown.startswith("["):
+        shown = f"[{shown}]"
+    url = f"http://{shown}:{args.port}/"
+    install_access_log_filter()
+    app = create_app(allowed_hosts=allowed_hosts_for(host), stop_on_signal=True)
+    _out(f"Auto Clipper web UI: {url}  (Ctrl-C to stop)")
+    if not args.no_browser:
+        def _open() -> None:
+            try:
+                webbrowser.open(url)
+            except Exception:  # noqa: BLE001 - never fail because of the browser
+                pass
+
+        threading.Timer(1.0, _open).start()
+    try:
+        uvicorn.run(app, host=host, port=args.port, log_level="info")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        app.state.worker.stop()
+    return 0
+
+
+# ---------------------------------------------------------------------------------------------
 # parser / main
 # ---------------------------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
@@ -531,6 +596,12 @@ def build_parser() -> argparse.ArgumentParser:
     ss.set_defaults(func=cmd_settings_set)
 
     sub.add_parser("doctor", parents=[common], help="check ffmpeg, fonts, Voicebox, API key, node").set_defaults(func=cmd_doctor)
+
+    sv = sub.add_parser("serve", parents=[common], help="start the local web UI (http://127.0.0.1:8765/)")
+    sv.add_argument("--host", default="127.0.0.1", help="address to bind (default 127.0.0.1, loopback only)")
+    sv.add_argument("--port", type=_port, default=8765, help="port (default 8765)")
+    sv.add_argument("--no-browser", action="store_true", help="do not open a browser tab")
+    sv.set_defaults(func=cmd_serve)
     return p
 
 

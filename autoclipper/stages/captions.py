@@ -156,6 +156,11 @@ def font_for(lang: str, settings: CaptionSettings) -> str:
 def build_ass(words: list[Word], *, lang: str, settings: CaptionSettings, width: int = 1080,
               height: int = 1920) -> str:
     font = font_for(lang, settings)
+    pct = settings.position_pct
+    # position_pct: centre of the line at pct % from the top (Alignment 5 + \pos on every event).
+    # None: legacy bottom-centre (Alignment 2) placed margin_v px above the bottom.
+    alignment = 2 if pct is None else 5
+    prefix = "" if pct is None else f"{{\\an5\\pos({width // 2},{round(height * pct / 100)})}}"
     primary = _style_color(settings.primary_color)
     hl, base = _inline_color(settings.highlight_color), _inline_color(settings.primary_color)
     header = "\n".join([
@@ -173,7 +178,7 @@ def build_ass(words: list[Word], *, lang: str, settings: CaptionSettings, width:
         "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
         "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
         f"Style: Default,{font},{settings.font_size},{primary},{primary},&H00000000,&H80000000,"
-        f"-1,0,0,0,100,100,0,0,1,5,2,2,60,60,{settings.margin_v},1",
+        f"-1,0,0,0,100,100,0,0,1,5,2,{alignment},60,60,{settings.margin_v},1",
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
@@ -198,7 +203,7 @@ def build_ass(words: list[Word], *, lang: str, settings: CaptionSettings, width:
             parts = [f"{{\\c{hl}}}{t}{{\\c{base}}}" if k == wi else t
                      for k, t in enumerate(escaped)]
             events.append(f"Dialogue: 0,{_ass_time(start_cs / 100)},{_ass_time(end_cs / 100)},Default,,0,0,0,,"
-                          + " ".join(parts))
+                          + prefix + " ".join(parts))
     return header + "\n" + "\n".join(events) + ("\n" if events else "")
 
 

@@ -529,6 +529,18 @@ def _shorten_fn(deps: _LazyDeps, lang: str):
     return shorten
 
 
+def _lengthen_fn(deps: _LazyDeps, lang: str):
+    """LengthenFn resolved lazily; None-safe when the LLM has no optional `lengthen`."""
+
+    def lengthen(narration: str, target_words: int) -> str:
+        fn = getattr(deps.llm, "lengthen", None)
+        if not callable(fn):
+            return narration  # unchanged -> the voice stage keeps the original take
+        return fn(lang=lang, narration=narration, target_words=target_words)
+
+    return lengthen
+
+
 def _voice_is_current(out_dir: Path, script: ClipScript) -> bool:
     from .stages.voice import load_voice_result, narration_hash
 
@@ -539,7 +551,7 @@ def _voice_is_current(out_dir: Path, script: ClipScript) -> bool:
 
 
 def _run_voice(store: JobStore, rep: _Reporter, settings: Settings, deps: _LazyDeps, clip: ClipState,
-               lang: str, script: ClipScript, script_path: Path) -> ClipScript:
+               lang: str, script: ClipScript, script_path: Path, allow_lengthen: bool = False) -> ClipScript:
     from . import ffmpeg
     from .stages.voice import make_voice
 
@@ -551,17 +563,23 @@ def _run_voice(store: JobStore, rep: _Reporter, settings: Settings, deps: _LazyD
     result = make_voice(client=deps.voicebox, narration=script.narration, lang=lang,
                         voice=settings.voice_for(lang), clip_duration=ffmpeg.duration(cut), out_dir=out_dir,
                         max_speedup=settings.audio.max_speedup, shorten=_shorten_fn(deps, lang),
-                        on_progress=rep.progress("voice", clip.index, lang))
+                        on_progress=rep.progress("voice", clip.index, lang),
+                        lengthen=_lengthen_fn(deps, lang) if allow_lengthen else None,
+                        lengthen_below=settings.script.lengthen_below,
+                        fill_ratio=settings.script.fill_ratio)
     if result.narration.strip() != script.narration.strip():
         # Keep script.json in sync with what was actually spoken (captions + rerender rely on it).
         script = script.model_copy(update={"narration": result.narration})
         _write_script(script_path, script)
-        rep.line("voice", 1.0, "narration was shortened to fit; script.json updated", clip.index, lang)
+        how = "lengthened to fill the clip" if result.lengthened else "shortened to fit"
+        rep.line("voice", 1.0, f"narration was {how}; script.json updated", clip.index, lang)
     notes = [f"{result.final_duration:.1f}s"]
     if result.tempo != 1.0:
         notes.append(f"tempo x{result.tempo:.2f}")
     if result.trimmed:
         notes.append("trimmed")
+    if result.lengthened:
+        notes.append("lengthened")
     rep.done("voice", clip.index, lang, ", ".join(notes))
     return script
 
@@ -618,7 +636,7 @@ def _process_clip_lang(store: JobStore, rep: _Reporter, settings: Settings, deps
         else:
             rep.start("script", clip.index, lang, f"{clip.moment.duration:.1f}s clip")
             script = write_script(llm=deps.llm, transcript=transcript, moment=clip.moment, lang=lang,
-                                  out_json=script_path)
+                                  out_json=script_path, script_settings=settings.script)
             regenerated = True
             rep.done("script", clip.index, lang, script.title)
 
@@ -627,7 +645,11 @@ def _process_clip_lang(store: JobStore, rep: _Reporter, settings: Settings, deps
         if not regenerated and _voice_is_current(out_dir, script):
             rep.skip("voice", clip.index, lang, "voice.wav matches script")
         else:
-            script = _run_voice(store, rep, settings, deps, clip, lang, script, script_path)
+            # Lengthen only a narration the LLM wrote, never one the user edited before a resume:
+            # the script was generated in this run, or it has never been voiced yet.
+            allow_lengthen = regenerated or not (out_dir / "voice.json").exists()
+            script = _run_voice(store, rep, settings, deps, clip, lang, script, script_path,
+                                allow_lengthen=allow_lengthen)
             regenerated = True
 
         # captions
@@ -785,7 +807,7 @@ def rerender(job_id: str, clip: int, lang: str, *, settings: Settings | None = N
         if _voice_is_current(out_dir, script):
             rep.skip("voice", clip, lang, "narration unchanged")
         else:
-            script = _run_voice(store, rep, s, lazy, cs, lang, script, script_path)
+            script = _run_voice(store, rep, s, lazy, cs, lang, script, script_path, allow_lengthen=False)
         stage = "captions"
         _run_captions(store, rep, s, lazy, cs, lang, script)
         stage = "render"
