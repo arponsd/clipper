@@ -1,0 +1,745 @@
+"""Pipeline orchestrator: source video -> per-clip, per-language finished shorts.
+
+Job stages (once per job):      ingest -> transcribe -> moments -> cut
+Clip stages (per clip x lang):  script -> voice -> captions -> render (+ metadata)
+
+Progress lives in data/jobs/<id>/job.json through JobStore, so a later web UI can read it while a
+worker thread runs this module. Every stage is idempotent: a stage whose output file already exists
+(and is not empty) is skipped. Staleness is persistent: before a stage regenerates, the outputs of the
+stages after it are deleted, so a resume after a failed/interrupted later stage rebuilds them.
+
+External services (Claude, Voicebox, faster-whisper) are injected through `Deps`, so tests use fakes.
+When no deps are passed, each real client is built lazily, only when a stage needs it.
+"""
+from __future__ import annotations
+
+import json
+import time
+import traceback
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from pydantic import ValidationError
+
+from .config import Settings, load_settings
+from .interfaces import LLM, LogFn, ProgressFn, Transcriber, VoiceboxAPI
+from .jobstore import CLIP_STAGES, JobStore
+from .models import ClipLangState, ClipScript, ClipState, Moment, StageState, Transcript
+
+SUPPORTED_LANGS = ("en", "hi")
+
+
+class PipelineError(RuntimeError):
+    """A job-level failure (or a rerender failure) with an actionable message."""
+
+
+# ---------------------------------------------------------------------------------------------
+# dependencies
+# ---------------------------------------------------------------------------------------------
+@dataclass
+class Deps:
+    llm: LLM
+    voicebox: VoiceboxAPI
+    transcriber: Transcriber
+
+
+def _make_llm(settings: Settings) -> LLM:
+    from .llm import AnthropicLLM
+
+    return AnthropicLLM(settings.llm)
+
+
+def _make_voicebox(settings: Settings) -> VoiceboxAPI:
+    from .voicebox import VoiceboxClient
+
+    return VoiceboxClient.from_settings(settings.voicebox)
+
+
+def _make_transcriber(settings: Settings) -> Transcriber:
+    from .stages.transcribe import WhisperTranscriber
+
+    return WhisperTranscriber(settings.whisper)
+
+
+def default_deps(settings: Settings) -> Deps:
+    """Build all real clients now. The pipeline itself prefers the lazy builder below."""
+    return Deps(llm=_make_llm(settings), voicebox=_make_voicebox(settings),
+                transcriber=_make_transcriber(settings))
+
+
+class _LazyDeps:
+    """Gives out injected deps, or builds each real client on first use (only what is needed)."""
+
+    def __init__(self, settings: Settings, deps: Deps | None):
+        self._settings = settings
+        self._deps = deps
+        self._llm: LLM | None = None
+        self._voicebox: VoiceboxAPI | None = None
+        self._transcriber: Transcriber | None = None
+
+    @property
+    def llm(self) -> LLM:
+        if self._deps is not None:
+            return self._deps.llm
+        if self._llm is None:
+            self._llm = _make_llm(self._settings)
+        return self._llm
+
+    @property
+    def voicebox(self) -> VoiceboxAPI:
+        if self._deps is not None:
+            return self._deps.voicebox
+        if self._voicebox is None:
+            self._voicebox = _make_voicebox(self._settings)
+        return self._voicebox
+
+    @property
+    def transcriber(self) -> Transcriber:
+        if self._deps is not None:
+            return self._deps.transcriber
+        if self._transcriber is None:
+            self._transcriber = _make_transcriber(self._settings)
+        return self._transcriber
+
+
+# ---------------------------------------------------------------------------------------------
+# settings
+# ---------------------------------------------------------------------------------------------
+def parse_langs(value: str | list[str] | None) -> list[str] | None:
+    """'en,hi' -> ['en', 'hi'] (deduplicated, validated). None stays None."""
+    if value is None:
+        return None
+    items = value.split(",") if isinstance(value, str) else list(value)
+    langs = list(dict.fromkeys(x.strip().lower() for x in items if x.strip()))
+    if not langs:
+        raise PipelineError("no languages given (use e.g. --langs en,hi)")
+    bad = [x for x in langs if x not in SUPPORTED_LANGS]
+    if bad:
+        raise PipelineError(f"unsupported language(s): {', '.join(bad)} (supported: {', '.join(SUPPORTED_LANGS)})")
+    return langs
+
+
+def effective_settings(settings: Settings, *, langs: list[str] | None = None, count: int | None = None,
+                       min_seconds: float | None = None, max_seconds: float | None = None) -> Settings:
+    """Copy of settings with CLI overrides applied and re-validated (bounds from config.py)."""
+    data = settings.model_dump()
+    if langs is not None:
+        data["languages"] = parse_langs(langs)
+    if count is not None:
+        data["clips"]["count"] = count
+    if min_seconds is not None:
+        data["clips"]["min_seconds"] = min_seconds
+    if max_seconds is not None:
+        data["clips"]["max_seconds"] = max_seconds
+    try:
+        out = Settings.model_validate(data)
+    except ValidationError as e:
+        raise PipelineError(f"invalid options: {_validation_summary(e)}") from e
+    if not out.languages:
+        raise PipelineError("settings.languages is empty - set at least one of en, hi")
+    if out.clips.min_seconds > out.clips.max_seconds:
+        raise PipelineError(f"min clip length ({out.clips.min_seconds}s) is greater than max "
+                            f"({out.clips.max_seconds}s)")
+    return out
+
+
+def _validation_summary(e: ValidationError) -> str:
+    parts = []
+    for err in e.errors():
+        loc = ".".join(str(x) for x in err.get("loc", ()))
+        parts.append(f"{loc}: {err.get('msg', 'invalid')}" if loc else str(err.get("msg", "invalid")))
+    return "; ".join(parts)
+
+
+# ---------------------------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------------------------
+def output_exists(path: Path) -> bool:
+    """Idempotency rule from CONTRACT.md: the file exists and is not empty."""
+    return path.is_file() and path.stat().st_size > 0
+
+
+def _write_script(path: Path, script: ClipScript) -> None:
+    from .stages.script import save_script
+
+    save_script(script, path)
+
+
+def _error_text(e: BaseException) -> str:
+    msg = str(e).strip()
+    return msg if msg else type(e).__name__
+
+
+INTERRUPTED = "interrupted"
+
+
+def _unlink_outputs(out_dir: Path, *names: str) -> None:
+    """Delete downstream outputs before an upstream stage regenerates (persistent staleness)."""
+    for name in names:
+        (out_dir / name).unlink(missing_ok=True)
+
+
+def _sweep_running(store: JobStore) -> None:
+    """Any stage still marked 'running' becomes 'failed' / 'interrupted' (nothing stays running)."""
+    job = store.job
+    states = list(job.stages.values())
+    for c in job.clips:
+        for ls in c.langs.values():
+            states.extend(ls.stages.values())
+    for st in states:
+        if st.status == "running":
+            st.status = "failed"
+            st.message = INTERRUPTED
+
+
+def _mark_job_interrupted(store: JobStore, log: LogFn) -> None:
+    job = store.job
+    _sweep_running(store)
+    job.status = "failed"
+    job.error = INTERRUPTED
+    try:
+        store.save()
+    finally:
+        log(f"[{job.id}] interrupted; resume with `autoclipper run --job {job.id}`")
+
+
+class _Reporter:
+    """Writes stage state into job.json and prints progress lines.
+
+    Line format: `[<job_id>] <stage> <clip>/<lang> <pct>% <message>` (clip/lang omitted for job stages).
+    Progress callbacks are throttled: a line every 10%, a job.json write every 5% or 1 s.
+    """
+
+    def __init__(self, store: JobStore, log: LogFn, debug: bool = False):
+        self.store = store
+        self.log = log
+        self.debug = debug
+
+    def _where(self, stage: str, clip: int | None, lang: str | None) -> str:
+        if clip is None:
+            return stage
+        return f"{stage} {clip:02d}/{lang}"
+
+    def line(self, stage: str, pct: float, message: str, clip: int | None = None,
+             lang: str | None = None) -> None:
+        text = f"[{self.store.job.id}] {self._where(stage, clip, lang)} {round(pct * 100):d}%"
+        self.log(f"{text} {message}".rstrip())
+
+    def start(self, stage: str, clip: int | None = None, lang: str | None = None, message: str = "") -> None:
+        self.store.set_stage(stage, "running", 0.0, message, clip=clip, lang=lang)
+        self.line(stage, 0.0, message or "started", clip, lang)
+
+    def done(self, stage: str, clip: int | None = None, lang: str | None = None, message: str = "") -> None:
+        self.store.set_stage(stage, "done", 1.0, message, clip=clip, lang=lang)
+        self.line(stage, 1.0, message or "done", clip, lang)
+
+    def skip(self, stage: str, clip: int | None = None, lang: str | None = None,
+             message: str = "output exists") -> None:
+        st = self._state(stage, clip, lang)
+        # "skipped" only when this stage never ran; a stage that finished before stays "done".
+        if st.status != "done":
+            self.store.set_stage(stage, "skipped", 1.0, message, clip=clip, lang=lang)
+        self.line(stage, 1.0, f"skipped ({message})", clip, lang)
+
+    def fail(self, stage: str, error: BaseException, clip: int | None = None, lang: str | None = None) -> None:
+        msg = _error_text(error)
+        st = self._state(stage, clip, lang)
+        self.store.set_stage(stage, "failed", st.progress, msg, clip=clip, lang=lang)
+        self.line(stage, st.progress, f"FAILED: {msg}", clip, lang)
+        if self.debug:
+            self.log("".join(traceback.format_exception(type(error), error, error.__traceback__)).rstrip())
+
+    def interrupted(self, stage: str, clip: int | None = None, lang: str | None = None) -> None:
+        st = self._state(stage, clip, lang)
+        st.status = "failed"
+        st.message = INTERRUPTED
+        self.line(stage, st.progress, f"FAILED: {INTERRUPTED}", clip, lang)
+
+    def progress(self, stage: str, clip: int | None = None, lang: str | None = None) -> ProgressFn:
+        last_line = [-1]
+        last_save = [-1, 0.0]
+
+        def on_progress(fraction: float, message: str = "") -> None:
+            f = min(1.0, max(0.0, float(fraction)))
+            pct = int(f * 100)
+            now = time.monotonic()
+            if pct // 5 != last_save[0] // 5 or now - last_save[1] >= 1.0:
+                last_save[0], last_save[1] = pct, now
+                self.store.set_stage(stage, "running", f, message, clip=clip, lang=lang)
+            if pct // 10 != last_line[0] // 10:
+                last_line[0] = pct
+                self.line(stage, f, message, clip, lang)
+
+        return on_progress
+
+    def _state(self, stage: str, clip: int | None, lang: str | None) -> StageState:
+        job = self.store.job
+        if clip is None:
+            return job.stages.setdefault(stage, StageState())
+        return job.clips[clip].langs[lang].stages.setdefault(stage, StageState())  # type: ignore[index]
+
+
+# ---------------------------------------------------------------------------------------------
+# job-level stages
+# ---------------------------------------------------------------------------------------------
+def _job_stage_ingest(store: JobStore, rep: _Reporter) -> Path:
+    from .stages.ingest import extract_audio_for_asr, find_source, ingest
+
+    existing = find_source(store.dir)
+    if existing is not None and output_exists(existing) and output_exists(store.dir / "audio.wav"):
+        rep.skip("ingest", message=existing.name)
+        return existing
+    rep.start("ingest", message=store.job.source)
+    src = ingest(store.job.source, store.dir, on_progress=rep.progress("ingest"))
+    extract_audio_for_asr(src, store.dir)
+    rep.done("ingest", message=src.name)
+    return src
+
+
+def _job_stage_transcribe(store: JobStore, rep: _Reporter, settings: Settings, deps: _LazyDeps) -> Transcript:
+    out = store.dir / "transcript.json"
+    if output_exists(out):
+        transcript = Transcript.model_validate_json(out.read_text(encoding="utf-8"))
+        rep.skip("transcribe", message="transcript.json")
+        return transcript
+    from .stages.transcribe import run_transcribe
+
+    rep.start("transcribe", message=f"whisper {settings.whisper.model}")
+    transcript = run_transcribe(store.dir / "audio.wav", out, deps.transcriber,
+                                language=settings.whisper.language, on_progress=rep.progress("transcribe"))
+    n_words = sum(len(s.words) for s in transcript.segments)
+    rep.done("transcribe", message=f"{len(transcript.segments)} segments, {n_words} words, "
+                                   f"language {transcript.language}")
+    return transcript
+
+
+def _job_stage_moments(store: JobStore, rep: _Reporter, settings: Settings, deps: _LazyDeps,
+                       transcript: Transcript) -> tuple[list[Moment], bool]:
+    """Returns (moments, fresh): fresh is True when moments were (re)generated in this run."""
+    out = store.dir / "moments.json"
+    fresh = False
+    if output_exists(out):
+        moments = [Moment.model_validate(m) for m in json.loads(out.read_text(encoding="utf-8"))]
+        rep.skip("moments", message=f"{len(moments)} moments in moments.json")
+    else:
+        from .stages.moments import run_moments
+
+        rep.start("moments", message=f"asking {settings.llm.model} for {settings.clips.count} moments")
+        moments = run_moments(transcript, deps.llm, settings.clips, out)
+        fresh = True
+        rep.done("moments", message=f"{len(moments)} moments")
+    if not moments:
+        raise PipelineError("no usable moments were found in this video (try a lower --min or a longer video)")
+    return moments, fresh
+
+
+_OVERRIDE_TOLERANCE = 0.5  # seconds
+
+
+def _warn_ignored_overrides(store: JobStore, log: LogFn, moments: list[Moment], count: int | None,
+                            min_seconds: float | None, max_seconds: float | None) -> None:
+    """moments.json was reused: tell the user when --clips/--min/--max ask for something else."""
+    differs: list[str] = []
+    if count is not None and count != len(moments):
+        differs.append(f"--clips {count} (moments.json has {len(moments)})")
+    if min_seconds is not None and any(m.duration < min_seconds - _OVERRIDE_TOLERANCE for m in moments):
+        differs.append(f"--min {min_seconds:g}")
+    if max_seconds is not None and any(m.duration > max_seconds + _OVERRIDE_TOLERANCE for m in moments):
+        differs.append(f"--max {max_seconds:g}")
+    if differs:
+        log(f"[{store.job.id}] warning: {', '.join(differs)} ignored for an existing job (moments.json is "
+            f"reused); delete {store.rel(store.dir / 'moments.json')} to pick moments again")
+
+
+def _stale_name(clips_root: Path, index: int) -> Path:
+    n = 1
+    while (clips_root / f"{index:02d}.stale-{n}").exists():
+        n += 1
+    return clips_root / f"{index:02d}.stale-{n}"
+
+
+def _rebuild_clips(store: JobStore, moments: list[Moment], log: LogFn) -> None:
+    """Moments were re-picked: make job.clips follow them. Changed or dropped clip dirs are renamed
+    aside to clips/NN.stale-<n> (never deleted) and their state is reset."""
+    job = store.job
+    clips_root = store.dir / "clips"
+    old = {c.index: c for c in job.clips}
+    new_clips: list[ClipState] = []
+    for i, m in enumerate(moments):
+        prev = old.get(i)
+        if prev is not None and prev.moment == m:
+            new_clips.append(prev)
+        else:
+            new_clips.append(ClipState(index=i, moment=m))
+    keep = {c.index for c in new_clips if old.get(c.index) is c}
+    for idx in sorted(old):
+        if idx in keep:
+            continue
+        d = clips_root / f"{idx:02d}"
+        if d.exists():
+            dst = _stale_name(clips_root, idx)
+            d.rename(dst)
+            log(f"[{job.id}] clip {idx:02d}: moment changed, old files moved to {store.rel(dst)}")
+    job.clips = new_clips
+
+
+def _populate_clips(store: JobStore, moments: list[Moment], langs: list[str], *, fresh: bool = False,
+                    log: LogFn = print) -> None:
+    """job.clips[i] <-> moments[i]; add missing languages to existing clips (resume with new --langs).
+
+    When the moments were freshly (re)picked and job.clips already exists, job.clips is rebuilt from them.
+    """
+    job = store.job
+    if not job.clips:
+        job.clips = [ClipState(index=i, moment=m) for i, m in enumerate(moments)]
+    elif fresh:
+        _rebuild_clips(store, moments, log)
+    for clip in job.clips:
+        for lang in langs:
+            state = clip.langs.setdefault(lang, ClipLangState())
+            for s in CLIP_STAGES:
+                state.stages.setdefault(s, StageState())
+    store.save()
+
+
+def _job_stage_cut(store: JobStore, rep: _Reporter, settings: Settings, source: Path,
+                   langs: list[str]) -> list[int]:
+    """Cut every clip. Returns indexes that have a cut.mp4. A failed cut fails only that clip."""
+    from .stages.cut import cut_clip
+
+    job = store.job
+    todo = [c for c in job.clips if not output_exists(store.clip_dir(c.index) / "cut.mp4")]
+    if not todo:
+        for c in job.clips:
+            c.cut = store.rel(store.clip_dir(c.index) / "cut.mp4")
+        store.save()
+        rep.skip("cut", message=f"{len(job.clips)} clips already cut")
+        return [c.index for c in job.clips]
+
+    rep.start("cut", message=f"{len(todo)} of {len(job.clips)} clips to cut")
+    ok: list[int] = []
+    errors: list[str] = []
+    total = len(job.clips)
+    for n, clip in enumerate(job.clips):
+        dst = store.clip_dir(clip.index) / "cut.mp4"
+        if not output_exists(dst):
+            base, span = n / total, 1.0 / total
+            inner = rep.progress("cut")
+
+            def clip_progress(f: float, msg: str = "", _b: float = base, _s: float = span,
+                              _i: int = clip.index) -> None:
+                inner(_b + _s * f, f"clip {_i:02d} {msg}".strip())
+
+            try:
+                cut_clip(source, clip.moment, dst, settings.clips, on_progress=clip_progress)
+            except Exception as e:  # one bad cut must not kill the other clips
+                msg = f"cut failed: {_error_text(e)}"
+                errors.append(f"clip {clip.index:02d}: {msg}")
+                rep.line("cut", base, f"clip {clip.index:02d} FAILED: {_error_text(e)}")
+                for lang in langs:
+                    state = clip.langs[lang]
+                    state.error = msg
+                    state.stages["script"].status = "failed"
+                    state.stages["script"].message = msg
+                store.save()
+                continue
+        clip.cut = store.rel(dst)
+        ok.append(clip.index)
+    store.save()
+    if not ok:
+        raise PipelineError("every clip failed to cut: " + "; ".join(errors))
+    rep.done("cut", message=f"{len(ok)} clips" + (f", {len(errors)} failed" if errors else ""))
+    return ok
+
+
+# ---------------------------------------------------------------------------------------------
+# clip x language stages
+# ---------------------------------------------------------------------------------------------
+def _shorten_fn(deps: _LazyDeps, lang: str):
+    """ShortenFn that resolves the LLM only if the voice stage actually needs to shorten."""
+
+    def shorten(narration: str, max_words: int) -> str:
+        from .stages.script import make_shorten_fn
+
+        return make_shorten_fn(deps.llm, lang)(narration, max_words)
+
+    return shorten
+
+
+def _voice_is_current(out_dir: Path, script: ClipScript) -> bool:
+    from .stages.voice import load_voice_result, narration_hash
+
+    if not output_exists(out_dir / "voice.wav"):
+        return False
+    result = load_voice_result(out_dir)
+    return result is not None and result.narration_hash == narration_hash(script.narration)
+
+
+def _run_voice(store: JobStore, rep: _Reporter, settings: Settings, deps: _LazyDeps, clip: ClipState,
+               lang: str, script: ClipScript, script_path: Path) -> ClipScript:
+    from . import ffmpeg
+    from .stages.voice import make_voice
+
+    out_dir = store.clip_dir(clip.index, lang)
+    cut = store.clip_dir(clip.index) / "cut.mp4"
+    _unlink_outputs(out_dir, "words.json", "captions.ass", "final.mp4")
+    rep.start("voice", clip.index, lang, f"engine {_engine_label(settings, lang)}")
+    result = make_voice(client=deps.voicebox, narration=script.narration, lang=lang,
+                        voice=settings.voice_for(lang), clip_duration=ffmpeg.duration(cut), out_dir=out_dir,
+                        max_speedup=settings.audio.max_speedup, shorten=_shorten_fn(deps, lang),
+                        on_progress=rep.progress("voice", clip.index, lang))
+    if result.narration.strip() != script.narration.strip():
+        # Keep script.json in sync with what was actually spoken (captions + rerender rely on it).
+        script = script.model_copy(update={"narration": result.narration})
+        _write_script(script_path, script)
+        rep.line("voice", 1.0, "narration was shortened to fit; script.json updated", clip.index, lang)
+    notes = [f"{result.final_duration:.1f}s"]
+    if result.tempo != 1.0:
+        notes.append(f"tempo x{result.tempo:.2f}")
+    if result.trimmed:
+        notes.append("trimmed")
+    rep.done("voice", clip.index, lang, ", ".join(notes))
+    return script
+
+
+def _engine_label(settings: Settings, lang: str) -> str:
+    return "chatterbox" if lang == "hi" else settings.voice_for(lang).engine
+
+
+def _run_captions(store: JobStore, rep: _Reporter, settings: Settings, deps: _LazyDeps, clip: ClipState,
+                  lang: str, script: ClipScript) -> Path:
+    from .stages.captions import make_captions
+
+    out_dir = store.clip_dir(clip.index, lang)
+    _unlink_outputs(out_dir, "final.mp4")
+    rep.start("captions", clip.index, lang)
+    ass = make_captions(narration=script.narration, voice_wav=out_dir / "voice.wav", lang=lang,
+                        transcriber=deps.transcriber, settings=settings, out_dir=out_dir)
+    rep.done("captions", clip.index, lang, ass.name)
+    return ass
+
+
+def _run_render(store: JobStore, rep: _Reporter, settings: Settings, clip: ClipState, lang: str,
+                script: ClipScript) -> Path:
+    from .stages.render import render_final, write_metadata
+
+    out_dir = store.clip_dir(clip.index, lang)
+    final = out_dir / "final.mp4"
+    rep.start("render", clip.index, lang)
+    render_final(cut=store.clip_dir(clip.index) / "cut.mp4", voice=out_dir / "voice.wav",
+                 ass=out_dir / "captions.ass", dst=final, audio=settings.audio,
+                 on_progress=rep.progress("render", clip.index, lang))
+    write_metadata(script, lang, out_dir / "metadata.json")
+    rep.done("render", clip.index, lang, store.rel(final))
+    return final
+
+
+def _process_clip_lang(store: JobStore, rep: _Reporter, settings: Settings, deps: _LazyDeps,
+                       transcript: Transcript, clip: ClipState, lang: str) -> None:
+    from .stages.render import write_metadata
+    from .stages.script import load_script, write_script
+
+    state = clip.langs[lang]
+    state.error = None
+    out_dir = store.clip_dir(clip.index, lang)
+    script_path = out_dir / "script.json"
+    stage = "script"
+    try:
+        # script
+        regenerated = False
+        if output_exists(script_path):
+            script = load_script(script_path)
+            rep.skip("script", clip.index, lang, "script.json")
+        else:
+            rep.start("script", clip.index, lang, f"{clip.moment.duration:.1f}s clip")
+            script = write_script(llm=deps.llm, transcript=transcript, moment=clip.moment, lang=lang,
+                                  out_json=script_path)
+            regenerated = True
+            rep.done("script", clip.index, lang, script.title)
+
+        # voice (skipped only when voice.json matches the current narration)
+        stage = "voice"
+        if not regenerated and _voice_is_current(out_dir, script):
+            rep.skip("voice", clip.index, lang, "voice.wav matches script")
+        else:
+            script = _run_voice(store, rep, settings, deps, clip, lang, script, script_path)
+            regenerated = True
+
+        # captions
+        stage = "captions"
+        if (not regenerated and output_exists(out_dir / "captions.ass")
+                and output_exists(out_dir / "words.json")):
+            rep.skip("captions", clip.index, lang, "captions.ass")
+        else:
+            _run_captions(store, rep, settings, deps, clip, lang, script)
+            regenerated = True
+
+        # render (+ metadata, always refreshed because it is cheap and follows script.json edits)
+        stage = "render"
+        final = out_dir / "final.mp4"
+        if not regenerated and output_exists(final):
+            write_metadata(script, lang, out_dir / "metadata.json")
+            rep.skip("render", clip.index, lang, "final.mp4")
+        else:
+            _run_render(store, rep, settings, clip, lang, script)
+        state.final = store.rel(final)
+        store.save()
+    except Exception as e:  # recorded per clip-language; other clips keep going
+        state.error = f"{stage}: {_error_text(e)}"
+        rep.fail(stage, e, clip.index, lang)
+        store.save()
+    except BaseException:  # Ctrl-C etc.: record it, then let it propagate
+        state.error = f"{stage}: {INTERRUPTED}"
+        rep.interrupted(stage, clip.index, lang)
+        store.save()
+        raise
+
+
+# ---------------------------------------------------------------------------------------------
+# public API
+# ---------------------------------------------------------------------------------------------
+def run_job(source: str, *, settings: Settings | None = None, deps: Deps | None = None,
+            langs: list[str] | None = None, count: int | None = None, min_seconds: float | None = None,
+            max_seconds: float | None = None, job_id: str | None = None, log: LogFn = print,
+            debug: bool = False) -> JobStore:
+    """Run (or resume, with job_id) a whole job. Returns the JobStore with the final job state.
+
+    Raises PipelineError when a job-level stage fails. Per clip-language failures are recorded in
+    job.json (ClipLangState.error) and do not raise.
+    """
+    base = settings if settings is not None else load_settings()
+    s = effective_settings(base, langs=langs, count=count, min_seconds=min_seconds, max_seconds=max_seconds)
+    lazy = _LazyDeps(s, deps)
+
+    if job_id:
+        try:
+            store = JobStore.load(job_id)
+        except FileNotFoundError as e:
+            raise PipelineError(f"job {job_id!r} not found (see `autoclipper jobs`)") from e
+    else:
+        if not source:
+            raise PipelineError("no source given: pass a video file path or a URL")
+        store = JobStore.create(source)
+    rep = _Reporter(store, log, debug)
+    job = store.job
+    job.status = "running"
+    job.error = None
+    store.save()
+    log(f"[{job.id}] job dir {store.dir}")
+
+    stage = "ingest"
+    try:
+        src = _job_stage_ingest(store, rep)
+        stage = "transcribe"
+        transcript = _job_stage_transcribe(store, rep, s, lazy)
+        stage = "moments"
+        moments, fresh = _job_stage_moments(store, rep, s, lazy, transcript)
+        if not fresh:
+            _warn_ignored_overrides(store, log, moments, count, min_seconds, max_seconds)
+        _populate_clips(store, moments, s.languages, fresh=fresh, log=log)
+        stage = "cut"
+        cut_ok = _job_stage_cut(store, rep, s, src, s.languages)
+    except Exception as e:
+        rep.fail(stage, e)
+        job.status = "failed"
+        job.error = f"{stage}: {_error_text(e)}"
+        store.save()
+        if isinstance(e, PipelineError):
+            raise
+        raise PipelineError(job.error) from e
+    except BaseException:
+        if job.stages.get(stage) is not None:
+            rep.interrupted(stage)
+        _mark_job_interrupted(store, log)
+        raise
+
+    try:
+        for idx in cut_ok:
+            clip = job.clips[idx]
+            for lang in s.languages:
+                _process_clip_lang(store, rep, s, lazy, transcript, clip, lang)
+    except BaseException:
+        _mark_job_interrupted(store, log)
+        raise
+
+    states = [c.langs[lang] for c in job.clips for lang in s.languages if lang in c.langs]
+    failed = [st for st in states if st.error]
+    if states and len(failed) == len(states):
+        job.status = "failed"
+        job.error = "every clip failed; see `autoclipper status " + job.id + "`"
+    else:
+        job.status = "done"
+        job.error = None
+    store.save()
+    log(f"[{job.id}] {job.status}: {len(states) - len(failed)}/{len(states)} clip-languages rendered"
+        + (f", {len(failed)} failed" if failed else ""))
+    return store
+
+
+def rerender(job_id: str, clip: int, lang: str, *, settings: Settings | None = None,
+             deps: Deps | None = None, log: LogFn = print, debug: bool = False) -> Path:
+    """Re-render one clip in one language from its (possibly user-edited) script.json.
+
+    The voice is regenerated only when the narration changed (sha256 vs voice.json narration_hash)
+    or the voice is missing. Captions, final.mp4 and metadata.json are always rebuilt.
+    """
+    from .stages.script import load_script
+
+    s = settings if settings is not None else load_settings()
+    try:
+        store = JobStore.load(job_id)
+    except FileNotFoundError as e:
+        raise PipelineError(f"job {job_id!r} not found (see `autoclipper jobs`)") from e
+    job = store.job
+    lang = (parse_langs(lang) or [lang])[0]
+    if not job.clips:
+        raise PipelineError(f"job {job_id} has no clips yet - run it first (`autoclipper run --job {job_id} ...`)")
+    if not 0 <= clip < len(job.clips):
+        raise PipelineError(f"clip {clip} does not exist in job {job_id} (valid: 0..{len(job.clips) - 1})")
+    cs = job.clips[clip]
+    if not output_exists(store.clip_dir(clip) / "cut.mp4"):
+        raise PipelineError(f"clip {clip:02d} has no cut.mp4 - resume the job first")
+    state = cs.langs.setdefault(lang, ClipLangState())
+    for st in CLIP_STAGES:
+        state.stages.setdefault(st, StageState())
+    store.save()
+
+    out_dir = store.clip_dir(clip, lang)
+    script_path = out_dir / "script.json"
+    if not output_exists(script_path):
+        raise PipelineError(f"{store.rel(script_path)} not found - run the job for language {lang!r} first")
+
+    rep = _Reporter(store, log, debug)
+    lazy = _LazyDeps(s, deps)
+    state.error = None
+    stage = "script"
+    try:
+        script = load_script(script_path)
+        rep.done("script", clip, lang, "loaded script.json")
+        stage = "voice"
+        if _voice_is_current(out_dir, script):
+            rep.skip("voice", clip, lang, "narration unchanged")
+        else:
+            script = _run_voice(store, rep, s, lazy, cs, lang, script, script_path)
+        stage = "captions"
+        _run_captions(store, rep, s, lazy, cs, lang, script)
+        stage = "render"
+        final = _run_render(store, rep, s, cs, lang, script)
+    except Exception as e:
+        state.error = f"{stage}: {_error_text(e)}"
+        rep.fail(stage, e, clip, lang)
+        store.save()
+        raise PipelineError(f"rerender {clip:02d}/{lang} failed at {stage}: {_error_text(e)}") from e
+    except BaseException:
+        state.error = f"{stage}: {INTERRUPTED}"
+        rep.interrupted(stage, clip, lang)
+        _mark_job_interrupted(store, log)
+        raise
+
+    state.final = store.rel(final)
+    if job.status == "failed" and any(not st.error for c in job.clips for st in c.langs.values()):
+        job.status = "done"
+        job.error = None
+    store.save()
+    return final
