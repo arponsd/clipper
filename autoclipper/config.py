@@ -10,6 +10,8 @@ from typing import Literal
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator
 
+from .publish.settings import PublishSettings
+
 load_dotenv()
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -168,6 +170,7 @@ class Settings(BaseModel):
     script: ScriptSettings = Field(default_factory=ScriptSettings)
     web: WebSettings = Field(default_factory=WebSettings)
     hyperframes: HyperFramesSettings = Field(default_factory=HyperFramesSettings)
+    publish: PublishSettings = Field(default_factory=PublishSettings)
 
     def voice_for(self, lang: str) -> VoiceProfile:
         return self.voicebox.hindi if lang == "hi" else self.voicebox.english

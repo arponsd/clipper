@@ -26,11 +26,12 @@ from ..joblock import JobLocked, has_lock_file, hold_job_lock, live_lock
 from ..jobstore import JobStore, jobs_root
 from ..models import Job
 from ..pipeline import Deps
+from ..publish import runner as publish_runner
 from ..stages._atomic import write_text_atomic
 
 log = logging.getLogger("autoclipper.web.worker")
 
-TaskKind = Literal["run_job", "rerender"]
+TaskKind = Literal["run_job", "rerender", "publish"]
 TaskState = Literal["queued", "running", "done", "failed", "cancelled"]
 FINISHED: tuple[str, ...] = ("done", "failed", "cancelled")
 # seconds: with NO job.lock (an older CLI), a younger job.json may belong to a running CLI process
@@ -50,12 +51,16 @@ class Task:
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
     finished_at: float | None = None
+    platforms: list[str] | None = None  # publish tasks only
+    force: bool = False  # publish tasks only
+    idempotency_key: str | None = field(default=None, repr=False)  # publish tasks only (not in to_dict)
 
     def to_dict(self, position: int | None) -> dict:
         d = asdict(self)
         d["position"] = position
+        d["platforms"] = list(self.platforms) if self.platforms is not None else None
         return {k: d[k] for k in ("id", "kind", "job_id", "clip", "lang", "state", "position", "error",
-                                  "created_at", "started_at", "finished_at")}
+                                  "created_at", "started_at", "finished_at", "platforms")}
 
 
 @dataclass
@@ -127,11 +132,13 @@ class Worker:
                  deps_factory: Callable[[Settings], Deps | None] = lambda s: None,
                  run_job: Callable[..., Any] = pipeline.run_job,
                  rerender: Callable[..., Any] = pipeline.rerender,
+                 publish: Callable[..., Any] | None = None,
                  history: int = 20):
         self._settings_loader = settings_loader
         self._deps_factory = deps_factory
         self._run_job = run_job
         self._rerender = rerender
+        self._publish = publish if publish is not None else publish_runner.run_publish
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
         self._tasks: dict[str, Task] = {}
@@ -330,12 +337,52 @@ class Worker:
         with self._lock:
             if self._active(job_id, kind="run_job") is not None:
                 raise WorkerConflict("the job is queued or running; re-render when it finishes")
+            if self._active(job_id, kind="publish", clip=clip, lang=lang) is not None:
+                raise WorkerConflict("clip is being published; re-render when it finishes")
             for t in self._queue:
                 if t.kind == "rerender" and t.job_id == job_id and t.clip == clip and t.lang == lang:
                     return t, False
             task = Task(id=uuid.uuid4().hex, kind="rerender", job_id=job_id, clip=clip, lang=lang)
             self._enqueue(task)
             return task, True
+
+    def submit_publish(self, job_id: str, clip: int, lang: str, platforms: list[str], *, force: bool = False,
+                       idempotency_key: str | None = None) -> tuple[Task, bool]:
+        """Queue a live publish of one clip-lang. Same active clip-lang + same platform set -> (it, False);
+        a different set, a run_job of the job or a rerender of the clip-lang -> WorkerConflict."""
+        wanted = list(platforms)
+        with self._lock:
+            if self._active(job_id, kind="run_job") is not None:
+                raise WorkerConflict("the job is queued or running; publish when it finishes")
+            if self._active(job_id, kind="rerender", clip=clip, lang=lang) is not None:
+                raise WorkerConflict("clip is being rendered; publish when it finishes")
+            existing = self._active(job_id, kind="publish", clip=clip, lang=lang)
+            if existing is not None:
+                if sorted(existing.platforms or []) == sorted(wanted) and existing.force == force:
+                    return existing, False
+                raise WorkerConflict("clip is already being published to "
+                                     f"{', '.join(existing.platforms or [])}; wait until it finishes")
+            task = Task(id=uuid.uuid4().hex, kind="publish", job_id=job_id, clip=clip, lang=lang,
+                        platforms=wanted, force=force, idempotency_key=idempotency_key)
+            self._enqueue(task)
+            return task, True
+
+    def active_publish(self, job_id: str, clip: int, lang: str) -> Task | None:
+        with self._lock:
+            return self._active(job_id, kind="publish", clip=clip, lang=lang)
+
+    @contextmanager
+    def exclusive_publish(self, job_id: str, clip: int, lang: str) -> Iterator[None]:
+        """Hold the worker lock while a request thread writes a clip-lang's dry-run plan files. Raises
+        WorkerConflict when a run_job of the job, or a publish/rerender of the clip-lang, is queued/running."""
+        with self._lock:
+            if self._active(job_id, kind="run_job") is not None:
+                raise WorkerConflict("the job is queued or running; try again when it finishes")
+            if self._active(job_id, kind="publish", clip=clip, lang=lang) is not None:
+                raise WorkerConflict("clip is being published; try again when it finishes")
+            if self._active(job_id, kind="rerender", clip=clip, lang=lang) is not None:
+                raise WorkerConflict("clip is being rendered; try again when it finishes")
+            yield
 
     # ---- cancel / query -------------------------------------------------------------------
     def cancel_ex(self, task_id: str) -> tuple[Task | None, str]:
@@ -439,7 +486,7 @@ class Worker:
         meanwhile. Raises WorkerConflict when run_job for the job or a rerender of the clip-lang is running."""
         with self._lock:
             r = self._running
-            if r is not None and r.job_id == job_id and (
+            if r is not None and r.job_id == job_id and r.kind != "publish" and (
                     r.kind == "run_job" or (r.clip == clip and r.lang == lang)):
                 raise WorkerConflict("clip is being rendered; try again when it finishes")
             yield
@@ -520,19 +567,25 @@ class Worker:
         with open(job_dir / "web.log", "a", encoding="utf-8") as logf:
             def log_line(line: str) -> None:
                 text = str(line)
-                try:
-                    logf.write(text.rstrip("\n") + "\n")
-                    logf.flush()
-                except (OSError, ValueError):
-                    pass
-                log.info("%s", text)
+                if text:  # an empty line is only a cancel point (publish between chunks/polls)
+                    try:
+                        logf.write(text.rstrip("\n") + "\n")
+                        logf.flush()
+                    except (OSError, ValueError):
+                        pass
+                    log.info("%s", text)
                 # Raise once; while the pipeline handles that TaskCancelled (its except BaseException
                 # blocks log too), further calls must not raise again or job.json would not be saved.
                 if flag.is_set() and not isinstance(sys.exc_info()[1], TaskCancelled):
                     raise TaskCancelled()
 
             stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-            what = "run" if task.kind == "run_job" else f"rerender {task.clip:02d}/{task.lang}"
+            if task.kind == "run_job":
+                what = "run"
+            elif task.kind == "publish":
+                what = f"publish {task.clip:02d}/{task.lang} {','.join(task.platforms or [])}"
+            else:
+                what = f"rerender {task.clip:02d}/{task.lang}"
             try:
                 logf.write(f"--- {stamp} task {task.id} {what}\n")
                 logf.flush()
@@ -541,10 +594,17 @@ class Worker:
             try:
                 if flag.is_set():
                     raise TaskCancelled()
+                publish_failure: str | None = None
                 with hold_job_lock(task.job_id):
                     settings = self._settings_loader()
-                    deps = self._deps_factory(settings)
-                    if task.kind == "run_job":
+                    deps = self._deps_factory(settings) if task.kind != "publish" else None
+                    if task.kind == "publish":
+                        results = self._publish(task.job_id, task.clip, task.lang,
+                                                platforms=list(task.platforms or []), force=task.force,
+                                                settings=settings, log=log_line,
+                                                idempotency_key=task.idempotency_key)
+                        publish_failure = publish_runner.all_failed(results if isinstance(results, dict) else {})
+                    elif task.kind == "run_job":
                         job = read_job(task.job_id)
                         o = read_options(task.job_id) or JobOptions()
                         langs = o.langs
@@ -559,6 +619,9 @@ class Worker:
                                        log=log_line)
                 if self._stop_requested(flag):
                     self._cancelled_by_stop(task, logf)
+                elif publish_failure is not None:
+                    task.state = "failed"
+                    task.error = _first_line(Exception(publish_failure))
                 else:
                     task.state = "done"
             except JobLocked as e:  # another live process owns the job: do not touch its job.json

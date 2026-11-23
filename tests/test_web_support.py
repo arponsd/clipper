@@ -200,7 +200,8 @@ def assert_error_shape(resp, status: int, message: str | None = None) -> dict:
 
 TASK_KEYS = {"id": str, "kind": str, "job_id": str, "clip": (int, type(None)), "lang": (str, type(None)),
              "state": str, "position": (int, type(None)), "error": (str, type(None)),
-             "created_at": float, "started_at": (float, type(None)), "finished_at": (float, type(None))}
+             "created_at": float, "started_at": (float, type(None)), "finished_at": (float, type(None)),
+             "platforms": (list, type(None))}  # step 4: publish tasks list their platforms, else null
 
 SUMMARY_KEYS = {"id": str, "source": str, "status": str, "error": (str, type(None)), "created_at": float,
                 "clip_count": int, "langs": list, "rendered": int, "failed": int, "interrupted": bool,
@@ -218,7 +219,8 @@ def assert_keys(d: dict, spec: dict) -> None:
 def assert_task(d: dict) -> None:
     assert_keys(d, TASK_KEYS)
     assert len(d["id"]) == 32
-    assert d["kind"] in ("run_job", "rerender")
+    assert d["kind"] in ("run_job", "rerender", "publish")
+    assert (d["platforms"] is None) == (d["kind"] != "publish")
     assert d["state"] in ("queued", "running", "done", "failed", "cancelled")
 
 

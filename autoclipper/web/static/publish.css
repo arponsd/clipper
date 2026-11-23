@@ -1,0 +1,55 @@
+/* Step 4 publishing UI (Accounts page, clip Publish panel, OAuth callback page).
+   Uses the colour tokens of styles.css; nothing here overrides step-2 rules. */
+
+.pub-dry-notice strong { display: block; font-size: 1.05rem; margin-bottom: .2rem; }
+.pub-switch { font-weight: 600; }
+
+.pub-map th, .pub-map td { white-space: normal; }
+.pub-acc { font-weight: 600; overflow-wrap: anywhere; }
+
+.pub-platforms { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); gap: 1rem; }
+.pub-block { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: .9rem; background: var(--surface); min-width: 0; }
+.pub-block h3 { margin: 0; font-size: 1rem; }
+.pub-block .fields { grid-template-columns: 1fr; }
+.pub-status-line { display: flex; flex-wrap: wrap; align-items: baseline; gap: .35rem; }
+.pub-problems, .pub-warnings { margin: .25rem 0; padding-left: 1.2rem; }
+.pub-problems li { color: var(--fail); }
+.pub-warnings li { color: var(--warn); }
+.pub-connect > summary, .pub-plan > summary, details > summary#pub-adv-h { cursor: pointer; font-weight: 600; padding: .25rem 0; }
+.pub-connect[open] > summary { margin-bottom: .5rem; }
+.pub-savebar { border-color: var(--accent); }
+
+.pub-panel { margin-top: 1rem; }
+.pub-choose { display: grid; gap: .75rem; }
+.pub-row { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: .7rem .8rem; min-width: 0; }
+.pub-row-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: .5rem; }
+.pub-status { margin-top: .5rem; }
+.pub-plan { margin-top: .5rem; }
+.pub-plan h4 { margin: .75rem 0 .25rem; font-size: .9rem; }
+.pub-plan .chip { margin-left: .4rem; }
+.pub-md .pub-md-val { white-space: pre-wrap; overflow-wrap: anywhere; }
+.pub-md:lang(hi), .pub-dialog-title:lang(hi), .pub-pre:lang(hi) { font-family: var(--font-hi); }
+.pub-reqs { padding-left: 1.3rem; display: grid; gap: .5rem; }
+.pub-method { font-weight: 700; }
+.pub-url { overflow-wrap: anywhere; }
+.pub-pre { margin: .25rem 0 0; padding: .5rem; background: var(--surface-2); border-radius: var(--radius-sm);
+  font-family: var(--mono); font-size: .8rem; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 18rem; overflow: auto; }
+
+.pub-dialog { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); color: var(--text);
+  width: min(560px, calc(100vw - 2rem)); max-height: calc(100vh - 2rem); padding: 1.2rem; box-shadow: var(--shadow); }
+.pub-dialog::backdrop { background: rgba(0, 0, 0, .55); }
+.pub-dialog h2 { margin-top: 0; }
+.pub-dialog-list { padding-left: 1.2rem; display: grid; gap: .6rem; }
+.pub-dialog-title { font-style: italic; overflow-wrap: anywhere; }
+.pub-public { color: var(--fail); font-weight: 600; }
+.pub-force { border-top: 1px solid var(--border); padding-top: .6rem; }
+
+/* OAuth callback page (served without app.js) */
+.oauth-page { display: grid; place-items: center; min-height: 100vh; margin: 0; padding: 1rem; background: var(--bg); color: var(--text); font-family: var(--font); }
+.oauth-card { max-width: 32rem; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 1.5rem; box-shadow: var(--shadow); }
+.oauth-hint { color: var(--muted); }
+
+@media (max-width: 480px) {
+  .pub-block, .pub-row { padding: .6rem; }
+  .pub-dialog { padding: .9rem; }
+}

@@ -386,6 +386,7 @@
   }
   function taskDesc(t) {
     if (t.kind === 'rerender') return `Re-render clip ${pad2(t.clip)} / ${LANG_SHORT[t.lang] || t.lang}`;
+    if (t.kind === 'publish') return `Publish clip ${pad2(t.clip)} / ${LANG_SHORT[t.lang] || t.lang}`;
     return 'Process job';
   }
   function chip(status, text) {
@@ -431,6 +432,7 @@
     [new RegExp(`^#/jobs/(${JOB_ID_RE})/clips/(\\d{1,3})/(en|hi)$`), viewClip, 'jobs'],
     [/^#\/settings$/, viewSettings, 'settings'],
     [/^#\/doctor$/, viewDoctor, 'doctor'],
+    [/^#\/accounts$/, (ctx) => window.ACPublish.viewAccounts(ctx), 'accounts'], // step 4 (publish.js)
   ];
 
   function route(initial) {
@@ -1311,6 +1313,7 @@
       }
       if (firstLoad) {
         swap(content, el('div', { class: 'review-layout' }, playerCol, form));
+        if (window.ACPublish) window.ACPublish.panel(ctx, id, n, lang, content); // step 4: publish panel
         if (entry.script) fillForm(entry.script);
         else {
           serverNote.hidden = false;
@@ -1555,6 +1558,7 @@
       const sections = [];
       for (const [key, raw] of Object.entries(props)) {
         const { node } = unwrapNullable(raw);
+        if (key === 'publish') continue; // step 4: owned by the Accounts page (left out on save; the server keeps it)
         if (isObjectNode(node)) sections.push([key, node]);
         else general.push([key, raw]);
       }
@@ -1581,6 +1585,9 @@
         e.preventDefault();
         errs.clear();
         const out = deepClone(loaded) || {};
+        // step 4: never send the (possibly stale) publish section: PUT /api/settings keeps the stored one,
+        // so a tab opened earlier cannot undo the dry-run switch or the account mapping set on #/accounts
+        delete out.publish;
         const clientErrors = {};
         for (const f of fields) {
           try { setPath(out, f.path, f.get()); } catch (err) { clientErrors[f.path.join('.')] = [err.message]; }
@@ -1875,6 +1882,9 @@
     rerun.addEventListener('click', run);
     run();
   }
+
+  // step 4: helpers shared with publish.js (CONTRACT_STEP4 section 11)
+  window.ACApp = { api, apiGet, el, append, swap, toast, makePoller, Queue, FormErrors, errorNotice, pageHead, loading, failBox, uuid, fmtBytes, fmtSecs, fmtDate, chip, bar, pad2, langAttr, cancelTask, taskLabel, LANG_NAMES, $main };
 
   // ------------------------------------------------------------------ boot
   function boot() {
