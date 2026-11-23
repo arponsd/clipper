@@ -335,7 +335,9 @@ def test_job_detail_structure(api):
                      "warning": (str, type(None)), "caption_engine": (str, type(None)),
                      "caption_style": (str, type(None)), "render_stale": bool,
                      "task": (dict, type(None)), "publish_url": str,  # step 4: publish_url (additive)
-                     "voiceover": bool, "rendered_voiceover": (bool, type(None))})  # voice-over on/off (additive)
+                     "voiceover": bool, "rendered_voiceover": (bool, type(None)),  # voice-over on/off (additive)
+                     "audio": (dict, type(None)),  # audio mix / trim info from render.json (additive)
+                     "audio_stale": bool})  # made with an older mix / other audio settings (additive)
     assert en["voiceover"] is True and en["rendered_voiceover"] is True
     assert set(en["stages"]) == {"script", "voice", "captions", "render"}
     assert en["final"] is True and en["video_url"] == f"/api/jobs/{store.job.id}/clips/0/en/video"
@@ -343,7 +345,7 @@ def test_job_detail_structure(api):
     assert_keys(en["script"], {"narration": str, "title": str, "description": str, "hashtags": list})
     assert_keys(en["metadata"], {"language": str, "title": str, "description": str, "hashtags": list})
     assert_keys(en["voice"], {"duration": float, "clip_duration": float, "tempo": float, "shortened": bool,
-                              "trimmed": bool, "lengthened": bool})
+                              "trimmed": bool, "lengthened": bool, "warnings": list, "truncated": bool})
     assert en["voice_stale"] is False and c["langs"]["hi"]["voice_stale"] is True
     assert c["langs"]["hi"]["script"]["narration"] == "नया पाठ"
     assert en["task"] is None

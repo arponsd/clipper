@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Literal
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .publish.settings import PublishSettings
 
@@ -51,6 +51,10 @@ class VoiceboxSettings(BaseModel):
     url: str = "http://127.0.0.1:17493"
     poll_interval: float = Field(1.0, ge=0.1, le=10)
     timeout_seconds: float = Field(600.0, ge=10, le=7200)
+    # The optional "lengthen" retry (a too-short take regenerated with a longer narration) is a nice-to-have:
+    # it gets its own, shorter limit so a slow Voicebox does not hold a clip for timeout_seconds again.
+    # The original take is kept when it runs out. Capped at timeout_seconds.
+    lengthen_timeout_seconds: float = Field(240.0, ge=10, le=7200)
     english: VoiceProfile = Field(default_factory=VoiceProfile)
     # Hindi must use Chatterbox Multilingual.
     hindi: VoiceProfile = Field(default_factory=lambda: VoiceProfile(engine="chatterbox"))
@@ -74,11 +78,29 @@ class ClipSettings(BaseModel):
 
 
 class AudioSettings(BaseModel):
-    original_volume: float = Field(0.15, ge=0, le=1)  # original audio level WHILE the voice plays (ducked)
-    # original audio level when no voice plays (before / after the narration)
+    # Voice-over mix (see README "Audio mix"):
+    # "loudness" = measure the voice and the background (EBU R128) and set their levels from that: the voice
+    #   is normalised to voice_lufs and the background sits background_db_below_voice under it while the
+    #   narration plays, however loud or quiet the source is.
+    # "gain" = the old fixed gains (original_volume under the voice, original_volume_after outside it).
+    mix: Literal["loudness", "gain"] = "loudness"
+    voice_lufs: float = Field(-16.0, ge=-30, le=-8)  # loudness mix: voice level before the final loudnorm
+    # loudness mix: background level under the narration, in dB below the voice
+    background_db_below_voice: float = Field(18.0, ge=0, le=40)
+    # gain mix only: original audio level WHILE the voice plays (ducked)
+    original_volume: float = Field(0.15, ge=0, le=1)
+    # Original audio level when no voice plays (before / after the narration, and the whole clip with the
+    # voice-over off). gain mix: a plain factor. loudness mix: relative to the voice level (1.0 = as loud as
+    # the voice, 0.5 = 6 dB under it).
     original_volume_after: float = Field(1.0, ge=0, le=2)
     duck_ramp_seconds: float = Field(0.4, ge=0, le=2)  # ramp time between the two levels
-    voice_volume: float = Field(1.0, ge=0, le=2)
+    voice_volume: float = Field(1.0, ge=0, le=2)  # gain mix: factor; loudness mix: trim on voice_lufs
+    # A narration that ends before short_voice_below x the clip length: "trim_clip" ends the video at the
+    # narration end + short_voice_tail seconds (never under 3 s); "keep" keeps the whole clip (the original
+    # audio comes back after the narration).
+    short_voice: Literal["trim_clip", "keep"] = "trim_clip"
+    short_voice_below: float = Field(0.6, ge=0.1, le=0.95)
+    short_voice_tail: float = Field(1.0, ge=0, le=5)
     max_speedup: float = Field(1.25, ge=1.0, le=2.0)  # cap on atempo to fit voice into clip
     loudnorm: bool = True  # single-pass loudnorm on the final mix
     target_lufs: float = Field(-14.0, ge=-30, le=-8)  # loudnorm integrated loudness target
@@ -138,6 +160,47 @@ class HyperFramesSettings(BaseModel):
         return v
 
 
+class SeparationSettings(BaseModel):
+    """Vocal separation with Demucs (optional, voice-over mode only). See README "Vocal separation"."""
+    # Background under the narration: "original" = the clip's own audio; "no_vocals" = the clip with its
+    # speech removed by Demucs (falls back to the original, with a warning, when Demucs is missing or fails).
+    background: Literal["original", "no_vocals"] = "original"
+    # Python of the venv Demucs is installed in (Windows: ~/tools/demucs/Scripts/python.exe).
+    python: str = "~/tools/demucs/bin/python"
+    model: str = "htdemucs"  # Demucs model name (-n); htdemucs = 4-stem hybrid transformer
+    # Seconds of audio processed at once: lower = less memory. Transformer models (htdemucs*) allow at most
+    # 7 (Demucs refuses more than 7.8); other models up to 60.
+    segment: int = Field(7, ge=1, le=60)
+    threads: int = Field(4, ge=0, le=64)  # CPU threads for torch (0 = torch's default: all cores)
+    timeout_seconds: float = Field(900.0, ge=30, le=7200)  # one clip
+    # Where Demucs keeps its downloaded model (TORCH_HOME); "" = torch's default (~/.cache/torch).
+    models_dir: str = "~/tools/demucs/models"
+
+    @field_validator("python", "models_dir")
+    @classmethod
+    def _path_text(cls, v: str) -> str:
+        if len(v) > _PATH_MAX:
+            raise ValueError(f"must be at most {_PATH_MAX} characters")
+        if any(ch in v for ch in ("\x00", "\n", "\r")):
+            raise ValueError("must not contain NUL or line breaks")
+        return v
+
+    @field_validator("model")
+    @classmethod
+    def _model_name(cls, v: str) -> str:
+        if not _MODEL_RE.match(v):
+            raise ValueError("must be 1-64 letters, digits, '_' or '-' (e.g. htdemucs)")
+        return v
+
+    @model_validator(mode="after")
+    def _segment_fits_model(self) -> "SeparationSettings":
+        if self.model.lower().startswith("htdemucs") and self.segment > 7:
+            raise ValueError(f"separation.segment must be at most 7 for the transformer model {self.model} "
+                             f"(Demucs refuses longer segments); got {self.segment}")
+        return self
+
+
+_MODEL_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}\Z")
 _EXT_RE = re.compile(r"^\.[a-z0-9]{1,9}\Z")  # \Z: "$" would accept ".mp4\n"
 
 
@@ -173,6 +236,7 @@ class Settings(BaseModel):
     script: ScriptSettings = Field(default_factory=ScriptSettings)
     web: WebSettings = Field(default_factory=WebSettings)
     hyperframes: HyperFramesSettings = Field(default_factory=HyperFramesSettings)
+    separation: SeparationSettings = Field(default_factory=SeparationSettings)
     publish: PublishSettings = Field(default_factory=PublishSettings)
 
     def voice_for(self, lang: str) -> VoiceProfile:

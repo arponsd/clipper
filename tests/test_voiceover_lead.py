@@ -63,7 +63,9 @@ def test_legacy_job_without_mode_is_voiceover_on(vo_api):  # noqa: F811
     d = client.get(f"/api/jobs/{store.job.id}").json()
     en = d["clips"][0]["langs"]["en"]
     assert d["voiceover"] is True and d["voiceover_override"] is None
-    assert en["voiceover"] is True and en["render_stale"] is False
+    # stale only because the legacy final was made with the old voice-over mix (audio_stale), not the mode
+    assert en["voiceover"] is True and en["rendered_voiceover"] is True
+    assert en["render_stale"] is True and en["audio_stale"] is True
 
 
 # --------------------------------------------------------------------------------------------- translation

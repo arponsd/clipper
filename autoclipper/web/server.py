@@ -141,6 +141,13 @@ class ClipScriptIn(BaseModel):
 # ---------------------------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------------------------
+class JobModeIn(BaseModel):
+    """PUT /api/jobs/{id}/mode: the job's voice-over mode (true = voice-over + captions, false = original
+    audio + captions)."""
+    model_config = ConfigDict(extra="forbid", strict=True)
+    voiceover: bool
+
+
 def _web_settings(settings: Settings) -> tuple[int, list[str]]:
     web = getattr(settings, "web", None)
     mb = getattr(web, "max_upload_mb", DEFAULT_MAX_UPLOAD_MB) if web is not None else DEFAULT_MAX_UPLOAD_MB
@@ -247,6 +254,29 @@ def _rendered_voiceover(out_dir: Path) -> bool:
     return rendered_voiceover(read_render_stamp(out_dir))
 
 
+_AUDIO_KEYS = ("mix", "background", "background_outside", "background_note", "separation_seconds",
+               "separation_cached", "clip_duration", "duration", "voice_end", "trimmed_to", "trim_reason",
+               "voice_lufs", "background_lufs_under_voice", "background_lufs", "voice_gain_db",
+               "background_gain_db_under_voice", "background_gain_db_outside", "warning")
+
+
+def _audio_stale(out_dir: Path, settings: Settings) -> bool:
+    """A voice-over final made with an older mix or other audio settings (render.json audio_key)."""
+    from ..stages.render import audio_settings_changed, read_render_stamp
+
+    return audio_settings_changed(read_render_stamp(out_dir), settings)
+
+
+def _render_audio(out_dir: Path) -> dict | None:
+    """render.json "audio" (what the mix did: background, loudness, trim), known keys only."""
+    from ..stages.render import read_render_stamp
+
+    audio = read_render_stamp(out_dir).get("audio")
+    if not isinstance(audio, dict):
+        return None
+    return {k: audio.get(k) for k in _AUDIO_KEYS}
+
+
 def _read_script(path: Path) -> ClipScript | None:
     try:
         return ClipScript.model_validate_json(path.read_text(encoding="utf-8"))
@@ -340,7 +370,9 @@ class App:
                     voice = {"duration": voice.get("final_duration"), "clip_duration": voice.get("clip_duration"),
                              "tempo": voice.get("tempo"), "shortened": bool(voice.get("shortened", False)),
                              "trimmed": bool(voice.get("trimmed", False)),
-                             "lengthened": bool(voice.get("lengthened", False))}
+                             "lengthened": bool(voice.get("lengthened", False)),
+                             "truncated": bool(voice.get("truncated", False)),
+                             "warnings": [str(w) for w in voice.get("warnings") or [] if isinstance(w, str)]}
                 else:
                     voice = None
                 base = f"/api/jobs/{job.id}/clips/{c.index}/{lang}"
@@ -362,6 +394,8 @@ class App:
                     "render_stale": render_stale,
                     "voiceover": d["voiceover"],
                     "rendered_voiceover": rendered_vo,
+                    "audio": _render_audio(out) if final else None,
+                    "audio_stale": bool(final and settings is not None and _audio_stale(out, settings)),
                     "task": self.worker.task_dict(self.worker.active_task_for(job.id, c.index, lang)),
                 }
             m = c.moment
@@ -771,6 +805,46 @@ def create_app(*, worker: Worker | None = None, settings_loader: Callable[[], Se
         task, created = state.worker.submit_resume(job_id)
         return JSONResponse({"job": state.summary(_load_job(job_id)), "task": state.worker.task_dict(task)},
                             status_code=202 if created else 200)
+
+    @app.put("/api/jobs/{job_id}/mode")
+    def put_mode(job_id: JobId, body: Annotated[JobModeIn, Body()]) -> JSONResponse:
+        """Switch a job between voice-over + captions and original audio + captions, and queue a run that
+        re-renders every clip-language made in the other mode (CONTRACT_WEB section 12)."""
+        from ..stages.render import render_settings_changed
+
+        job = _load_job(job_id)
+        try:
+            settings: Settings | None = state.settings_loader()
+        except (ValidationError, ValueError, OSError):
+            settings = None
+        current = _job_voiceover(job, settings)
+        want = body.voiceover
+        active = state.worker.active_run_job(job_id)
+        target = _job_settings(job, settings)
+        if target is not None:
+            target = target.model_copy(update={"voiceover": want})
+
+        def up_to_date(out: Path) -> bool:
+            # rendered in that mode and with the current audio/caption settings (else: re-rendered)
+            if not _nonempty_file(out / "final.mp4") or _rendered_voiceover(out) != want:
+                return False
+            return target is None or not render_settings_changed(out, target)
+
+        if active is None and current == want and job.clips and all(
+                up_to_date(_clip_dir(job_id, c.index, lang)) for c in job.clips for lang in c.langs):
+            return JSONResponse({"job": state.summary(job), "voiceover": want, "changed": False, "task": None},
+                                status_code=200)
+        if active is None:
+            _check_no_other_owner(state.worker, job_id)
+        try:
+            # the task carries the switch only when it is one; a run already queued in the job's current mode
+            # is the answer to "same mode" (no 409)
+            task, created = state.worker.submit_resume(job_id, voiceover=want if want != current else None,
+                                                       current=current)
+        except WorkerConflict as e:
+            raise APIError(409, str(e))
+        return JSONResponse({"job": state.summary(_load_job(job_id)), "voiceover": want, "changed": current != want,
+                             "task": state.worker.task_dict(task)}, status_code=202 if created else 200)
 
     # ---- clip review ------------------------------------------------------------------------
     @app.get("/api/jobs/{job_id}/clips/{clip}/{lang}/script")

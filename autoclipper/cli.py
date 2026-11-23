@@ -608,7 +608,26 @@ def run_doctor(settings: Settings) -> list[Check]:
     checks += check_voicebox(settings)
     checks.append(check_api_key(settings))
     checks += check_hyperframes(settings)
+    checks.append(check_demucs(settings))
     return checks
+
+
+def check_demucs(settings: Settings, runner: Callable[..., Any] | None = None) -> Check:
+    """Demucs (vocal separation) row. Never fails: a missing Demucs falls back to the original audio."""
+    from . import separation
+
+    s = settings.separation
+    if s.background != "no_vocals":
+        py = separation.python_path(s)
+        where = f"Python found at {py}" if py.is_file() else f"not installed at {py}"
+        return Check("demucs", "ok", f"not used (separation.background = original); {where}")
+    if not settings.voiceover:
+        return Check("demucs", "ok", "not needed: voice-over is off (the original audio is kept)")
+    ok, detail = separation.check_demucs(s, runner=runner)
+    if ok:
+        return Check("demucs", "ok", detail)
+    return Check("demucs", "warn", f"{detail} - voice-over backgrounds fall back to the original audio; "
+                                   "see README \"Vocal separation\"")
 
 
 def cmd_doctor(_args: argparse.Namespace) -> int:

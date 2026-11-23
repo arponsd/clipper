@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -311,6 +312,42 @@ def to_wav(src: Path, dst: Path, *, sample_rate: int = 16000, channels: int = 1)
             desc=f"extract wav from {Path(src).name}",
         )
     return dst
+
+
+# EBU R128 integrated loudness at or under this is "no audio" (ebur128 reports -70 LUFS for silence).
+SILENT_LUFS = -69.0
+_LOUDNESS_RE = re.compile(r"Summary:.*?Integrated loudness:\s*I:\s*(-?[0-9.]+|-inf)\s*LUFS", re.S)
+
+
+def measure_loudness(path: Path, *, start: float = 0.0, end: float | None = None,
+                     pre: str | None = None) -> float | None:
+    """Integrated loudness (LUFS, EBU R128 / ebur128 filter) of the first audio stream of ``path`` between
+    ``start`` and ``end`` seconds. None when the span is silent, has no audio or cannot be measured.
+
+    ``pre`` is a filter chain applied first, e.g. the mono -> stereo copy a mix applies: a mono signal
+    played on both channels measures 3 dB louder than the same mono file."""
+    cmd = [ffmpeg_bin(), "-hide_banner", "-nostdin", "-nostats", "-loglevel", "info"]
+    if start > 0:
+        cmd += ["-ss", _num(start)]
+    if end is not None:
+        span = end - max(start, 0.0)
+        if span <= 0.05:
+            return None
+        cmd += ["-t", _num(span)]
+    af = (pre + "," if pre else "") + "ebur128=framelog=quiet"
+    cmd += ["-i", str(path), "-map", "0:a:0", "-vn", "-af", af, "-f", "null", "-"]
+    try:
+        proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=300)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    m = _LOUDNESS_RE.search(proc.stderr)
+    if not m or m.group(1) == "-inf":
+        return None
+    value = float(m.group(1))
+    return value if math.isfinite(value) and value > SILENT_LUFS else None
 
 
 def atempo_chain(factor: float) -> str:

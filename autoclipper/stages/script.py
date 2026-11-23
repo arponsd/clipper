@@ -40,8 +40,66 @@ def target_words(duration: float, lang: str, *, wps: float | None = None,
     return max(MIN_TARGET_WORDS, round(max(0.0, duration) * wps * fill_ratio))
 
 
+_DQ = '"'
+_CURLY = ("\u201c", "\u201d")  # left / right double quotation marks
+_WRAPPERS = (('"', '"'), ("\u201c", "\u201d"), ("\u201e", "\u201c"), ("\u00ab", "\u00bb"))
+
+
+_INCH_RE = re.compile(r'(?<=\d)"(?=[\s\-\u2013\u2014,.;:!?)]|$)')  # 5" screen, 27" monitor
+
+
+def _drop_unpaired_curly(t: str) -> str:
+    """Remove curly double quotes without a partner: a closing one with no open quote before it, and an
+    opening one never closed. Paired quotes stay."""
+    lq, rq = _CURLY
+    keep = [True] * len(t)
+    opened: list[int] = []
+    for i, ch in enumerate(t):
+        if ch == lq:
+            opened.append(i)
+        elif ch == rq:
+            if opened:
+                opened.pop()
+            else:
+                keep[i] = False
+    for i in opened:
+        keep[i] = False
+    return "".join(ch for ch, k in zip(t, keep) if k)
+
+
+def _fix_quotes(title: str) -> str:
+    """Drop quotes that wrap the whole title, then any unpaired double quote.
+
+    '"A title"' -> 'A title'; '"Quoted" - rest' stays as is (a balanced pair is kept);
+    'Quoted" - rest' (an LLM or an old clean-up dropped the opening quote) -> 'Quoted - rest';
+    '\u201cQuoted\u201d - rest\u201d' -> '\u201cQuoted\u201d - rest'. An inch mark after a digit ('5" screen')
+    is not a quote and is kept. Apostrophes / single quotes are left alone ("Reagan's", "'Garbage'").
+    """
+    t = title.strip()
+    changed = True
+    while changed and len(t) >= 2:
+        changed = False
+        for left, right in _WRAPPERS:
+            inner = t[len(left):-len(right)]
+            if t.startswith(left) and t.endswith(right) and left not in inner and right not in inner:
+                t, changed = inner.strip(), True
+    inch = "\u0000"  # placeholder: inch marks take no part in the pairing
+    t = _INCH_RE.sub(inch, t)
+    if t.count(_DQ) % 2:  # unbalanced straight quotes: drop the last one that has no partner
+        i = t.rfind(_DQ) if t.count(_DQ) > 1 else t.find(_DQ)
+        t = t[:i] + t[i + 1:]
+    t = _drop_unpaired_curly(t).replace(inch, _DQ)
+    t = re.sub(r"\s+([,.;:!?])", r"\1", " ".join(t.split()))
+    return t.strip()
+
+
+def fix_title_quotes(title: str) -> str:
+    """Public: the quote clean-up of _clean_title (also applied to titles of older scripts)."""
+    return _fix_quotes(" ".join((title or "").split())) if title else title
+
+
 def _clean_title(title: str) -> str:
-    title = " ".join(title.split()).strip().strip('"').strip()
+    title = _fix_quotes(" ".join(title.split()).strip())
     if len(title) <= TITLE_MAX:
         return title
     cut = title[:TITLE_MAX]

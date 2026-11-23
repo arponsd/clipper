@@ -581,3 +581,7 @@ td.detail { overflow-wrap: anywhere; word-break: break-word; font-size: .88rem; 
 fieldset.is-inactive > .fields, fieldset.is-inactive > p.muted { opacity: 0.55; }
 .field.is-inactive { opacity: 0.55; }
 .caption-engine { margin: 0; }
+
+/* job page: voice-over Mode switch */
+.mode-row { margin-top: .4rem; }
+.mode-row select { width: auto; max-width: 100%; }

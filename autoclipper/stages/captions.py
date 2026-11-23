@@ -15,7 +15,7 @@ from ..interfaces import Transcriber
 from ..models import Word
 from ._atomic import write_text_atomic
 from .transcribe import transcribe_voice
-from .voice import load_voice_result, narration_hash
+from .voice import load_voice_result, looks_truncated, narration_hash, truncated_prefix
 
 log = logging.getLogger(__name__)
 MIN_MATCH_RATIO = 0.3
@@ -244,10 +244,17 @@ def make_captions(*, narration: str, voice_wav: Path, lang: str, transcriber: Tr
     dur = ffmpeg.duration(voice_wav)
     trimmed = False
     vr = load_voice_result(out_dir)
-    if vr is not None and vr.trimmed and vr.narration_hash == narration_hash(narration):
+    if vr is not None and (vr.trimmed or vr.truncated) and vr.narration_hash == narration_hash(narration):
         trimmed = True
         if vr.spoken_narration:
             narration = vr.spoken_narration
+    elif looks_truncated(narration, dur, settings.script.wps(lang)):
+        # A take Voicebox cut short before voice.json recorded it (older voices): caption only the words
+        # that fit in the voice, never the whole text squeezed into it.
+        log.warning("%s is %.1fs, far shorter than its %d-word narration needs; captioning only the spoken part",
+                    voice_wav.name, dur, len(narration.split()))
+        narration = truncated_prefix(narration, dur, settings.script.wps(lang))
+        trimmed = True
     script_words = split_words(narration)
     recognized: list[Word] = []
     if script_words:

@@ -270,6 +270,16 @@ class _Reporter:
             return stage
         return f"{stage} {clip:02d}/{lang}"
 
+    @property
+    def has_cancel_point(self) -> bool:
+        return bool(getattr(self.log, "cancel_point", False))
+
+    def cancel_point(self) -> None:
+        """Lets a cancel/stop requested in the web worker interrupt a long subprocess (Demucs). The worker's
+        log function treats an empty line as a cancel point only; other log functions are not called."""
+        if getattr(self.log, "cancel_point", False):
+            self.log("")
+
     def line(self, stage: str, pct: float, message: str, clip: int | None = None,
              lang: str | None = None) -> None:
         text = f"[{self.store.job.id}] {self._where(stage, clip, lang)} {round(pct * 100):d}%"
@@ -585,7 +595,10 @@ def _run_voice(store: JobStore, rep: _Reporter, settings: Settings, deps: _LazyD
                         on_progress=rep.progress("voice", clip.index, lang),
                         lengthen=_lengthen_fn(deps, lang) if allow_lengthen else None,
                         lengthen_below=settings.script.lengthen_below,
-                        fill_ratio=settings.script.fill_ratio)
+                        fill_ratio=settings.script.fill_ratio,
+                        lengthen_timeout=min(settings.voicebox.lengthen_timeout_seconds,
+                                             settings.voicebox.timeout_seconds),
+                        wps=settings.script.wps(lang))
     if result.narration.strip() != script.narration.strip():
         # Keep script.json in sync with what was actually spoken (captions + rerender rely on it).
         script = script.model_copy(update={"narration": result.narration})
@@ -599,6 +612,10 @@ def _run_voice(store: JobStore, rep: _Reporter, settings: Settings, deps: _LazyD
         notes.append("trimmed")
     if result.lengthened:
         notes.append("lengthened")
+    if result.truncated:
+        notes.append("cut short by Voicebox")
+    for w in result.warnings:
+        rep.line("voice", 1.0, "WARNING " + w, clip.index, lang)
     rep.done("voice", clip.index, lang, ", ".join(notes))
     return script
 
@@ -693,23 +710,51 @@ def _run_render(store: JobStore, rep: _Reporter, settings: Settings, clip: ClipS
     notes = ["captions: HyperFrames"] if engine == "hyperframes" else []
     if not settings.voiceover:
         notes.append("original audio, no voice-over")
+    elif settings.separation.background == "no_vocals":
+        notes.append("background: removing vocals (Demucs)")
     rep.start("render", clip.index, lang, "; ".join(notes))
     outcome = render_clip(cut=store.clip_dir(clip.index) / "cut.mp4", out_dir=out_dir, settings=settings,
-                          on_progress=rep.progress("render", clip.index, lang), hf_env_cache=hf_env_cache)
+                          on_progress=rep.progress("render", clip.index, lang), hf_env_cache=hf_env_cache,
+                          cancel_check=rep.cancel_point if rep.has_cancel_point else None)
     write_render_stamp(out_dir, settings, outcome)
     write_metadata(script, lang, out_dir / "metadata.json")
     message = store.rel(final)
+    warnings = []
     if outcome.warning:
-        if state is not None:
-            state.warning = outcome.warning
-        rep.line("render", 1.0, "WARNING " + outcome.warning, clip.index, lang)
+        warnings.append(outcome.warning)
         message = f"{final.name} (ASS fallback: {outcome.reason or outcome.warning})"
     elif outcome.engine_used == "hyperframes":
         message = f"{store.rel(final)} (HyperFrames {settings.hyperframes.style} captions)"
+    if outcome.audio_warning:
+        warnings.append(outcome.audio_warning)
+    if settings.voiceover:
+        warnings += _voice_warnings(out_dir)
+    for w in warnings:
+        rep.line("render", 1.0, "WARNING " + w, clip.index, lang)
+    if state is not None and warnings:
+        state.warning = "; ".join(warnings)
+    audio = outcome.audio or {}
+    if audio.get("background") == "no_vocals":
+        secs = audio.get("separation_seconds")
+        how = "cached stem" if audio.get("separation_cached") else (
+            f"separated in {secs:.0f}s" if isinstance(secs, (int, float)) else "separated")
+        rep.line("render", 1.0, f"background: vocals removed (Demucs, {how})", clip.index, lang)
+    if audio.get("background_note"):
+        rep.line("render", 1.0, f"background {audio['background_note']}", clip.index, lang)
+    if audio.get("trimmed_to"):
+        message += (f" - trimmed to {audio['trimmed_to']:.1f}s (narration ends at "
+                     f"{audio.get('voice_end') or 0:.1f}s of {audio.get('clip_duration') or 0:.1f}s)")
     if not settings.voiceover:
         message += " - voice-over off"
     rep.done("render", clip.index, lang, message)
     return final
+
+
+def _voice_warnings(out_dir: Path) -> list[str]:
+    from .stages.voice import load_voice_result
+
+    result = load_voice_result(out_dir)
+    return list(result.warnings) if result is not None else []
 
 
 def _add_narration(store: JobStore, rep: _Reporter, settings: Settings, deps: _LazyDeps,

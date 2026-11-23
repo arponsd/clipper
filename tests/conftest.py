@@ -62,6 +62,14 @@ def _no_real_services(request: pytest.FixtureRequest, tmp_path: Path, monkeypatc
         for name in ("_make_llm", "_make_voicebox", "_make_transcriber"):
             monkeypatch.setattr(pipeline, name, real_client)
 
+    if request.node.get_closest_marker("demucs") is None:
+        from autoclipper import separation
+
+        def no_demucs(*_a, **_kw):
+            raise RuntimeError("real Demucs in tests (mark the test demucs + slow, or pass a fake runner)")
+
+        monkeypatch.setattr(separation, "_default_runner", no_demucs)
+
     real_connect = socket.socket.connect
     real_connect_ex = socket.socket.connect_ex
 

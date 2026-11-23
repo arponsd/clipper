@@ -294,7 +294,7 @@ def test_render_final_builds_ducking_graph(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(render, "resolve_fonts_dir", lambda: None)
     dst = tmp_path / "en" / "final.mp4"
     out = render_final(cut=cut, voice=voice, ass=ass, dst=dst,
-                       audio=AudioSettings(original_volume=0.2, voice_volume=1.1))
+                       audio=AudioSettings(original_volume=0.2, voice_volume=1.1, mix="gain", short_voice="keep"))
     assert out == dst and dst.is_file()
     args = seen["args"]
     assert args[args.index("-i") + 1] == str(cut) and str(voice) in args
