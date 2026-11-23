@@ -56,6 +56,8 @@ class Task:
     idempotency_key: str | None = field(default=None, repr=False)  # publish tasks only (not in to_dict)
     # run_job only: switch the job's voice-over mode to this (PUT /api/jobs/{id}/mode); None = keep it
     voiceover: bool | None = field(default=None, repr=False)
+    # publish only (G6): the schedule this task fires, passed to run_publish as `schedule=`
+    schedule: dict | None = field(default=None, repr=False)
 
     def to_dict(self, position: int | None) -> dict:
         d = asdict(self)
@@ -158,6 +160,7 @@ class Worker:
         self._finalizing = False
         self._thread: threading.Thread | None = None
         self._stopping = False
+        self.scheduler: Any = None  # G6: web.scheduler.Scheduler, started/stopped with the worker
 
     # ---- lifecycle ------------------------------------------------------------------------
     def start(self) -> None:
@@ -171,6 +174,8 @@ class Worker:
         with self._lock:
             self._thread = t
         t.start()
+        if self.scheduler is not None:  # G6
+            self.scheduler.start()
 
     def begin_stop(self) -> None:
         """Set the stopping flag and cancel the running task, without waiting (safe from a signal handler:
@@ -188,6 +193,8 @@ class Worker:
         return self._stopping
 
     def stop(self, timeout: float = 10.0) -> None:
+        if self.scheduler is not None:  # G6
+            self.scheduler.stop()
         self.begin_stop()
         with self._lock:
             t = self._thread
@@ -217,6 +224,8 @@ class Worker:
                     self._mark_interrupted(task.job_id, only_if=("queued",))
                 except Exception:  # noqa: BLE001
                     log.exception("could not mark job %s interrupted", task.job_id)
+        if self.scheduler is not None and hasattr(self.scheduler, "release"):  # G6: after the last publish
+            self.scheduler.release()
 
     @property
     def alive(self) -> bool:
@@ -372,7 +381,7 @@ class Worker:
             return task, True
 
     def submit_publish(self, job_id: str, clip: int, lang: str, platforms: list[str], *, force: bool = False,
-                       idempotency_key: str | None = None) -> tuple[Task, bool]:
+                       idempotency_key: str | None = None, schedule: dict | None = None) -> tuple[Task, bool]:
         """Queue a live publish of one clip-lang. Same active clip-lang + same platform set -> (it, False);
         a different set, a run_job of the job or a rerender of the clip-lang -> WorkerConflict."""
         wanted = list(platforms)
@@ -388,7 +397,7 @@ class Worker:
                 raise WorkerConflict("clip is already being published to "
                                      f"{', '.join(existing.platforms or [])}; wait until it finishes")
             task = Task(id=uuid.uuid4().hex, kind="publish", job_id=job_id, clip=clip, lang=lang,
-                        platforms=wanted, force=force, idempotency_key=idempotency_key)
+                        platforms=wanted, force=force, idempotency_key=idempotency_key, schedule=schedule)
             self._enqueue(task)
             return task, True
 
@@ -436,6 +445,29 @@ class Worker:
 
     def cancel(self, task_id: str) -> Task | None:
         return self.cancel_ex(task_id)[0]
+
+    def cancel_if_queued(self, task_id: str) -> str:
+        """G6: remove a task only while it still waits in the queue; never signals a running task.
+        -> "removed", "running", "finished" or "unknown" (not a task of this server)."""
+        with self._cond:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return "unknown"
+            if task.state != "queued":
+                return "running" if task.state == "running" else "finished"
+            # same removal as cancel_ex, under the same lock hold, so it cannot start in between
+            try:
+                self._queue.remove(task)
+            except ValueError:
+                pass
+            task.state = "cancelled"
+            task.finished_at = time.time()
+            self._cancel.pop(task.id, None)
+            self._remember(task)
+            if task.kind == "run_job":
+                self._finalize.append(task.job_id)
+            self._cond.notify_all()
+            return "removed"
 
     def status(self, task_id: str) -> Task | None:
         with self._lock:
@@ -630,7 +662,8 @@ class Worker:
                         results = self._publish(task.job_id, task.clip, task.lang,
                                                 platforms=list(task.platforms or []), force=task.force,
                                                 settings=settings, log=log_line,
-                                                idempotency_key=task.idempotency_key)
+                                                idempotency_key=task.idempotency_key,
+                                                **({"schedule": task.schedule} if task.schedule else {}))
                         publish_failure = publish_runner.all_failed(results if isinstance(results, dict) else {})
                     elif task.kind == "run_job":
                         job = read_job(task.job_id)

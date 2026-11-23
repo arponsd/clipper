@@ -6,6 +6,7 @@ platform is written atomically; the ledger gets one line per successful publish.
 """
 from __future__ import annotations
 
+import dataclasses
 import time
 from typing import Any, Callable
 
@@ -14,6 +15,7 @@ import httpx
 from ..config import Settings
 from . import LANG_NAMES, PLATFORM_NAMES, records
 from .base import PublishError, make_publisher
+from .common import fmt_local
 from .secrets import redact
 from .service import PublishConflict, check_platforms, load_item, platform_problems, build_plans
 
@@ -25,16 +27,24 @@ def _base_status(job_id: str, clip: int, lang: str, platform: str, *, item: Any,
             "progress": 0.0, "message": "queued", "attempts": attempts, "error": None, "remote_id": None,
             "url": None, "account": ({"id": account.get("id"), "name": account.get("name")} if account else None),
             "video_sha256": item.sha256 if item else None, "video_size": item.size if item else None,
-            "idempotency_key": idempotency_key, "started_at": now, "updated_at": now, "published_at": None}
+            "idempotency_key": idempotency_key, "started_at": now, "updated_at": now, "published_at": None,
+            "scheduled_for": None, "cover": None}
 
 
 def run_publish(job_id: str, clip: int, lang: str, *, platforms: list[str], force: bool, settings: Settings,
                 log: Callable[[str], None], http: httpx.Client | None = None,
-                sleep: Callable[[float], None] = time.sleep, idempotency_key: str | None = None) -> dict:
-    """-> {platform: Status (public)}. Raises PublishNotFound / PublishConflict for clip-level problems."""
+                sleep: Callable[[float], None] = time.sleep, idempotency_key: str | None = None,
+                schedule: dict | None = None) -> dict:
+    """-> {platform: Status (public)}. Raises PublishNotFound / PublishConflict for clip-level problems.
+
+    `schedule` (G6, from the scheduler): {"id", "publish_at", "native": bool, "plans": {platform: {...}}}. With native
+    true the platform's own scheduling is used (YouTube publishAt, Facebook SCHEDULED)."""
     platforms = check_platforms(platforms)
     ps = settings.publish
     item, extra = load_item(job_id, clip, lang)
+    native_at = float(schedule["publish_at"]) if schedule and schedule.get("native") else None
+    if native_at is not None:
+        item = dataclasses.replace(item, publish_at=native_at)
     tag = f"[{job_id}] publish {clip:02d}/{lang}"
     results: dict[str, dict] = {}
     writers: dict[str, records.FileStatusWriter] = {}
@@ -75,6 +85,11 @@ def run_publish(job_id: str, clip: int, lang: str, *, platforms: list[str], forc
         # the plan file is rewritten with dry_run=false right before sending
         plan = build_plans(item, extra, [p], ps)[p]
         plan["dry_run"] = False
+        if schedule:
+            info = (schedule.get("plans") or {}).get(p) if isinstance(schedule.get("plans"), dict) else None
+            info = info if isinstance(info, dict) else schedule.get("plan")
+            if isinstance(info, dict):
+                plan["schedule"] = info
         records.write_plan(job_id, clip, lang, p, plan)
         sw.update(state="uploading", message=f"sending to {name}", account=acc.public, progress=0.0)
         log(f"{tag}: {name} -> {acc.get('name')} ({LANG_NAMES.get(lang, lang)})")
@@ -122,9 +137,16 @@ def run_publish(job_id: str, clip: int, lang: str, *, platforms: list[str], forc
             sw.update(state="interrupted", message="interrupted - publish again to resume")
             raise
         now = time.time()
-        sw.update(state="published", progress=1.0, message="published", error=None,
-                  remote_id=out.get("remote_id"), url=out.get("url"), published_at=now)
-        records.append_ledger(p, str(acc.get("id")), lang, now)
+        cover = out.get("cover") if isinstance(out.get("cover"), dict) else None
+        message = "published"
+        if native_at is not None:
+            message = f"scheduled on {name} for {fmt_local(native_at)}"
+        if cover and cover.get("state") != "set":
+            message += f"; {cover.get('message')}"
+        sw.update(state="published", progress=1.0, message=message, error=None,
+                  remote_id=out.get("remote_id"), url=out.get("url"), published_at=now,
+                  scheduled_for=native_at, cover=cover)
+        records.append_ledger(p, str(acc.get("id")), lang, now, day_t=native_at)
         records.clear_resume(job_id, clip, lang, p)
         log(f"{tag}: {name} published: {out.get('url') or out.get('remote_id')}")
         results[p] = records.public_status(sw.data)  # type: ignore[assignment]

@@ -477,6 +477,72 @@ The Graph API version is **v27.0**. You can change it under Accounts -> Advanced
 
 ---
 
+### Scheduled publishing
+
+Open a clip, tick the platforms in the **Publish** panel, pick a date and time under **Schedule for later**
+(your browser's time zone is shown), and press **Schedule…**. The **Schedule** page lists upcoming, done,
+missed, failed and cancelled schedules; you can cancel a schedule (or one platform of it) or change its
+time until it starts.
+
+- **Scheduling is your confirmation.** It needs dry run off both when you schedule and when the time comes,
+  connected and enabled accounts, and passes the same checks as Publish now. With dry run on, **Preview
+  schedule (dry run)** only shows (and saves) the request plans with the time; nothing is stored.
+- **Who publishes it:**
+
+  | Platform | How | Server must run |
+  |---|---|---|
+  | YouTube, privacy **public** | Uploaded as private up to `native_lead_minutes` (60) before; YouTube makes it public at the time (`status.publishAt`) | at the hand-off |
+  | YouTube, private or unlisted | YouTube can only schedule the switch to public, so Auto Clipper uploads it at the time | at the time |
+  | Facebook | Uploaded before the time and finished with `video_state=SCHEDULED` (allowed 10 min to 29 days ahead); closer than 15 min, Auto Clipper posts it at the time | at the hand-off |
+  | Instagram | No scheduling in Instagram's API: Auto Clipper posts it at the time | at the time |
+
+  **Once handed to YouTube or Facebook, the platform publishes it**: cancelling in Auto Clipper or turning
+  dry run on no longer stops it; cancel or move it there (YouTube Studio / Meta Business Suite). The confirm
+  dialog shows each hand-off time, and the Schedule page warns when dry run is on while posts are handed off.
+  If dry run is on at the hand-off time (or the YouTube privacy is no longer public, or the hand-off fails
+  before anything was sent), the post is not handed over: Auto Clipper posts it itself at the time if dry run
+  is off by then.
+- **Keep `autoclipper serve` running.** If the server was off when a schedule came due, it is still posted
+  when the server starts within `grace_minutes` (30); later it is marked **missed** with the time and how
+  late it was, and nothing is posted. A schedule never posts twice (a second fire finds the published
+  record and stops). Only one server fires the schedules of a data folder; a second `serve` on the same
+  folder shows "another Auto Clipper server … runs the schedules" on the Schedule page.
+- **Daily limits** per account and local day (Accounts page, *Scheduling*): YouTube 5, Facebook 10 (Facebook
+  allows 30 per 24 h), Instagram 10 (Instagram allows 100 per 24 h). Published and pending posts count;
+  over the limit the schedule is refused with the day and the numbers. Days are counted in
+  `publish.schedule.timezone` (empty = this computer's zone), and a post handed over the evening before
+  counts on the day it goes public.
+- CLI (stored in `data/schedules.json`; fired by the running server):
+
+  ```bash
+  autoclipper schedule add <job> --clip 0 --lang hi --platform all --at "2026-11-24 18:30" --tz Asia/Dhaka --yes
+  autoclipper schedule list [--state upcoming|done|missed|failed|cancelled|all] [--json]
+  autoclipper schedule edit s_0123456789ab --at "2026-11-25 09:00"
+  autoclipper schedule cancel s_0123456789ab [--platform instagram]
+  ```
+
+  Without `--yes` (or with dry run on) `add` prints the plans and stores nothing. On Windows without the
+  `tzdata` package, pass the time with its offset (`--at 2026-11-24T18:30+06:00`) instead of `--tz`.
+
+### Cover (thumbnail) per clip
+
+The clip page has a **Cover** card: drag the slider to pick a frame (preview thumbnail), optionally type a
+title (burned in at the top, Devanagari shaped correctly), and press **Use this frame**; or upload a JPEG,
+PNG or WebP (up to 10 MB, 64-8192 px a side). Auto Clipper writes `cover.jpg` (1080×1920, at most 2 MB)
+per clip and language. Publishing uses it where the official API allows:
+
+| Platform | How the cover is sent | Limits |
+|---|---|---|
+| YouTube | `thumbnails.set` after YouTube has processed the upload (the API says a Short's thumbnail only sticks after processing) | 50 quota units; the channel must be allowed custom thumbnails (verified at youtube.com/verify) |
+| Facebook | `POST /{video-id}/thumbnails` with `is_preferred=true` before the reel is published | 10 MB; the Page token may need `pages_manage_engagement` and `pages_read_user_content` |
+| Instagram | `thumb_offset` = the picked frame, in milliseconds | No title text, no uploaded image: the API's `cover_url` must be a public URL, and Auto Clipper runs only on this computer |
+
+A failing cover never fails the post: the status says "cover not set: …" and you can set it on the platform.
+The dry-run plan shows the cover and how each platform will use it. Re-rendering the clip marks a frame
+cover as made from an earlier render; pick it again (an uploaded image stays valid). Not verified against
+the real Graph API: Facebook's docs give no order for the thumbnail and finish calls; Auto Clipper sends the
+thumbnail first, and a failure there never stops the reel.
+
 ## Data layout
 
 Everything is stored under `data/`, or under `$AUTOCLIPPER_DATA_DIR` if that is set:
@@ -484,6 +550,7 @@ Everything is stored under `data/`, or under `$AUTOCLIPPER_DATA_DIR` if that is 
 ```
 data/
   settings.json                     all settings (see below)
+  schedules.json                    scheduled publishing (G6); schedules.lock guards it
   jobs/<job_id>/
     job.json                        status + per-stage progress (job and per clip per language)
     source.mp4                      copied or downloaded source
@@ -508,6 +575,8 @@ data/
         render.json                 how final.mp4 was rendered: caption engine/style/format/fps, fallback warning,
                                     "audio": mix, background, measured loudness, trim
         metadata.json               {"language","title","description","hashtags"}
+        cover.jpg / cover.json      picked cover (1080x1920) and how it was made (G7)
+        cover_upload.<ext>          uploaded cover source image, if any
       hi/ ...
     clips/01/ ...
 ```

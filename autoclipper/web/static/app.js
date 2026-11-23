@@ -433,6 +433,7 @@
     [/^#\/settings$/, viewSettings, 'settings'],
     [/^#\/doctor$/, viewDoctor, 'doctor'],
     [/^#\/accounts$/, (ctx) => window.ACPublish.viewAccounts(ctx), 'accounts'], // step 4 (publish.js)
+    [/^#\/schedule$/, (ctx) => window.ACSchedule.viewSchedules(ctx), 'schedule'], // G6 (schedule.js)
   ];
 
   function route(initial) {

@@ -24,7 +24,8 @@ URL = f"/api/jobs/{JOB}/clips/1/hi/publish"
 
 PLAN_KEYS = {"platform": str, "lang": str, "job_id": str, "clip": int, "dry_run": bool, "created_at": float,
              "api_version": str, "account": (dict, type(None)), "video": dict, "metadata": dict,
-             "requests": list, "limits": dict, "problems": list, "warnings": list}
+             "requests": list, "limits": dict, "problems": list, "warnings": list,
+             "cover": (dict, type(None)), "schedule": (dict, type(None))}  # G7/G6 additive
 VIDEO_KEYS = {"path": str, "size": int, "duration": (int, float), "width": int, "height": int, "sha256": str}
 REQ_KEYS = {"step", "method", "url", "headers", "body", "note"}
 STATUS_KEYS = {"platform": str, "lang": str, "job_id": str, "clip": int, "state": str, "progress": (int, float),
@@ -32,7 +33,8 @@ STATUS_KEYS = {"platform": str, "lang": str, "job_id": str, "clip": int, "state"
                "url": (str, type(None)), "account": (dict, type(None)), "video_sha256": (str, type(None)),
                "video_size": (int, type(None)), "idempotency_key": (str, type(None)),
                "started_at": (float, type(None)), "updated_at": (float, type(None)),
-               "published_at": (float, type(None))}
+               "published_at": (float, type(None)),
+               "scheduled_for": (float, type(None)), "cover": (dict, type(None))}  # G6/G7 additive
 VIEW_PLATFORM_KEYS = {"enabled": bool, "connected": bool, "account": (dict, type(None)), "plan": (dict, type(None)),
                       "status": (dict, type(None)), "published_render_outdated": bool, "problems": list}
 PUB_TASK_KEYS = {**TASK_KEYS, "platforms": (list, type(None))}

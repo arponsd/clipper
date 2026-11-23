@@ -522,6 +522,9 @@ def load_item(job_id: str, clip: int, lang: str) -> tuple[PublishItem, list[str]
                        duration=round(duration, 3), width=width, height=height,
                        sha256=records.file_sha256(final), metadata=meta,
                        rel_path=f"clips/{clip:02d}/{lang}/final.mp4")
+    from .cover import item_cover  # G7
+
+    item.cover = item_cover(job_id, clip, lang, item.sha256, item.duration)
     return item, extra
 
 
