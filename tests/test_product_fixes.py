@@ -220,7 +220,7 @@ def media(tmp_path_factory) -> SimpleNamespace:
 
 
 def test_render_ducks_only_while_voice_plays(media, tmp_path: Path):
-    audio = AudioSettings(loudnorm=False)
+    audio = AudioSettings(loudnorm=False, mix="gain", short_voice="keep")  # the fixed-gain mix (the loudness mix: test_audio_mix.py)
     final = render_final(cut=media.cut, voice=media.voice, ass=None, dst=tmp_path / "final.mp4", audio=audio)
     assert ffmpeg.probe(final).duration == pytest.approx(8.0, abs=0.1)
     during = volume_db(final, 0.5, 2.0, band=440)[0]
@@ -238,7 +238,7 @@ def test_render_ducks_only_while_voice_plays(media, tmp_path: Path):
 
 
 def test_render_tail_uses_original_volume_after(media, tmp_path: Path):
-    audio = AudioSettings(loudnorm=False, original_volume_after=0.5)
+    audio = AudioSettings(loudnorm=False, original_volume_after=0.5, mix="gain", short_voice="keep")
     final = render_final(cut=media.cut, voice=media.voice, ass=None, dst=tmp_path / "f.mp4", audio=audio)
     after = volume_db(final, 4.0, 3.5, band=440)[0]
     assert after - media.orig_db == pytest.approx(20 * math.log10(0.5), abs=1.5)
@@ -252,14 +252,14 @@ def test_render_speech_end_from_words_json(media, tmp_path: Path):
     voice.write_bytes(media.voice.read_bytes())
     (d / "words.json").write_text(json.dumps([{"start": 0, "end": 1.5, "text": "x"}]), encoding="utf-8")
     final = render_final(cut=media.cut, voice=voice, ass=None, dst=d / "final.mp4",
-                         audio=AudioSettings(loudnorm=False))
+                         audio=AudioSettings(loudnorm=False, mix="gain", short_voice="keep"))
     assert volume_db(final, 2.2, 0.7, band=440)[0] == pytest.approx(media.orig_db, abs=1.5)
     assert volume_db(final, 0.3, 1.0, band=440)[0] - media.orig_db == pytest.approx(DUCK_DB, abs=2.5)
 
 
 def test_render_with_loudnorm_tail_is_not_silent_and_never_clips(media, tmp_path: Path):
     final = render_final(cut=media.cut, voice=media.voice, ass=None, dst=tmp_path / "f.mp4",
-                         audio=AudioSettings())  # loudnorm on, -14 LUFS
+                         audio=AudioSettings(mix="gain", short_voice="keep"))  # loudnorm on, -14 LUFS
     info = ffmpeg.probe(final)
     assert info.duration == pytest.approx(8.0, abs=0.1) and info.has_audio and info.audio_channels == 2
     during_total = volume_db(final, 0.5, 2.0)[0]

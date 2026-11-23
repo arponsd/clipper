@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 from autoclipper.config import VoiceboxSettings
-from autoclipper.voicebox import VoiceboxClient, VoiceboxError
+from autoclipper.voicebox import VoiceboxTimeout, VoiceboxClient, VoiceboxError
 
 
 class FakeClock:
@@ -205,7 +205,8 @@ def test_wait_timeout_sends_exactly_one_cancel():
     client, _ = make_client(handler, timeout=3.0, poll=1.0)
     with pytest.raises(VoiceboxError, match="did not finish within 3s") as ei:
         client.wait("g1")
-    assert type(ei.value) is VoiceboxError
+    # the public VoiceboxTimeout (a VoiceboxError), never the internal _WaitTimeout
+    assert type(ei.value) is VoiceboxTimeout
     (cancel,) = _cancels(reqs)
     assert cancel.method == "POST" and cancel.url.path == "/generate/g1/cancel"
     assert reqs[-1] is cancel  # no polling after the cancel

@@ -7,6 +7,7 @@ import logging
 import re
 import unicodedata
 from pathlib import Path
+from typing import Any
 
 from .. import ffmpeg
 from ..config import CaptionSettings, Settings
@@ -14,12 +15,14 @@ from ..interfaces import Transcriber
 from ..models import Word
 from ._atomic import write_text_atomic
 from .transcribe import transcribe_voice
-from .voice import load_voice_result, narration_hash
+from .voice import load_voice_result, looks_truncated, narration_hash, truncated_prefix
 
 log = logging.getLogger(__name__)
 MIN_MATCH_RATIO = 0.3
 # Keep a line on screen across short pauses between lines so captions do not flicker.
 _LINE_HOLD = 0.5
+# How words.json was made (voice-over or the original speech); see write_captions_stamp.
+CAPTIONS_STAMP = "captions.json"
 
 
 class CaptionsError(RuntimeError):
@@ -207,6 +210,24 @@ def build_ass(words: list[Word], *, lang: str, settings: CaptionSettings, width:
     return header + "\n" + "\n".join(events) + ("\n" if events else "")
 
 
+def write_captions_stamp(out_dir: Path, *, voiceover: bool, source: str, **extra: Any) -> Path:
+    """captions.json: how words.json was made. ``voiceover`` False = from the original speech."""
+    data: dict[str, Any] = {"voiceover": voiceover, "source": source}
+    data.update(extra)
+    return write_text_atomic(Path(out_dir) / CAPTIONS_STAMP, json.dumps(data, indent=2, ensure_ascii=False))
+
+
+def captions_voiceover(out_dir: Path) -> bool:
+    """The voice-over mode words.json was made for. A missing/unreadable stamp = voice-over (step 1-4)."""
+    try:
+        data = json.loads((Path(out_dir) / CAPTIONS_STAMP).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return True
+    if isinstance(data, dict) and isinstance(data.get("voiceover"), bool):
+        return data["voiceover"]
+    return True
+
+
 def make_captions(*, narration: str, voice_wav: Path, lang: str, transcriber: Transcriber,
                   settings: Settings, out_dir: Path) -> Path:
     """Write out_dir/words.json and out_dir/captions.ass; return the .ass path.
@@ -223,10 +244,17 @@ def make_captions(*, narration: str, voice_wav: Path, lang: str, transcriber: Tr
     dur = ffmpeg.duration(voice_wav)
     trimmed = False
     vr = load_voice_result(out_dir)
-    if vr is not None and vr.trimmed and vr.narration_hash == narration_hash(narration):
+    if vr is not None and (vr.trimmed or vr.truncated) and vr.narration_hash == narration_hash(narration):
         trimmed = True
         if vr.spoken_narration:
             narration = vr.spoken_narration
+    elif looks_truncated(narration, dur, settings.script.wps(lang)):
+        # A take Voicebox cut short before voice.json recorded it (older voices): caption only the words
+        # that fit in the voice, never the whole text squeezed into it.
+        log.warning("%s is %.1fs, far shorter than its %d-word narration needs; captioning only the spoken part",
+                    voice_wav.name, dur, len(narration.split()))
+        narration = truncated_prefix(narration, dur, settings.script.wps(lang))
+        trimmed = True
     script_words = split_words(narration)
     recognized: list[Word] = []
     if script_words:
@@ -242,4 +270,6 @@ def make_captions(*, narration: str, voice_wav: Path, lang: str, transcriber: Tr
     ass = out_dir / "captions.ass"
     write_text_atomic(ass, build_ass(words, lang=lang, settings=settings.captions,
                                      width=settings.clips.width, height=settings.clips.height))
+    # No stamp = voice-over captions (as in every job before captions-only mode existed).
+    (out_dir / CAPTIONS_STAMP).unlink(missing_ok=True)
     return ass

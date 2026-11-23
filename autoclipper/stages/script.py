@@ -40,8 +40,66 @@ def target_words(duration: float, lang: str, *, wps: float | None = None,
     return max(MIN_TARGET_WORDS, round(max(0.0, duration) * wps * fill_ratio))
 
 
+_DQ = '"'
+_CURLY = ("\u201c", "\u201d")  # left / right double quotation marks
+_WRAPPERS = (('"', '"'), ("\u201c", "\u201d"), ("\u201e", "\u201c"), ("\u00ab", "\u00bb"))
+
+
+_INCH_RE = re.compile(r'(?<=\d)"(?=[\s\-\u2013\u2014,.;:!?)]|$)')  # 5" screen, 27" monitor
+
+
+def _drop_unpaired_curly(t: str) -> str:
+    """Remove curly double quotes without a partner: a closing one with no open quote before it, and an
+    opening one never closed. Paired quotes stay."""
+    lq, rq = _CURLY
+    keep = [True] * len(t)
+    opened: list[int] = []
+    for i, ch in enumerate(t):
+        if ch == lq:
+            opened.append(i)
+        elif ch == rq:
+            if opened:
+                opened.pop()
+            else:
+                keep[i] = False
+    for i in opened:
+        keep[i] = False
+    return "".join(ch for ch, k in zip(t, keep) if k)
+
+
+def _fix_quotes(title: str) -> str:
+    """Drop quotes that wrap the whole title, then any unpaired double quote.
+
+    '"A title"' -> 'A title'; '"Quoted" - rest' stays as is (a balanced pair is kept);
+    'Quoted" - rest' (an LLM or an old clean-up dropped the opening quote) -> 'Quoted - rest';
+    '\u201cQuoted\u201d - rest\u201d' -> '\u201cQuoted\u201d - rest'. An inch mark after a digit ('5" screen')
+    is not a quote and is kept. Apostrophes / single quotes are left alone ("Reagan's", "'Garbage'").
+    """
+    t = title.strip()
+    changed = True
+    while changed and len(t) >= 2:
+        changed = False
+        for left, right in _WRAPPERS:
+            inner = t[len(left):-len(right)]
+            if t.startswith(left) and t.endswith(right) and left not in inner and right not in inner:
+                t, changed = inner.strip(), True
+    inch = "\u0000"  # placeholder: inch marks take no part in the pairing
+    t = _INCH_RE.sub(inch, t)
+    if t.count(_DQ) % 2:  # unbalanced straight quotes: drop the last one that has no partner
+        i = t.rfind(_DQ) if t.count(_DQ) > 1 else t.find(_DQ)
+        t = t[:i] + t[i + 1:]
+    t = _drop_unpaired_curly(t).replace(inch, _DQ)
+    t = re.sub(r"\s+([,.;:!?])", r"\1", " ".join(t.split()))
+    return t.strip()
+
+
+def fix_title_quotes(title: str) -> str:
+    """Public: the quote clean-up of _clean_title (also applied to titles of older scripts)."""
+    return _fix_quotes(" ".join((title or "").split())) if title else title
+
+
 def _clean_title(title: str) -> str:
-    title = " ".join(title.split()).strip().strip('"').strip()
+    title = _fix_quotes(" ".join(title.split()).strip())
     if len(title) <= TITLE_MAX:
         return title
     cut = title[:TITLE_MAX]
@@ -102,13 +160,8 @@ def load_script(path: Path) -> ClipScript:
         raise ScriptError(f"could not read {path}: {e}; fix the JSON or delete it to regenerate") from e
 
 
-def write_script(*, llm: LLM, transcript: Transcript, moment: Moment, lang: str,
-                 out_json: Path, script_settings: ScriptSettings | None = None) -> ClipScript:
-    """Ask the LLM for the script, shorten once if far too long, normalize and write out_json.
-
-    With ``script_settings`` the word target uses its per-language words/s and fill_ratio, and the
-    LLM is also told the spoken duration to fill (target_seconds). Without it, step-1 constants.
-    """
+def _generate_script(*, llm: LLM, transcript: Transcript, moment: Moment, lang: str,
+                     script_settings: ScriptSettings | None = None) -> ClipScript:
     duration = moment.end - moment.start
     clip_transcript = format_transcript(transcript, moment.start, moment.end)
     if script_settings is None:
@@ -127,9 +180,53 @@ def write_script(*, llm: LLM, transcript: Transcript, moment: Moment, lang: str,
         shorter = llm.shorten(lang=lang, narration=script.narration, max_words=target)
         if shorter.strip():
             script = script.model_copy(update={"narration": shorter})
-    script = normalize_script(script)
+    return normalize_script(script)
+
+
+def write_script(*, llm: LLM, transcript: Transcript, moment: Moment, lang: str,
+                 out_json: Path, script_settings: ScriptSettings | None = None) -> ClipScript:
+    """Ask the LLM for the script, shorten once if far too long, normalize and write out_json.
+
+    With ``script_settings`` the word target uses its per-language words/s and fill_ratio, and the
+    LLM is also told the spoken duration to fill (target_seconds). Without it, step-1 constants.
+    """
+    script = _generate_script(llm=llm, transcript=transcript, moment=moment, lang=lang,
+                              script_settings=script_settings)
     save_script(script, out_json)
     return script
+
+
+def write_metadata_script(*, llm: LLM, transcript: Transcript, moment: Moment, lang: str,
+                          out_json: Path) -> ClipScript:
+    """Voice-over off: script.json with title/description/hashtags in ``lang`` and an empty narration.
+
+    Uses the LLM's optional ``write_publish_metadata``; an LLM without it writes a normal script, whose
+    narration is then dropped (it would never be spoken).
+    """
+    duration = moment.end - moment.start
+    clip_transcript = format_transcript(transcript, moment.start, moment.end)
+    fn = getattr(llm, "write_publish_metadata", None)
+    if callable(fn):
+        script = fn(lang=lang, clip_transcript=clip_transcript, moment=moment, duration=duration)
+    else:
+        script = llm.write_script(lang=lang, clip_transcript=clip_transcript, moment=moment,
+                                  duration=duration, target_words=target_words(duration, lang))
+    script = normalize_script(script.model_copy(update={"narration": ""}))
+    if not script.title:
+        raise ScriptError(f"the LLM returned an empty {lang} title")
+    save_script(script, out_json)
+    return script
+
+
+def add_narration(*, llm: LLM, transcript: Transcript, moment: Moment, lang: str, script: ClipScript,
+                  out_json: Path, script_settings: ScriptSettings | None = None) -> ClipScript:
+    """Voice-over turned on for a script written without narration: ask the LLM for a narration and keep
+    the existing (possibly user-edited) title, description and hashtags."""
+    fresh = _generate_script(llm=llm, transcript=transcript, moment=moment, lang=lang,
+                             script_settings=script_settings)
+    merged = script.model_copy(update={"narration": fresh.narration})
+    save_script(merged, out_json)
+    return merged
 
 
 def make_shorten_fn(llm: LLM, lang: str) -> ShortenFn:

@@ -8,8 +8,10 @@ Auto Clipper is a local app that turns one long video into short vertical clips.
 4. cuts each moment into a 9:16 1080x1920 clip,
 5. writes a **narration** script for each clip in English and Hindi. The narration is new commentary spoken over the clip, not a dub of what is said in it. It also writes a title, a description and hashtags,
 6. generates the voice with a local [Voicebox](https://github.com/jamiepine/voicebox) server. Hindi always uses the `chatterbox` engine,
-7. burns word-by-word captions in the clip's language (Noto Sans for English, Noto Sans Devanagari for Hindi) and mixes in the original audio: it is ducked to `audio.original_volume` while the narration plays and comes back to `audio.original_volume_after` before and after it (with `audio.duck_ramp_seconds` ramps), then the mix is loudness-normalised,
+7. burns word-by-word captions in the clip's language (Noto Sans for English, Noto Sans Devanagari for Hindi) and mixes the narration over the original audio (or, optionally, over the original with its speech removed by Demucs): the voice and the background are measured and the background sits a fixed number of dB under the voice while it speaks, however loud the source is, then the mix is loudness-normalised (see [Audio mix](#audio-mix-voice-over)),
 8. writes `final.mp4` and `metadata.json` for each clip in each language.
+
+You can also switch the narration off and keep only captions on the clip's own audio: see [Captions only (no voice-over)](#captions-only-no-voice-over).
 
 The narration is sized to the clip from the voice's words per second (`script.wps_en` / `script.wps_hi`, `script.fill_ratio`). If a voice-over is longer than its clip, it is sped up slightly, never more than `audio.max_speedup`. If it would need more than that, it is first shortened by the LLM, and trimmed with a fade only as a last resort. If a new voice-over is much shorter than its clip (below `script.lengthen_below`), the LLM lengthens the narration once; the longer take is kept only if it fits, otherwise the original take stays. Lengthening happens only when the script was just written or regenerated, or no voice exists yet: resuming a job (`run --job`) never rewrites a narration you edited, and `rerender` never lengthens.
 
@@ -161,7 +163,40 @@ Notes:
 - The composition stays in `clips/NN/<lang>/hf/index.html`; you can open that folder in the HyperFrames desktop app to tweak it.
 - The HyperFrames CLI runs with its working directory in that `hf/` folder and with every `ANTHROPIC_*` variable removed from its environment, so it never sees your `.env`.
 
-### 7. Check everything
+### 7. Vocal separation with Demucs (optional)
+
+With `separation.background = "no_vocals"` the narration plays over the clip **with its own speech removed** (music, game sound and effects stay), instead of over a ducked copy of someone else talking. [Demucs](https://github.com/adefossez/demucs) (PyPI `demucs`) does the separation. It needs PyTorch, so it goes in its **own** virtual environment under `~/tools/demucs` and Auto Clipper runs it as a separate process (`separation.python`). Nothing is added to PATH or to Auto Clipper's own environment. CPU is enough.
+
+Linux / macOS:
+
+```bash
+uv venv --python 3.11 ~/tools/demucs
+# CPU-only PyTorch from the official PyTorch index (the default PyPI torch for Linux pulls ~2.5 GB of CUDA libraries)
+uv pip install --python ~/tools/demucs/bin/python --index-url https://download.pytorch.org/whl/cpu torch==2.5.1 torchaudio==2.5.1
+uv pip install --python ~/tools/demucs/bin/python demucs==4.0.1 soundfile
+uv run autoclipper settings set separation.background=no_vocals
+uv run autoclipper doctor          # "demucs  OK  demucs 4.0.1, torch 2.5.1+cpu ..."
+```
+
+Windows (PowerShell):
+
+```powershell
+uv venv --python 3.11 $env:USERPROFILE\tools\demucs
+uv pip install --python $env:USERPROFILE\tools\demucs\Scripts\python.exe --index-url https://download.pytorch.org/whl/cpu torch==2.5.1 torchaudio==2.5.1
+uv pip install --python $env:USERPROFILE\tools\demucs\Scripts\python.exe demucs==4.0.1 soundfile
+uv run autoclipper settings set "separation.python=~/tools/demucs/Scripts/python.exe" separation.background=no_vocals
+uv run autoclipper doctor
+```
+
+(With an NVIDIA GPU you may install the CUDA build of torch instead; Auto Clipper still runs Demucs with `-d cpu`, which is fast enough for short clips.) The `htdemucs` model (~80 MB) is downloaded on the first separation into `separation.models_dir` (`~/tools/demucs/models`).
+
+How it is used:
+- Once per clip: `clips/NN/bed_no_vocals.wav` is cached with `bed_no_vocals.json` (sha256 of `cut.mp4` + model), and every language and re-render reuses it. A new cut or another model separates again.
+- Measured here (16-core CPU, `htdemucs`, `segment` 7, 4 threads): a 38 s clip takes about 22-25 s and peaks at about 1.4 GB RAM. Lower `separation.segment` to use less memory.
+- Any failure (Demucs missing, an error, longer than `separation.timeout_seconds`) falls back to the original audio for that clip, with a warning on the job page; the render does not fail.
+- Only used with the voice-over on. Captions-only clips always keep their original audio.
+
+### 8. Check everything
 
 ```bash
 uv run autoclipper doctor
@@ -171,18 +206,19 @@ uv run autoclipper doctor
 - ffmpeg and ffprobe are on PATH,
 - ffmpeg has the subtitles, ass, amix and atempo filters,
 - the fonts are installed, either in assets/fonts or found by `fc-list`,
-- Voicebox is reachable and the profile ids are set,
+- Voicebox is reachable and the profile ids are set (skipped when `voiceover` is `false`),
 - the API key is present,
-- HyperFrames (optional, warnings only): the Node version in `hyperframes.node_bin_dir`, the installed `hyperframes` version, its headless Chrome, FFmpeg's `libvpx-vp9` decoder (WebM alpha) and whether the caption engine will work or fall back to ASS.
+- HyperFrames (optional, warnings only): the Node version in `hyperframes.node_bin_dir`, the installed `hyperframes` version, its headless Chrome, FFmpeg's `libvpx-vp9` decoder (WebM alpha) and whether the caption engine will work or fall back to ASS,
+- Demucs (optional, a warning only): with `separation.background = "no_vocals"`, that `separation.python` imports `demucs` and `torch`; otherwise just whether it is installed.
 
-It exits with code 1 if anything required is missing. HyperFrames rows are only warnings.
+It exits with code 1 if anything required is missing. HyperFrames and Demucs rows are only warnings.
 
 ---
 
 ## CLI usage
 
 ```bash
-uv run autoclipper run <file-or-url> [--clips N] [--min S] [--max S] [--langs en,hi] [--job ID]
+uv run autoclipper run <file-or-url> [--clips N] [--min S] [--max S] [--langs en,hi] [--job ID] [--no-voiceover | --voiceover]
 uv run autoclipper rerender <job_id> <clip> <lang>
 uv run autoclipper status <job_id>
 uv run autoclipper jobs
@@ -225,6 +261,47 @@ Progress lines look like `[<job_id>] <stage> <clip>/<lang> <pct>% <message>`, fo
 **Rerender** uses the saved `script.json`, which you may have edited. The voice is regenerated only when the narration text changed: the sha256 of the narration is compared with `narration_hash` in `voice.json`. Captions, `final.mp4` and `metadata.json` are always rebuilt. If the voice stage had to shorten the narration to fit the clip, the shortened text is written back to `script.json`, so the captions always match the audio.
 
 Clip indexes are 0-based and match the `clips/NN` folders.
+
+### Captions only (no voice-over)
+
+Turn the narration off when you only want captions on the clip's own audio:
+
+```bash
+uv run autoclipper settings set voiceover=false                 # every new job (or Settings > General > Voice-over narration)
+uv run autoclipper run "~/Videos/talk.mp4" --no-voiceover       # just this job (--voiceover forces it on)
+uv run autoclipper run --job 20261122-101500-ab12cd --no-voiceover   # switch an existing job, then resume it
+```
+
+On the web, the **New job** form has a **Voice-over narration** checkbox (it starts at the setting).
+
+With the voice-over off, for every clip and language:
+- **Script:** Claude still writes the title, description and hashtags in that language; the narration stays empty. On the clip page the narration field is hidden and the rest stays editable.
+- **Voice:** skipped (`voice-over off`). Voicebox is never called and does not need to run; `doctor` does not check it.
+- **Captions:** made from the original speech. When the clip language is the video's spoken language (the language Whisper detected), the captions are Whisper's own words and timings. Otherwise Claude translates each spoken line of the clip once (cached in `caption_translation.json`, so a re-render does not ask again; if a line was left out, the next render asks again) and each translated line is shown while its original line is spoken (long pauses skipped; a very short line is held a little longer so it can be read). The word highlight follows the line, not each spoken word. Both caption engines (`ass`, `hyperframes`) and the Devanagari font for Hindi work as usual.
+- **Audio:** the original audio at `audio.original_volume_after`, with no ducking, then loudness-normalised as usual.
+- **Publishing:** unchanged; the title, description and hashtags come from `metadata.json`.
+
+Each job keeps the mode it was created with (the setting at that moment, or `--no-voiceover` / `--voiceover` / the New job checkbox), so changing the setting later only affects new jobs; jobs made before this option existed are voice-over jobs. To switch an existing job, use `run --job ID --no-voiceover` (or `--voiceover`), or on the job page pick **Mode: Voice-over + captions / Original audio + captions** and press **Apply & re-render** (this queues a run of the job that re-renders every clip made in the other mode; on an unfinished job it also runs the remaining steps, i.e. scripts, voices and renders, and the confirm dialog says so). Switching the mode makes the affected stages stale: a resume or a re-render redoes the captions and the render (and, when turning the voice-over on, writes a narration for a script that has none, keeping your title, and makes the voice). An earlier voice-over take is kept on disk, so switching back does not regenerate it.
+
+### Audio mix (voice-over)
+
+`audio.mix = "loudness"` (the default) sets the levels from measurements, not from fixed factors, so a loud game stream and a quiet lecture come out the same:
+1. The voice (`voice.wav`, up to the end of the speech) and the background (the clip's audio, or the Demucs `no_vocals` stem) are measured with EBU R128 (ffmpeg `ebur128`).
+2. The voice is brought to `audio.voice_lufs` (-16 LUFS; `audio.voice_volume` is a trim on that, 1.0 = none).
+3. While the narration plays, the background sits `audio.background_db_below_voice` (18 dB) under the voice, measured over that same stretch. Before and after the narration it is as loud as the voice times `audio.original_volume_after` (1.0 = as loud as the voice). The two levels are joined with `audio.duck_ramp_seconds` ramps. A quiet background is never lifted by more than 12 dB.
+4. The whole mix is loudness-normalised to `audio.target_lufs` and limited, as before.
+
+`audio.mix = "gain"` is the old behaviour: the original at `audio.original_volume` (a factor) under the voice and `audio.original_volume_after` outside it, the voice at `audio.voice_volume`. `audio.original_volume` is used only by the gain mix. Older `settings.json` files load unchanged and get the loudness mix.
+
+**Short narration.** When the narration ends before `audio.short_voice_below` (0.6) of the clip, `audio.short_voice = "trim_clip"` (default) ends the clip `audio.short_voice_tail` (1 s) after the narration, never under 3 s: the background stays at its under-voice level and fades out, instead of the loud original coming back for the rest of the clip. The captions all fall inside the narration, so they still fit. `"keep"` keeps the whole clip. A trimmed render is recorded in `render.json` (`audio.trimmed_to`, `audio.clip_duration`) and shown on the job and clip pages ("trimmed to 11.0 s (short narration, clip 38.2 s)").
+
+**Lengthen retry timeout.** A too-short take gets one "lengthen" retry; that generation has its own limit `voicebox.lengthen_timeout_seconds` (240 s, never above `voicebox.timeout_seconds`). When it runs out, Voicebox is asked to cancel it, the first take is kept and the clip gets a warning ("the lengthened voice took longer than 240s ... kept the original 10.1s voice (26% of the 38.2s clip)"), stored in `voice.json` `warnings` and shown on the job page.
+
+What a render did is in `render.json` `"audio"`: `mix`, `background` (`original` / `no_vocals`), the measured `voice_lufs` / `background_lufs_under_voice` / `background_lufs`, the gains, `voice_end`, `trimmed_to` and any separation `warning`. It also records `background_note` (e.g. "nearly silent after vocal removal" for a speech-only clip) and, with vocal separation, `separation_seconds` / `separation_cached`.
+
+The voice-over audio settings (`audio.*` and `separation.background` / `model`) **are** part of the "re-render to apply" check (render.json `audio_key`): a voice-over render made with other audio settings, or with the old mix from before this version (every older final), shows "re-render to apply" on the job page and is redone by a resume. To apply them to a whole job, pick the job's current mode under **Mode** and press **Apply & re-render**: it re-renders every out-of-date clip (render only; the narrations and voices are kept). Voice-over-off renders do not depend on these settings.
+
+**Cut-short voices.** Chatterbox sometimes stops a long take early (e.g. a 10 s voice for a 115-word Hindi narration that needs about 34 s). A take shorter than half of what its words need at `script.wps_en` / `script.wps_hi` is generated once more and the longer take kept. If it is still cut short it is marked `truncated` in voice.json, the clip gets a warning, it is never "lengthened" (a longer text would be cut short too), and the captions show only the words that are actually spoken (estimated, then aligned to the voice) instead of squeezing the whole text into the short voice. Voices made before this check get the same caption handling on their next re-render. With `audio.short_voice = trim_clip` such a clip ends about 1 s after the voice.
 
 ---
 
@@ -415,17 +492,21 @@ data/
     moments.json                    chosen moments (start, end, hook, reason, score)
     clips/00/
       cut.mp4                       1080x1920 cut with original audio
+      bed_no_vocals.wav / .json     Demucs no_vocals stem + its key (separation.background=no_vocals only)
       en/
         script.json                 narration, title, description, hashtags  <- editable
-        voice_raw.wav               Voicebox output
+        voice_raw.wav               Voicebox output (not made with the voice-over off)
         voice.wav                   fitted voice (<= clip length)
-        voice.json                  durations, tempo, narration_hash
+        voice.json                  durations, tempo, narration_hash, warnings
         words.json                  timed caption words
+        captions.json               voice-over off only: captions came from the original speech ("transcript" or "translation")
+        caption_translation.json    voice-over off, other language: the translated caption lines (cache)
         captions.ass                word-by-word ASS subtitles (also the HyperFrames fallback)
         hf/                         HyperFrames composition (captions.engine=hyperframes): index.html, assets/, overlay.json
         captions_overlay.webm       transparent caption overlay rendered by HyperFrames (.mov with hyperframes.format=mov)
         final.mp4                   the short
-        render.json                 how final.mp4 was rendered: caption engine/style/format/fps, fallback warning
+        render.json                 how final.mp4 was rendered: caption engine/style/format/fps, fallback warning,
+                                    "audio": mix, background, measured loudness, trim
         metadata.json               {"language","title","description","hashtags"}
       hi/ ...
     clips/01/ ...
@@ -440,6 +521,7 @@ Change settings with `autoclipper settings set key.path=value`. The value is par
 | Key | Default | Meaning |
 |---|---|---|
 | `languages` | `["en","hi"]` | Output languages (`en`, `hi`). `languages=en` also works. |
+| `voiceover` | `true` | Voice-over narration. `false` = captions only: no narration or Voicebox, the original audio is kept and the captions come from the original speech (see [Captions only](#captions-only-no-voice-over)). Used for new jobs; each job keeps its own mode. `run --no-voiceover` / `--voiceover` override it per job |
 | `llm.model` | `claude-opus-5-5` | Claude model used for moments and scripts |
 | `llm.effort` | `medium` | `low` / `medium` / `high` / `xhigh` / `max` |
 | `llm.use_fallbacks` | `true` | Server-side fallback if a request is declined |
@@ -452,6 +534,7 @@ Change settings with `autoclipper settings set key.path=value`. The value is par
 | `voicebox.url` | `http://127.0.0.1:17493` | Voicebox server |
 | `voicebox.poll_interval` | `1.0` | Seconds between history polls (0.1-10) |
 | `voicebox.timeout_seconds` | `600` | Max wait per generation, in seconds (10-7200) |
+| `voicebox.lengthen_timeout_seconds` | `240` | Max wait for the optional "lengthen" retry (10-7200, capped at `timeout_seconds`); the first take is kept with a warning when it runs out |
 | `voicebox.english.profile_id` | `""` | English voice profile id (see `profiles`) |
 | `voicebox.english.engine` | `chatterbox` | English TTS engine |
 | `voicebox.hindi.profile_id` | `""` | Hindi voice profile id |
@@ -460,10 +543,16 @@ Change settings with `autoclipper settings set key.path=value`. The value is par
 | `clips.min_seconds` / `clips.max_seconds` | `20` / `60` | Clip length bounds |
 | `clips.width` / `clips.height` | `1080` / `1920` | Output size (240-3840, even numbers) |
 | `clips.reframe` | `crop` | `crop` = center crop; `blur` = whole frame over a blurred fill |
-| `audio.original_volume` | `0.15` | Original audio level WHILE the voice speaks (ducked, 0-1) |
-| `audio.original_volume_after` | `1.0` | Original audio level before and after the narration (0-2) |
+| `audio.mix` | `loudness` | `loudness` = measured levels (see [Audio mix](#audio-mix-voice-over)); `gain` = the old fixed factors |
+| `audio.voice_lufs` | `-16` | Loudness mix: voice level before the final loudnorm (-30 to -8 LUFS) |
+| `audio.background_db_below_voice` | `18` | Loudness mix: background level under the narration, in dB below the voice (0-40) |
+| `audio.original_volume` | `0.15` | Gain mix only: original audio level WHILE the voice speaks (ducked, 0-1) |
+| `audio.original_volume_after` | `1.0` | Original audio level before and after the narration (0-2). Loudness mix: relative to the voice (1 = as loud as the voice); gain mix: a factor. Voice-over off: the whole clip |
 | `audio.duck_ramp_seconds` | `0.4` | Fade time between the two levels (0-2 s) |
-| `audio.voice_volume` | `1.0` | Voice level (0-2) |
+| `audio.voice_volume` | `1.0` | Voice level (0-2); a trim on `voice_lufs` in the loudness mix |
+| `audio.short_voice` | `trim_clip` | A narration that ends early: `trim_clip` ends the clip shortly after it, `keep` keeps the whole clip |
+| `audio.short_voice_below` | `0.6` | "Short" = the narration ends before this share of the clip (0.1-0.95) |
+| `audio.short_voice_tail` | `1.0` | `trim_clip`: seconds the clip runs on after the narration (0-5; the clip is never under 3 s) |
 | `audio.max_speedup` | `1.25` | Max atempo used to fit the voice into the clip |
 | `audio.loudnorm` | `true` | Normalize the loudness of the final mix (a limiter always keeps peaks below 0 dBFS) |
 | `audio.target_lufs` | `-14` | Loudness target for `audio.loudnorm` (-30 to -8 LUFS) |
@@ -484,12 +573,19 @@ Change settings with `autoclipper settings set key.path=value`. The value is par
 | `hyperframes.format` | `webm` | Overlay codec: `webm` (VP9 + alpha, small, needs FFmpeg's libvpx decoder) or `mov` (ProRes 4444) |
 | `hyperframes.workers` | `0` | Parallel Chrome workers (0 = auto, max 8) |
 | `hyperframes.timeout_seconds` | `300` | Max HyperFrames render time per clip-language (30-3600 s); longer falls back to ASS |
+| `separation.background` | `original` | Background under the narration: `original` or `no_vocals` (speech removed with Demucs, see [7](#7-vocal-separation-with-demucs-optional)) |
+| `separation.python` | `~/tools/demucs/bin/python` | Python of the Demucs venv (Windows: `~/tools/demucs/Scripts/python.exe`) |
+| `separation.model` | `htdemucs` | Demucs model name |
+| `separation.segment` | `7` | Seconds processed at once (1-60; the transformer models `htdemucs*` allow at most 7 and a larger value is rejected); lower = less memory |
+| `separation.threads` | `4` | CPU threads for torch (0 = all cores, max 64) |
+| `separation.timeout_seconds` | `900` | Max separation time per clip (30-7200 s); longer falls back to the original audio |
+| `separation.models_dir` | `~/tools/demucs/models` | Where the model is downloaded (`TORCH_HOME`); `""` = torch's default |
 | `web.max_upload_mb` | `4096` | Largest upload the web UI accepts, in MB (1-102400) |
 | `web.allowed_extensions` | `[".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".ogv"]` | Video file types the web UI accepts (lower-case, with the dot) |
 
 `--clips`, `--min`, `--max` and `--langs` on `run` override these settings for that run only.
 
-Changing `captions.engine` or `hyperframes.style` / `format` / `fps` makes existing renders stale: a resume (`run --job`) or a re-render redoes only the render stage of the affected clips (no new voice or captions). Renders from before step 3 count as ASS renders, so they stay current with the default engine.
+Changing `captions.engine` or `hyperframes.style` / `format` / `fps` makes existing renders stale: a resume (`run --job`) or a re-render redoes only the render stage of the affected clips (no new voice or captions). Renders from before step 3 count as ASS renders, so the caption engine does not make them stale (voice-over renders from before the loudness mix are stale for the audio, see "Audio mix").
 
 ---
 

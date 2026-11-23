@@ -95,6 +95,20 @@ class FakeLLM:
         return " ".join((words * (target_words // len(words) + 1))[:max(target_words, len(words))])
 
 
+    def write_publish_metadata(self, *, lang, clip_transcript, moment, duration):
+        """Voice-over off: post metadata only (narration empty)."""
+        self.calls.append(("write_publish_metadata", dict(lang=lang, duration=duration)))
+        return ClipScript(narration="", title=f"Captions title {lang}",
+                          description=f"Captions description {lang}", hashtags=["#captions", f"#{lang}"])
+
+    def translate_segments(self, *, lang, source_lang, segments):
+        """Voice-over off: 'translates' each line to a fixed Devanagari/Latin phrase keeping its id."""
+        self.calls.append(("translate_segments", dict(lang=lang, source_lang=source_lang,
+                                                      ids=[s["id"] for s in segments])))
+        word = "अनुवाद" if lang == "hi" else "translated"
+        return {s["id"]: f"{word} पंक्ति {s['id']}" if lang == "hi" else f"{word} line {s['id']}" for s in segments}
+
+
 class FakeVoicebox:
     """Writes a sine wav whose length is words * seconds_per_word."""
 

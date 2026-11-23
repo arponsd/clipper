@@ -76,6 +76,39 @@ SCRIPT_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+# Voice-over off: only the post metadata (no narration).
+METADATA_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "description": {"type": "string"},
+        "hashtags": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["title", "description", "hashtags"],
+    "additionalProperties": False,
+}
+
+# Voice-over off, clip language != source language: caption lines translated one by one (ids kept).
+TRANSLATE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "segments": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer"},
+                    "text": {"type": "string"},
+                },
+                "required": ["id", "text"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["segments"],
+    "additionalProperties": False,
+}
+
 SHORTEN_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {"narration": {"type": "string"}},
@@ -115,17 +148,32 @@ LENGTHEN_SYSTEM = (
 )
 
 
-def language_rules(lang: str) -> str:
+METADATA_SYSTEM = (
+    "You write the post text for vertical short videos (YouTube Shorts, Instagram Reels, Facebook Reels). "
+    "The clip is posted with its original audio and burned-in captions of what is said; there is no "
+    "narrator. Write a title that makes people click, a short description and relevant hashtags that "
+    "match what happens and what is said in the clip."
+)
+
+TRANSLATE_SYSTEM = (
+    "You translate the spoken lines of a short video into another language for on-screen captions. "
+    "Translate each line on its own, keep its id, and never merge, split, drop or reorder lines. "
+    "Keep the meaning and the speaker's tone; use natural, short, spoken phrasing that reads well as a "
+    "caption. Return plain text only: no notes, no quotes, no speaker labels."
+)
+
+
+def language_rules(lang: str, what: str = "everything (narration, title, description)") -> str:
     if lang == "hi":
         return (
-            "Write everything (narration, title, description) in natural, conversational Hindi as "
+            f"Write {what} in natural, conversational Hindi as "
             "people actually speak it, in Devanagari script. Common English loanwords are fine but "
             "must also be written in Devanagari. Never use romanized Hindi (Hinglish in Latin letters). "
             "Use standard Hindi spelling (for example अट्ठाईस, not अठ्ठाईस), and do not add Urdu "
             "nuktas (क़, ज़, फ़) unless the word is normally written with them."
         )
     name = LANGUAGE_NAMES.get(lang, lang)
-    return f"Write everything (narration, title, description) in natural, conversational {name}."
+    return f"Write {what} in natural, conversational {name}."
 
 
 # --------------------------------------------------------------------------- client
@@ -268,6 +316,52 @@ class AnthropicLLM:
             return ClipScript.model_validate(data)
         except Exception as e:  # noqa: BLE001
             raise LLMError(f"Claude returned an invalid script: {str(data)[:200]}") from e
+
+    def write_publish_metadata(self, *, lang: str, clip_transcript: str, moment: Moment,
+                               duration: float) -> ClipScript:
+        """Voice-over off: title/description/hashtags in ``lang``; the narration stays empty."""
+        user = (
+            f"{language_rules(lang, 'everything (title, description, hashtags)')}\n\n"
+            f"Clip length: {duration:.1f} seconds. Write a title of at most 70 characters, a 1-3 sentence "
+            "description, and 3 to 8 relevant hashtags (each starting with #, no spaces).\n\n"
+            f"Why this moment was picked: {moment.reason or '-'}\n"
+            f"Hook: {moment.hook or '-'}\n\n"
+            "What is said in the clip (it may be in another language):\n"
+            f"<clip_transcript>\n{clip_transcript}\n</clip_transcript>"
+        )
+        data = self.complete_json(system=METADATA_SYSTEM, user=user, schema=METADATA_SCHEMA,
+                                  max_tokens=min(SHORTEN_MAX_TOKENS, self.max_tokens))
+        try:
+            return ClipScript.model_validate({**data, "narration": ""})
+        except Exception as e:  # noqa: BLE001
+            raise LLMError(f"Claude returned invalid post metadata: {str(data)[:200]}") from e
+
+    def translate_segments(self, *, lang: str, source_lang: str, segments: list[dict]) -> dict[int, str]:
+        """Voice-over off: translate caption lines [{"id", "text"}] into ``lang``. Returns {id: text}."""
+        name = LANGUAGE_NAMES.get(lang, lang)
+        src = LANGUAGE_NAMES.get(source_lang, source_lang or "the source language")
+        rules = language_rules(lang, "the captions")
+        lines = json.dumps([{"id": int(s["id"]), "text": str(s["text"])} for s in segments], ensure_ascii=False)
+        user = (
+            f"Translate these {len(segments)} caption lines from {src} into {name}. {rules}\n"
+            "Return exactly one item per input line with the same id.\n\n"
+            f"<lines>\n{lines}\n</lines>"
+        )
+        data = self.complete_json(system=TRANSLATE_SYSTEM, user=user, schema=TRANSLATE_SCHEMA)
+        out: dict[int, str] = {}
+        for item in data.get("segments") or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                sid = int(item.get("id"))
+            except (TypeError, ValueError):
+                continue
+            text = " ".join(str(item.get("text") or "").split())
+            if text:
+                out[sid] = text
+        if segments and not out:
+            raise LLMError(f"Claude returned no {name} caption translation")
+        return out
 
     def shorten(self, *, lang: str, narration: str, max_words: int) -> str:
         user = (

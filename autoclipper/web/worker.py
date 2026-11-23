@@ -54,6 +54,8 @@ class Task:
     platforms: list[str] | None = None  # publish tasks only
     force: bool = False  # publish tasks only
     idempotency_key: str | None = field(default=None, repr=False)  # publish tasks only (not in to_dict)
+    # run_job only: switch the job's voice-over mode to this (PUT /api/jobs/{id}/mode); None = keep it
+    voiceover: bool | None = field(default=None, repr=False)
 
     def to_dict(self, position: int | None) -> dict:
         d = asdict(self)
@@ -69,10 +71,14 @@ class JobOptions:
     min_seconds: float | None = None
     max_seconds: float | None = None
     langs: list[str] | None = None
+    voiceover: bool | None = None  # the job's mode (the API fills in the setting); None = keep job.json's
 
     def to_dict(self) -> dict:
-        return {"clips": self.clips, "min_seconds": self.min_seconds, "max_seconds": self.max_seconds,
-                "langs": list(self.langs) if self.langs is not None else None}
+        d = {"clips": self.clips, "min_seconds": self.min_seconds, "max_seconds": self.max_seconds,
+             "langs": list(self.langs) if self.langs is not None else None}
+        if self.voiceover is not None:
+            d["voiceover"] = self.voiceover
+        return d
 
 
 class TaskCancelled(BaseException):
@@ -101,9 +107,11 @@ def read_options(job_id: str) -> JobOptions | None:
     if not isinstance(data, dict):
         return None
     langs = data.get("langs")
+    vo = data.get("voiceover")
     return JobOptions(clips=data.get("clips"), min_seconds=data.get("min_seconds"),
                       max_seconds=data.get("max_seconds"),
-                      langs=list(langs) if isinstance(langs, list) else None)
+                      langs=list(langs) if isinstance(langs, list) else None,
+                      voiceover=vo if isinstance(vo, bool) else None)
 
 
 def read_job(job_id: str) -> Job | None:
@@ -300,8 +308,13 @@ class Worker:
         self._queue.append(task)
         self._cond.notify_all()
 
-    def submit_job(self, source: str, *, options: JobOptions, upload: Path | None = None) -> Task:
-        store = JobStore.create(source)  # the one request-thread write: a brand-new job (CONTRACT 1a)
+    def submit_job(self, source: str, *, options: JobOptions, upload: Path | None = None,
+                   voiceover_default: bool = True) -> Task:
+        """``voiceover_default`` (the `voiceover` setting) is stored as the job's mode when the options
+        have none, so a later Settings change never switches this job."""
+        vo = options.voiceover if options.voiceover is not None else bool(voiceover_default)
+        # the one request-thread write: a brand-new job (CONTRACT 1a), its voice-over mode fixed in it
+        store = JobStore.create(source, voiceover=vo)
         job_id = store.job.id
         try:
             if upload is not None:
@@ -324,12 +337,24 @@ class Worker:
             store.save()
             raise
 
-    def submit_resume(self, job_id: str) -> tuple[Task, bool]:
+    def submit_resume(self, job_id: str, *, voiceover: bool | None = None,
+                      current: bool | None = None) -> tuple[Task, bool]:
+        """Queue a run_job (resume). ``voiceover`` switches the job's mode first (run_job stores it in
+        job.json). ``current`` = the job's mode now: a run already queued/running ends in its own switch, or
+        in ``current`` when it switches nothing. Asking for the mode that run ends in returns it (no new
+        task); asking for the other mode is a WorkerConflict."""
         with self._lock:
             existing = self._active(job_id, kind="run_job")
             if existing is not None:
+                ends_in = existing.voiceover if existing.voiceover is not None else current
+                asked = voiceover if voiceover is not None else current
+                if asked is not None and ends_in is not None and asked != ends_in:
+                    raise WorkerConflict("the job is queued or running in the other mode; change the mode when "
+                                         "it finishes")
+                if voiceover is not None and ends_in is None and existing.voiceover != voiceover:
+                    raise WorkerConflict("the job is queued or running; change the mode when it finishes")
                 return existing, False
-            task = Task(id=uuid.uuid4().hex, kind="run_job", job_id=job_id)
+            task = Task(id=uuid.uuid4().hex, kind="run_job", job_id=job_id, voiceover=voiceover)
             self._enqueue(task)
             return task, True
 
@@ -579,9 +604,12 @@ class Worker:
                 if flag.is_set() and not isinstance(sys.exc_info()[1], TaskCancelled):
                     raise TaskCancelled()
 
+            log_line.cancel_point = True  # type: ignore[attr-defined]  # pipeline._Reporter.cancel_point
+
             stamp = time.strftime("%Y-%m-%d %H:%M:%S")
             if task.kind == "run_job":
-                what = "run"
+                what = "run" if task.voiceover is None else (
+                    "run (switch to voice-over)" if task.voiceover else "run (switch to captions only)")
             elif task.kind == "publish":
                 what = f"publish {task.clip:02d}/{task.lang} {','.join(task.platforms or [])}"
             else:
@@ -611,9 +639,12 @@ class Worker:
                         if langs is None and job is not None and job.clips and \
                                 not options_path(task.job_id).exists():
                             langs = sorted({lang for c in job.clips for lang in c.langs}) or None
+                        # the voice-over mode is only passed when the task switches it (PUT .../mode):
+                        # job.json holds it (fixed at creation, or switched), and run_job keeps it.
+                        extra = {"voiceover": task.voiceover} if task.voiceover is not None else {}
                         self._run_job(job.source if job is not None else "", settings=settings, deps=deps,
                                       langs=langs, count=o.clips, min_seconds=o.min_seconds,
-                                      max_seconds=o.max_seconds, job_id=task.job_id, log=log_line)
+                                      max_seconds=o.max_seconds, job_id=task.job_id, log=log_line, **extra)
                     else:
                         self._rerender(task.job_id, task.clip, task.lang, settings=settings, deps=deps,
                                        log=log_line)

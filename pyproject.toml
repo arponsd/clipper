@@ -30,6 +30,7 @@ addopts = "-m 'not slow'"
 markers = [
     "slow: needs real models or network (skipped by default; run with `uv run pytest -m slow`)",
     "hyperframes: renders with the real HyperFrames CLI (needs Node 22 + hyperframes; also marked slow; run with `uv run pytest -m hyperframes`)",
+    "demucs: runs the real Demucs install (separation.python; also marked slow; skipped when it is missing)",
     "real_clients: lets the test use pipeline._make_llm/_make_voicebox/_make_transcriber (blocked by conftest otherwise)",
 ]
 

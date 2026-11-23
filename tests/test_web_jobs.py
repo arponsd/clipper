@@ -134,7 +134,10 @@ def test_create_job_from_url(api_idle):
     jdir = jobs_root() / body["id"]
     job = Job.model_validate_json((jdir / "job.json").read_text(encoding="utf-8"))
     assert job.status == "queued"
-    assert read_json(jdir / "options.json") == {"clips": 3, "min_seconds": 20, "max_seconds": 45, "langs": ["hi"]}
+    # voiceover: the setting at creation, fixed for the job (lead fix, CONTRACT_WEB section 11)
+    assert read_json(jdir / "options.json") == {"clips": 3, "min_seconds": 20, "max_seconds": 45, "langs": ["hi"],
+                                                "voiceover": True}
+    assert job.voiceover is True
 
 
 def test_create_job_from_upload_moves_file(api_idle):
@@ -148,7 +151,7 @@ def test_create_job_from_upload_moves_file(api_idle):
     assert (jdir / "source.mov").read_bytes() == VIDEO
     assert not (uploads_root() / up["upload_id"]).exists()
     assert read_json(jdir / "options.json") == {"clips": None, "min_seconds": None, "max_seconds": None,
-                                                "langs": None}
+                                                "langs": None, "voiceover": True}
     # claimed: a second job with the same upload id -> 404
     assert_error_shape(client.post("/api/jobs", json={"upload_id": up["upload_id"]}), 404, "not found")
 
@@ -313,7 +316,9 @@ def test_job_detail_structure(api):
     d = r.json()
     from test_web_support import SUMMARY_KEYS
 
-    assert_keys(d, {**SUMMARY_KEYS, "stages": dict, "options": (dict, type(None)), "clips": list})
+    assert_keys(d, {**SUMMARY_KEYS, "stages": dict, "options": (dict, type(None)), "clips": list,
+                    "voiceover": bool, "voiceover_override": (bool, type(None))})  # voice-over on/off (additive)
+    assert d["voiceover"] is True and d["voiceover_override"] is None
     assert set(d["stages"]) >= {"ingest", "transcribe", "moments", "cut"}
     for st in d["stages"].values():
         assert_keys(st, {"status": str, "progress": float, "message": str})
@@ -329,14 +334,18 @@ def test_job_detail_structure(api):
                      "metadata": (dict, type(None)), "voice": (dict, type(None)), "voice_stale": bool,
                      "warning": (str, type(None)), "caption_engine": (str, type(None)),
                      "caption_style": (str, type(None)), "render_stale": bool,
-                     "task": (dict, type(None)), "publish_url": str})  # step 4: publish_url (additive)
+                     "task": (dict, type(None)), "publish_url": str,  # step 4: publish_url (additive)
+                     "voiceover": bool, "rendered_voiceover": (bool, type(None)),  # voice-over on/off (additive)
+                     "audio": (dict, type(None)),  # audio mix / trim info from render.json (additive)
+                     "audio_stale": bool})  # made with an older mix / other audio settings (additive)
+    assert en["voiceover"] is True and en["rendered_voiceover"] is True
     assert set(en["stages"]) == {"script", "voice", "captions", "render"}
     assert en["final"] is True and en["video_url"] == f"/api/jobs/{store.job.id}/clips/0/en/video"
     assert en["download_url"] == f"/api/jobs/{store.job.id}/clips/0/en/download"
     assert_keys(en["script"], {"narration": str, "title": str, "description": str, "hashtags": list})
     assert_keys(en["metadata"], {"language": str, "title": str, "description": str, "hashtags": list})
     assert_keys(en["voice"], {"duration": float, "clip_duration": float, "tempo": float, "shortened": bool,
-                              "trimmed": bool, "lengthened": bool})
+                              "trimmed": bool, "lengthened": bool, "warnings": list, "truncated": bool})
     assert en["voice_stale"] is False and c["langs"]["hi"]["voice_stale"] is True
     assert c["langs"]["hi"]["script"]["narration"] == "नया पाठ"
     assert en["task"] is None

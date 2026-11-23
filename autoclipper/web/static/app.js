@@ -563,12 +563,20 @@
       el('label', { class: 'check', lang: 'hi' }, langHi, 'हिन्दी (Hindi)'));
     const langsField = el('div', { class: 'field' }, el('span', { class: 'field-label', id: 'nj-langs-label', text: 'Languages' }), langsBox, langErr);
     errs.register('options.langs', langsField, langErr);
+    // Voice-over: starts at the setting; always sent, and fixed for the job (Settings changes apply to new jobs).
+    let voiceoverDefault = true;
+    const voIn = el('input', { type: 'checkbox', id: 'nj-voiceover', checked: true });
+    const voErr = el('div', { class: 'field-error', id: 'nj-voiceover-err' });
+    const voHint = el('div', { class: 'hint', id: 'nj-voiceover-hint', text: 'Off = captions only: no narrator voice, the original audio is kept and the captions show what is said.' });
+    voIn.setAttribute('aria-describedby', 'nj-voiceover-hint nj-voiceover-err');
+    const voField = el('div', { class: 'field' }, el('label', { class: 'check' }, voIn, 'Voice-over narration'), voHint, voErr);
+    errs.register('options.voiceover', voField, voErr);
     const optsFs = el('fieldset', null, el('legend', { text: 'Options' }),
       el('div', { class: 'fields' },
         fieldWrap('options.clips', 'Number of clips', clipsIn, '1–30', 'nj-clips'),
         fieldWrap('options.min_seconds', 'Min length (s)', minIn, '5–180 seconds', 'nj-min'),
         fieldWrap('options.max_seconds', 'Max length (s)', maxIn, '10–180, at least the minimum', 'nj-max'),
-        langsField));
+        langsField, voField));
 
     // --- progress + actions
     const upBar = el('div', { class: 'bar upload', role: 'progressbar', 'aria-label': 'Upload progress', 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': 0 }, el('span'));
@@ -659,6 +667,8 @@
       const langs = Array.isArray(s.languages) ? s.languages : ['en', 'hi'];
       langEn.checked = langs.includes('en');
       langHi.checked = langs.includes('hi');
+      voiceoverDefault = s.voiceover !== false;
+      voIn.checked = voiceoverDefault;
       if (s.web) web = Object.assign({}, web, s.web);
       fileInput.setAttribute('accept', (web.allowed_extensions || DEFAULT_EXTS).join(','));
       settingsNote.textContent = `Defaults come from Settings. Uploads: ${(web.allowed_extensions || DEFAULT_EXTS).join(' ')}, up to ${web.max_upload_mb} MiB.`;
@@ -689,6 +699,7 @@
       if (langHi.checked) langs.push('hi');
       if (!langs.length) clientErrors['options.langs'] = ['Pick at least one language.'];
       o.langs = langs;
+      o.voiceover = voIn.checked; // always sent: the job keeps the mode shown on the form
       return o;
     }
 
@@ -874,14 +885,14 @@
       el('div', { class: 'stage-head' }, el('span', { class: 'stage-name', text: name }), chip(s.status)),
       bar(s.status, s.progress, `${name} progress`),
       el('div', { class: 'row row-between' },
-        el('span', { class: 'stage-pct', text: (s.status === 'done' ? 100 : pct(s.progress)) + '%' })),
+        el('span', { class: 'stage-pct', text: s.status === 'skipped' ? (s.message === 'voice-over off' ? 'off' : 'skipped') : (s.status === 'done' ? 100 : pct(s.progress)) + '%' })),
       s.message ? el('div', { class: 'stage-msg', text: s.message }) : null);
   }
   function miniStage(name, st) {
     const s = st || { status: 'pending', progress: 0, message: '' };
     const v = s.status === 'done' ? 100 : pct(s.progress);
     return el('div', { class: 'mini-stage is-' + s.status, title: `${name}: ${s.status} ${v}%${s.message ? ' - ' + s.message : ''}` },
-      el('div', { class: 'label' }, el('b', { text: name }), el('span', { text: s.status === 'pending' ? '' : v + '%' })),
+      el('div', { class: 'label' }, el('b', { text: name }), el('span', { text: s.status === 'pending' ? '' : s.status === 'skipped' ? (s.message === 'voice-over off' ? 'off' : 'skipped') : v + '%' })),
       bar(s.status, s.progress, `${name} ${s.status}`));
   }
   function clipLangStatus(cl) {
@@ -898,6 +909,27 @@
     if (!cl || !cl.caption_engine) return '';
     if (cl.caption_engine === 'hyperframes') return `Captions: HyperFrames${cl.caption_style ? ' (' + cl.caption_style + ')' : ''}`;
     return 'Captions: ASS';
+  }
+  function voiceoverChanged(cl) {
+    return !!cl && cl.final && typeof cl.rendered_voiceover === 'boolean' && typeof cl.voiceover === 'boolean' && cl.rendered_voiceover !== cl.voiceover;
+  }
+  function staleText(cl) {
+    if (voiceoverChanged(cl)) return `Voice-over turned ${cl.voiceover ? 'on' : 'off'} - re-render to apply.`;
+    if (cl && cl.audio_stale) return 'Made with an older audio mix or other audio settings - re-render to apply (or use "Apply & re-render" on the Mode row).';
+    return 'Caption engine/style changed - re-render to apply.';
+  }
+  function audioText(cl) {
+    const a = cl && cl.audio;
+    if (!a || a.mix === 'original') return '';
+    const parts = [];
+    if (a.background === 'no_vocals') parts.push('background: vocals removed');
+    if (a.background_note) parts.push('background ' + a.background_note);
+    if (typeof a.trimmed_to === 'number') parts.push(`trimmed to ${fmtSecs(a.trimmed_to)} (short narration${typeof a.clip_duration === 'number' ? ', clip ' + fmtSecs(a.clip_duration) : ''})`);
+    return parts.length ? 'Audio: ' + parts.join('; ') : '';
+  }
+  function audioLabel(cl) {
+    const t = audioText(cl);
+    return t ? el('p', { class: 'small muted audio-info', text: t }) : null;
   }
   function captionsLabel(cl) {
     const t = captionsText(cl);
@@ -971,6 +1003,29 @@
       poll.kick();
     }
 
+    async function setMode(on, d) {
+      const current = d.voiceover !== false;
+      const unfinished = d.status !== 'done' || d.interrupted || (d.failed || 0) > 0;
+      const finish = unfinished ? ' The job is not finished, so this also runs its remaining steps (narration scripts, voices, renders) for every clip.' : '';
+      const msg = on === current
+        ? `Re-render the clips of this job that are out of date (made in the other mode, or with older audio or caption settings)?${finish}`
+        : (on
+          ? 'Switch this job to voice-over + captions and re-render its clips? Clips without a narration get one written (language model), then a voice (Voicebox).'
+          : 'Switch this job to original audio + captions and re-render its clips? The narration voice is kept on disk, so switching back reuses it.') + finish;
+      if (!confirm(msg)) return;
+      try {
+        const r = await api('PUT', `/api/jobs/${encodeURIComponent(id)}/mode`, { body: { voiceover: on } });
+        const data = r.data || {};
+        let text;
+        if (!data.task) text = 'Every clip is already up to date in this mode.';
+        else if (r.status !== 202) text = 'A run of this job is already queued.';
+        else text = data.changed ? 'Mode changed; re-render queued.' : 'Re-render queued for the clips that are out of date.';
+        toast(text, 'ok');
+      } catch (e) { toast(e.message, 'error'); }
+      Queue.kick();
+      poll.kick();
+    }
+
     function render(d) {
       const status = d.interrupted ? 'interrupted' : d.status;
       const canResume = !d.task && (d.status === 'failed' || d.status === 'queued' || d.status === 'running' || d.interrupted || (d.failed || 0) > 0);
@@ -987,12 +1042,38 @@
         (opts.min_seconds != null || opts.max_seconds != null) ? `${opts.min_seconds != null ? opts.min_seconds : '…'}–${opts.max_seconds != null ? opts.max_seconds : '…'} s` : null,
         Array.isArray(opts.langs) ? opts.langs.map((l) => LANG_SHORT[l] || l).join(', ') : null,
       ].filter(Boolean).join(' · ') || 'settings defaults' : 'settings defaults';
+      const voText = d.voiceover === false ? 'off - captions only, original audio' : 'on';
+      const voFrom = ' (switch it for this job with Mode below; the Settings switch applies to new jobs)';
+      const modeSel = el('select', { id: 'job-mode', 'aria-label': 'Mode for this job', disabled: !!d.task },
+        el('option', { value: 'on', text: 'Voice-over + captions', selected: d.voiceover !== false }),
+        el('option', { value: 'off', text: 'Original audio + captions', selected: d.voiceover === false }));
+      const modeBtn = el('button', { type: 'button', class: 'btn btn-small', 'data-fk': 'mode', disabled: !!d.task, text: 'Apply & re-render',
+        on: { click: () => setMode(modeSel.value === 'on', d) } });
+      const anyStale = (d.clips || []).some((c) => Object.values(c.langs || {}).some((cl) => cl && cl.render_stale));
+      const unfinishedJob = d.status !== 'done' || d.interrupted || (d.failed || 0) > 0;
+      const modeHint = () => {
+        if (d.task) return 'Wait for the current task to finish.';
+        const same = (modeSel.value === 'on') === (d.voiceover !== false);
+        if (!same) return 'Switches the mode and re-renders every clip.' + (unfinishedJob ? ' The job is unfinished: its remaining steps run too.' : '');
+        if (unfinishedJob) return 'Finishes the job and re-renders out-of-date clips.';
+        return anyStale ? 'Re-renders the clips that are out of date.' : 'Every clip is up to date in this mode.';
+      };
+      const hintEl = el('span', { class: 'small muted', text: modeHint() });
+      const syncMode = () => {
+        const same = (modeSel.value === 'on') === (d.voiceover !== false);
+        modeBtn.disabled = !!d.task || (same && !unfinishedJob && !anyStale);
+        hintEl.textContent = modeHint();
+      };
+      modeSel.addEventListener('change', syncMode);
+      syncMode();
+      const modeRow = d.clips && d.clips.length ? el('div', { class: 'row mode-row' }, modeSel, modeBtn, hintEl) : null;
 
       const info = el('section', { class: 'card' },
         el('dl', { class: 'kv' },
           el('dt', { text: 'Source' }), el('dd', { text: d.source || '' }),
           el('dt', { text: 'Created' }), el('dd', { text: fmtDate(d.created_at) }),
           el('dt', { text: 'Options' }), el('dd', { text: optText }),
+          el('dt', { text: 'Voice-over' }), el('dd', null, el('span', { text: voText + voFrom }), modeRow),
           el('dt', { text: 'Output' }), el('dd', { text: `${d.rendered || 0} rendered, ${d.failed || 0} failed` }),
           d.task ? el('dt', { text: 'Task' }) : null,
           d.task ? el('dd', null, chip(d.task.state, taskLabel(d.task)),
@@ -1038,8 +1119,9 @@
         cl.error ? el('p', { class: 'small field-error', role: 'alert', text: cl.error }) : null,
         cl.voice_stale ? el('p', { class: 'small notice notice-warn', text: 'Narration changed - re-render to regenerate the voice.' }) : null,
         cl.warning ? el('p', { class: 'small notice notice-warn', role: 'status', text: cl.warning }) : null,
-        cl.render_stale ? el('p', { class: 'small notice notice-info', text: 'Caption engine/style changed - re-render to apply.' }) : null,
+        cl.render_stale ? el('p', { class: 'small notice notice-info', text: staleText(cl) }) : null,
         captionsLabel(cl),
+        audioLabel(cl),
         el('div', { class: 'row' },
           (cl.script || cl.final) ? el('a', { class: 'btn btn-small', href: reviewHref, 'data-fk': `rv-${c.index}-${lang}`, text: 'Review & edit' }) : null,
           cl.final && cl.download_url ? el('a', { class: 'btn btn-small', href: cl.download_url + '?token=' + encodeURIComponent(TOKEN),
@@ -1098,6 +1180,7 @@
     }
     const narration = el('textarea', { class: 'narration', lang: langAttr(lang), maxlength: '5000', spellcheck: hi ? 'false' : 'true' });
     const narrCount = el('div', { class: 'counter', 'aria-live': 'polite' });
+    const voOffNote = el('p', { class: 'notice notice-info', hidden: true, text: 'Voice-over: off. This clip keeps its original audio and the captions show what is said, so there is no narration to edit. The title, description and hashtags are still used when publishing.' });
     const title = el('input', { type: 'text', lang: langAttr(lang), maxlength: '200' });
     const titleCount = el('div', { class: 'counter' });
     const desc = el('textarea', { lang: langAttr(lang), maxlength: '5000', rows: '4' });
@@ -1109,10 +1192,13 @@
     const saveBtn = el('button', { type: 'submit', class: 'btn btn-primary', text: 'Save' });
     const revertBtn = el('button', { type: 'button', class: 'btn', text: 'Revert' });
     const dirtyLabel = el('span', { class: 'small muted', 'aria-live': 'polite' });
+    const narrField = fieldWrap('narration', 'Narration', narration, narrCount, 'cr-narr');
+    function voiceoverOn() { return !(entry && entry.voiceover === false); }
     const form = el('form', { class: 'card stack', novalidate: true, 'aria-label': 'Script and metadata' },
       el('h2', { text: 'Script & metadata' }),
       serverNote,
-      fieldWrap('narration', 'Narration', narration, narrCount, 'cr-narr'),
+      voOffNote,
+      narrField,
       staleNote,
       fieldWrap('title', 'Title', title, titleCount, 'cr-title'),
       fieldWrap('description', 'Description', desc, null, 'cr-desc'),
@@ -1185,7 +1271,9 @@
     function validateClient(f) {
       const e = {};
       const nl = f.narration.trim().length;
-      if (!nl) e.narration = ['Narration cannot be empty.'];
+      // An empty narration is allowed while the voice-over is off, and when none was written yet
+      // (script made with the voice-over off): Re-render then writes it.
+      if (!nl && voiceoverOn() && (saved && saved.narration || '').trim()) e.narration = ['Narration cannot be empty.'];
       else if (nl > 5000) e.narration = ['At most 5000 characters.'];
       const tl = f.title.trim().length;
       if (!tl) e.title = ['Title cannot be empty.'];
@@ -1210,7 +1298,7 @@
         const titleChanged = sc.title !== f.title;
         const tagsChanged = JSON.stringify(sc.hashtags || []) !== JSON.stringify(f.hashtags);
         fillForm(sc);
-        staleNote.hidden = !(r.data && r.data.voice_stale);
+        staleNote.hidden = !(r.data && r.data.voice_stale) || !voiceoverOn();
         const notes = [];
         if (titleChanged) notes.push('The title was shortened to fit 70 characters.');
         if (tagsChanged) notes.push('The hashtags were adjusted ("#" added, spaces and duplicates removed).');
@@ -1277,22 +1365,38 @@
       swap(stagesBox, CLIP_STAGES.map((k) => miniStage(k, entry.stages && entry.stages[k])));
       swap(clipErr, entry.error ? el('p', { class: 'notice notice-error', role: 'alert', text: entry.error }) : null,
         entry.warning ? el('p', { class: 'notice notice-warn', role: 'status', text: entry.warning }) : null,
-        entry.render_stale ? el('p', { class: 'notice notice-info', text: 'Caption engine/style changed - re-render to apply.' }) : null,
+        entry.render_stale ? el('p', { class: 'notice notice-info', text: staleText(entry) }) : null,
         captionsLabel(entry),
         jobBusy() ? el('p', { class: 'notice notice-info', text: 'The whole job is being processed; editing is locked until it finishes.' }) : null);
       const v = entry.voice;
       const dur = clipDuration();
       const rows = [];
       if (dur != null) rows.push(['Clip', `${fmtSecs(dur)} (${fmtClock(clip.moment.start)}–${fmtClock(clip.moment.end)} in the source)`]);
-      if (v) {
+      const vo = voiceoverOn();
+      rows.push(['Voice-over', vo ? 'on' : 'off (captions only, original audio)']);
+      narrField.hidden = !vo;
+      voOffNote.hidden = vo;
+      if (v && vo) {
         rows.push(['Voice', fmtSecs(v.duration)]);
         rows.push(['Tempo', typeof v.tempo === 'number' ? `${v.tempo.toFixed(2)}×` : '?']);
-        const flags = ['shortened', 'trimmed', 'lengthened'].filter((k) => v[k]);
+        const flags = ['shortened', 'trimmed', 'lengthened', 'truncated'].filter((k) => v[k]).map((k) => (k === 'truncated' ? 'cut short by Voicebox' : k));
         rows.push(['Adjusted', flags.length ? flags.join(', ') : 'no']);
+      }
+      const a = entry.audio;
+      if (a && vo && a.mix !== 'original') {
+        const bg = a.background === 'no_vocals' ? 'vocals removed (Demucs)' : (a.background === 'none' ? 'none' : 'original audio');
+        rows.push(['Background', bg]);
+        if (typeof a.voice_lufs === 'number') {
+          const under = typeof a.background_lufs_under_voice === 'number' && typeof a.background_gain_db_under_voice === 'number'
+            ? `, background under it ${(a.background_lufs_under_voice + a.background_gain_db_under_voice).toFixed(1)} LUFS` : '';
+          rows.push(['Mix', `${a.mix}: voice ${(a.voice_lufs + (a.voice_gain_db || 0)).toFixed(1)} LUFS${under} (before the final normalisation)`]);
+        } else rows.push(['Mix', a.mix]);
+        if (a.background_note) rows.push(['Background level', 'The background is ' + a.background_note + '.']);
+        if (typeof a.trimmed_to === 'number') rows.push(['Final length', `${fmtSecs(a.trimmed_to)} - trimmed after the short narration (ends at ${fmtSecs(a.voice_end || 0)})`]);
       }
       if (clip.moment && clip.moment.hook) rows.push(['Hook', clip.moment.hook]);
       swap(voiceInfo, rows.map(([k, val]) => [el('dt', { text: k }), el('dd', { text: val })]));
-      staleNote.hidden = !entry.voice_stale;
+      staleNote.hidden = !entry.voice_stale || !vo;
       // prev/next clip-lang
       const pairs = [];
       for (const c of job.clips || []) for (const l of Object.keys(c.langs || {})) pairs.push([c.index, l]);
@@ -1402,14 +1506,16 @@
     whisper: ['Transcription (Whisper)', 'Runs locally with faster-whisper.'],
     voicebox: ['Voice (Voicebox)', 'Local text-to-speech server and the voice profile per language.'],
     clips: ['Clips', 'How many clips to cut and how long they are.'],
-    audio: ['Audio mix', 'Levels of the original audio and the narration.'],
+    audio: ['Audio mix', 'Levels of the original audio and the narration. The "loudness" mix measures both and keeps the background a fixed number of dB under the voice, however loud the source is.'],
     captions: ['Captions', 'Burned-in word-by-word captions.'],
     script: ['Narration script', 'Speaking rate used to size the narration to the clip.'],
     web: ['Web uploads', 'Limits for files uploaded through this page.'],
+    separation: ['Vocal separation (optional)', 'Demucs removes the speech from the clip so the narration is not talking over someone else. Used only with the voice-over on and Background = "no_vocals"; a clip falls back to the original audio (with a warning) if Demucs is missing or fails. Run Doctor to check the install.'],
     hyperframes: ['HyperFrames captions (optional)', 'Animated captions rendered with the HyperFrames CLI (Node 22+). Used only when the caption engine is "hyperframes"; a clip falls back to ASS captions if HyperFrames is missing or fails. Run Doctor to check the install.'],
   };
   const FIELD_LABELS = {
-    languages: ['Output languages', 'Each clip is narrated in every selected language.'],
+    languages: ['Output languages', 'Each clip is made in every selected language.'],
+    voiceover: ['Voice-over narration', 'On: a narrator voice (Voicebox) talks over each clip. Off: captions only - the clip keeps its original audio and the captions show what is said (translated into the other language).'],
     'llm.provider': ['Provider', null],
     'llm.model': ['Model', 'Anthropic model id, e.g. claude-opus-5-5.'],
     'llm.effort': ['Effort', 'Higher effort gives better picks but is slower and costs more.'],
@@ -1423,6 +1529,7 @@
     'voicebox.url': ['Voicebox URL', 'e.g. http://127.0.0.1:17493'],
     'voicebox.poll_interval': ['Poll interval (s)', null],
     'voicebox.timeout_seconds': ['Timeout per narration (s)', null],
+    'voicebox.lengthen_timeout_seconds': ['Timeout for the "lengthen" retry (s)', 'A too-short narration is re-generated once with a longer text. If that takes longer than this, it is cancelled and the first voice is kept (with a warning).'],
     'voicebox.english': ['English voice', null],
     'voicebox.hindi': ['Hindi voice', 'Hindi needs a multilingual engine (Chatterbox).'],
     'voicebox.english.profile_id': ['Voice profile', null],
@@ -1435,10 +1542,23 @@
     'clips.width': ['Width (px)', 'Even number.'],
     'clips.height': ['Height (px)', 'Even number.'],
     'clips.reframe': ['Reframe mode', 'crop = centre crop to 9:16; blur = whole frame over a blurred fill.'],
-    'audio.original_volume': ['Original volume under the voice', 'Level of the source audio while the narration plays.'],
-    'audio.original_volume_after': ['Original volume without voice', 'Level before and after the narration.'],
+    'audio.mix': ['Mix', 'loudness = measure the voice and the background and set their levels from that (recommended). gain = the old fixed volume factors.'],
+    'audio.voice_lufs': ['Voice loudness (LUFS)', 'loudness mix: the narration is normalised to this before the final loudness normalisation.'],
+    'audio.background_db_below_voice': ['Background under the voice (dB)', 'loudness mix: how far the background sits under the narration while it plays. 18-20 dB keeps the voice clear over loud game or music audio.'],
+    'audio.original_volume': ['Original volume under the voice', 'gain mix only: level of the source audio while the narration plays (the loudness mix uses "Background under the voice").'],
+    'audio.original_volume_after': ['Original volume without voice', 'Level before and after the narration. loudness mix: relative to the voice (1 = as loud as the voice). gain mix: a plain factor. With the voice-over off this is the level of the whole clip (loudness normalisation runs afterwards).'],
     'audio.duck_ramp_seconds': ['Duck ramp (s)', 'Fade time between the two levels.'],
-    'audio.voice_volume': ['Voice volume', null],
+    'audio.voice_volume': ['Voice volume', 'gain mix: a factor; loudness mix: a trim on the voice loudness (1 = unchanged).'],
+    'audio.short_voice': ['Short narration', 'trim_clip = when the narration ends early, end the clip shortly after it; keep = keep the whole clip (the original audio comes back after the narration).'],
+    'audio.short_voice_below': ['Short below (× clip)', 'A narration that ends before this fraction of the clip counts as short.'],
+    'audio.short_voice_tail': ['Tail after the narration (s)', 'trim_clip: how long the clip runs on after the narration ends (the clip is never shorter than 3 s).'],
+    'separation.background': ['Background', 'original = the clip\'s own audio under the narration; no_vocals = the clip with its speech removed by Demucs.'],
+    'separation.python': ['Demucs Python', 'Python of the venv Demucs is installed in, e.g. ~/tools/demucs/bin/python or %USERPROFILE%\\tools\\demucs\\Scripts\\python.exe.'],
+    'separation.model': ['Model', 'Demucs model name; htdemucs is the default.'],
+    'separation.segment': ['Segment (s)', 'Seconds processed at once; lower uses less memory (htdemucs allows at most 7).'],
+    'separation.threads': ['CPU threads', '0 = all cores.'],
+    'separation.timeout_seconds': ['Timeout per clip (s)', 'A longer separation is stopped and the original audio is used.'],
+    'separation.models_dir': ['Model folder', 'Where Demucs keeps its downloaded model (TORCH_HOME). Empty = ~/.cache/torch.'],
     'audio.max_speedup': ['Max voice speed-up', 'Longest allowed tempo-up before the narration is shortened.'],
     'audio.loudnorm': ['Normalise loudness', 'Single-pass loudnorm on the final mix.'],
     'audio.target_lufs': ['Target loudness (LUFS)', '-14 suits Shorts / Reels.'],
@@ -1612,7 +1732,45 @@
       });
       swap(content, form);
       syncEngine(form);
-      form.addEventListener('change', () => syncEngine(form));
+      syncVoiceover(form);
+      form.addEventListener('change', () => { syncEngine(form); syncVoiceover(form); });
+    }
+
+    // Voicebox and narration-script fields stay editable but are greyed while the voice-over is off.
+    function syncVoiceover(form) {
+      const f = fields.find((x) => x.path.join('.') === 'voiceover');
+      let on = true;
+      try { on = f ? !!f.get() : true; } catch (e) { on = true; }
+      for (const key of ['voicebox', 'script', 'separation']) {
+        const fs = form.querySelector(`fieldset[data-path="${key}"]`);
+        if (!fs) continue;
+        fs.classList.toggle('is-inactive', !on);
+        let note = fs.querySelector('.voiceover-note');
+        if (!on && !note) {
+          note = el('p', { class: 'small notice notice-info voiceover-note', text: 'Not used: Voice-over narration is off (General). Clips keep their original audio with captions only.' });
+          const legend = fs.querySelector('legend');
+          if (legend && legend.nextSibling) fs.insertBefore(note, legend.nextSibling.nextSibling || null); else fs.appendChild(note);
+        } else if (on && note) note.remove();
+      }
+      // Audio mix: the under-voice / duck / voice fields do nothing without a voice-over.
+      for (const key of ['audio.mix', 'audio.voice_lufs', 'audio.background_db_below_voice', 'audio.original_volume', 'audio.duck_ramp_seconds', 'audio.voice_volume', 'audio.max_speedup', 'audio.short_voice', 'audio.short_voice_below', 'audio.short_voice_tail']) {
+        const w = form.querySelector(`.field[data-path="${key}"]`);
+        if (!w) continue;
+        w.classList.toggle('is-inactive', !on);
+        if (!on) w.title = 'Not used: Voice-over narration is off'; else w.removeAttribute('title');
+      }
+      if (!on) return;
+      // Voice-over on: grey the fields of the mix that is not selected.
+      const mf = fields.find((x) => x.path.join('.') === 'audio.mix');
+      let mix = 'loudness';
+      try { mix = mf ? mf.get() : 'loudness'; } catch (e) { mix = 'loudness'; }
+      const unused = mix === 'gain' ? ['audio.voice_lufs', 'audio.background_db_below_voice'] : ['audio.original_volume'];
+      for (const key of unused) {
+        const w = form.querySelector(`.field[data-path="${key}"]`);
+        if (!w) continue;
+        w.classList.add('is-inactive');
+        w.title = `Not used with the "${mix}" mix`;
+      }
     }
 
     // HyperFrames fields stay editable but are greyed while the caption engine is "ass".

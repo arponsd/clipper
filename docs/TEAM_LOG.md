@@ -1288,3 +1288,414 @@ The manual run used port 8767 with `AUTOCLIPPER_DATA_DIR=~/.cache/ac-step4/data-
 - **Notes:**
   - DELETE on a YouTube account revokes at Google by default (`revoke=true`), so a disconnect makes a network call. Use `?revoke=false` or `--no-revoke` for tests with fake tokens.
   - The README's `icacls ... "%USERNAME%"` is cmd syntax. In PowerShell it is `$env:USERNAME`, so it should say "run in cmd".
+
+## Builder (voice-over on/off, "captions only"), 2026-11-23
+
+Worktree `auto-clipper-novo`, branch `feat-no-voiceover`. Nothing committed, nothing published, the user's
+server on :8765 and its data dir were not touched (sample job copied read-only).
+
+### What I built
+- **Setting** `voiceover: bool = true` (top level, Settings > General "Voice-over narration" with a hint;
+  the Voicebox and Narration-script fieldsets grey out with a note while it is off). CLI `settings set voiceover=false`.
+- **Per-job override:** `run --no-voiceover` / `--voiceover` (mutually exclusive), web New-job checkbox
+  (starts at the setting; `options.voiceover` sent only when changed). Stored as `Job.voiceover` in job.json, so
+  resume and rerender keep the job's mode; None follows the setting.
+- **Pipeline (off):** script = title/description/hashtags only (`LLM.write_publish_metadata`, narration "");
+  voice stage `skipped` "voice-over off" with no Voicebox client built; captions from the original speech
+  (new `stages/original_captions.py`): same language -> Whisper words re-based to clip time (edge words
+  clamped); other language -> one `LLM.translate_segments` call per clip-lang with segment ids, each line
+  timed over its original span by character length, cached in `caption_translation.json`; render with no
+  voice input (original at `original_volume_after`, loudnorm + limiter). Both caption engines use the same words.json.
+- **Staleness:** `captions.json` stamp (written only when off; removed by voice-mode captions) and
+  `render.json "voiceover": false` (absent = on, so existing renders stay current). Mode switch -> captions +
+  render redone. Turning it on for an empty narration -> `add_narration` (title etc. kept) + voice. voice.wav is
+  kept across switches, so on->off->on reuses the voice.
+- **Web:** detail adds `voiceover`, `voiceover_override`, per clip-lang `voiceover`, `rendered_voiceover`;
+  clip page hides the narration (info note), shows "Voice-over: off", Save accepts an empty narration only when
+  off; stale hint "Voice-over turned on/off - re-render to apply". Publish `voice_stale` ignores finals rendered
+  without voice. Doctor: one OK row "not needed: voice-over is off".
+- Optional LLM capabilities are a separate protocol (`interfaces.CaptionsOnlyLLM`), used via getattr like
+  `lengthen`; an LLM without `write_publish_metadata` falls back to `write_script` and drops the narration.
+- Docs: README (Settings row, "Captions only (no voice-over)" section, CLI usage, data layout, doctor) and
+  CONTRACT_WEB section 11.
+
+### Tests
+- New `tests/test_voiceover_off.py` (27) and `tests/test_voiceover_llm.py` (8); `tests/fakes.py` FakeLLM gained
+  `write_publish_metadata` and `translate_segments` (additive).
+- Changed one existing test: `test_web_jobs.py::test_job_detail_structure` pins the exact detail keys; I added
+  the new additive keys there (contract extension, not a behaviour change).
+- Full suite: `TMPDIR=~/.cache/ac-novo uv run pytest -q -p no:cacheprovider --basetemp ~/.cache/ac-novo/bt-builder`
+  -> **1241 passed**, 2 deselected (re-run after the final docs/JS changes: same).
+
+### Real render (data copy `~/.cache/ac-novo/data-builder`, settings `voiceover=false`)
+- Real Claude wrote captions-only metadata for clip 01 en/hi (en title from the copied job's moment, hi in
+  Devanagari); the copied narration scripts were kept aside as `script.voiceover.json`.
+- `autoclipper rerender <job> 1 en|hi`: voice `skipped (voice-over off)`, no Voicebox; en captions from
+  Whisper (71 words), hi from one translation call (7 lines -> 82 words). Render 3.9 s (en) / 9.9 s (hi incl. the LLM call).
+- Audio: cut -25.1 LUFS -> final -14.2 LUFS; the 0.5 s level envelope follows the cut at a constant +11.0 dB
+  (p10..p90 +10.5..+11.2) = original only, no ducking. The old voice-over final varied -16.5..+12.6 dB.
+- Frames: English words match the speech, Hindi Devanagari shaped correctly (e.g. छूने), highlight works.
+- Web on :8771 (stopped after): clip page hides narration, Save with empty narration -> 200 and metadata.json
+  updated; job page shows "Voice-over: off - captions only (from Settings)" and the re-render hint on clip 00;
+  Settings greys Voicebox/script. No console errors.
+
+### Notes for the lead
+- Publish disclosure flags (`contains_synthetic_media`, FB `is_ai_generated`) stay true by default even for
+  captions-only clips (no AI voice). Not changed: it is a publishing-policy decision.
+- Pre-existing nit seen in the real run: `_clean_title` strips a leading `"` but not an inner closing one
+  (`Slipped the Surly Bonds of Earth" – ...`). Not touched.
+- The web job page has no per-job voice-over toggle for existing jobs (CLI `run --job X --no-voiceover` does it);
+  with no override a job follows Settings, and a clip re-render applies it.
+
+## Reviewer (UX + output, voice-over on/off), 2026-11-23
+
+Data copy `~/.cache/ac-novo/data-reviewer`, server on :8772 (stopped). Full suite: 1241 passed.
+- **Main issue:** a job without its own override follows the *current* setting. The user's existing job (made with
+  the voice-over) reports `voiceover: false` and every clip "Voice-over turned off - re-render to apply" as soon as
+  Settings is switched off; a later re-render (e.g. to fix a title) silently drops the voice-over. The New-job form
+  sends `options.voiceover` only when it differs from the setting, so new jobs have no pinned mode either.
+  Suggest: pin the effective mode in job.json at creation (web + CLI), and treat legacy `None` jobs as `true`.
+- Job page: the skipped voice stage reads "Voice 100%"; "voice-over off" is only in the tooltip.
+- Settings: Audio mix still shows under-voice / duck / voice-volume fields as active while off; the label
+  "Original volume without voice / Level before and after the narration" is what applies in captions-only mode.
+- Clip page, voice-over ON with an empty narration (script written while off): Save is blocked by "Narration cannot
+  be empty", so a title edit can't be saved without writing a narration.
+- Output OK: final audio aligned with source (30 ms), -25.1 -> -14.2 LUFS, no voice; en captions match speech;
+  hi translation (cached) is good and shaped correctly in both ass and HyperFrames (rendered hi with HF here);
+  web Save (title, hidden narration preserved) and web Re-render work; 401/403/404/422 checked.
+
+## Reviewer (correctness, voice-over on/off), 2026-11-23
+
+Full suite: 1241 passed. Probed `original_captions` directly (boundary words, partial/mismatched
+translations, zero-length words) and `settings set voiceover=...` on a data copy. Findings:
+
+- MEDIUM: a job's mode is not frozen unless explicitly overridden. `run_job` only writes `job.voiceover`
+  when a flag/option is given; a CLI run without a flag or a web job left at the default keeps
+  `voiceover=None`, so resuming after a Settings change silently switches mode (clip-langs
+  already rendered are re-rendered in the other mode, any half-done ones come out mixed).
+- LOW-MED: partial translations are cached as-is (`caption_translation.json` keyed only on source lines);
+  later renders hit the cache and never retry the missing lines, which stay uncaptioned.
+- LOW: `translate_lines` does `int(k)` on the result keys without a guard, so a non-numeric id raises a
+  bare ValueError instead of CaptionsError (AnthropicLLM itself normalises the ids).
+- LOW: a clip with no speech plus caption engine hyperframes gets `words.json has no words`, which is
+  shown as "HyperFrames captions failed ... used ASS captions" (a false failure warning).
+- LOW: translated lines take their source segment's span. A one-word or zero-length Whisper segment
+  makes the translated sentence flash for about 10 ms. A segment with a long pause spreads its
+  captions over the silence.
+- LOW: on the New job form, `voiceover` is sent only when it differs from the setting as it was when
+  the form loaded. A Settings change made in another tab before submitting flips the job's mode.
+Clip-boundary trimming, same-language re-basing, staleness on toggle (captions stamp + render stamp),
+rerender in both directions, render graph with no voice input, CLI flag precedence and doctor are correct.
+
+## Lead triage + sign-off (voice-over on/off), 2026-11-23
+
+**Triage of review findings:**
+- **C1 / UX1 (job mode not fixed): ACCEPTED (blocker).** The mode is now fixed when the job is created.
+  - `JobStore.create(source, voiceover=...)` writes it in the first save.
+  - CLI `run`: for a new job, the setting or the flag.
+  - Web `POST /api/jobs`: `options.voiceover`, or the current setting when it is null. The resolved bool goes to options.json and job.json.
+  - `pipeline.job_voiceover`: `None` (legacy job) = **on**, whatever the setting.
+  - The worker no longer passes the mode from options.json, so job.json is the only source and `run --job ID --no-voiceover` still switches a job.
+  - Job page text: "(fixed for this job; the Settings switch applies to new jobs)". The CLI job view always shows the mode. README and CONTRACT_WEB section 11 are updated.
+- **C6 (form sends only when changed): ACCEPTED.** app.js always sends `options.voiceover`.
+- **C2 (partial translation cached for good): ACCEPTED.** A cache entry missing ids makes the next render ask again; the lines it already had are kept (merged).
+- **C3 (`int(k)` unguarded): ACCEPTED.** `_parse_translation` ignores non-numeric ids and non-dict results. Nothing usable gives a CaptionsError.
+- **C4 (no-speech clip + hyperframes = false fallback warning): ACCEPTED.** `render_clip` renders with no captions when words.json is a valid empty list. `engine_used` is hyperframes, there is no warning, and no probe or overlay runs.
+- **C5 (zero-length / long-pause timing): ACCEPTED.**
+  - Translated words go over the spoken parts of the line only: word runs merged across pauses up to 0.6 s. Each word sits in the span that holds its middle, so nothing is shown across a pause.
+  - A line shorter than max(0.8 s, 0.25 s/word) is held into the following silence, but never into the next line or past the clip end.
+- **UX2 ("Voice 100%" for skipped): ACCEPTED.** Stage boxes and mini stages show "off" (voice-over off) or "skipped".
+- **UX3 (Audio mix fields active while off): ACCEPTED.** The under-voice, duck, voice-volume and max-speed-up fields grey out with a tooltip. The `original_volume_after` hint says it is the whole-clip level when the voice-over is off.
+- **UX4 (empty narration blocks a title save with voice-over on): ACCEPTED.**
+  - An empty narration is accepted, client and server, only when the saved script has none yet; Re-render then writes one.
+  - Emptying an existing narration is still 422.
+- **UX5 (line grouping before the next sentence): REJECTED for this change.** It is pre-existing behaviour in both modes, not part of this feature.
+- **Builder notes (synthetic-media flags, `_clean_title` quote): left as is.** They are out of scope and need a policy decision.
+
+**Tests:**
+- New file `tests/test_voiceover_lead.py` with 8 tests:
+  - fixed mode in both directions through resume and rerender
+  - legacy job = on over the web after the setting is turned off
+  - partial cache completed
+  - non-numeric ids
+  - zero-length hold and clip-end clamp
+  - long-pause skip
+  - no-speech + hyperframes
+  - empty narration save with the voice-over on
+- Updated tests that encoded the old "follows the setting" behaviour:
+  - `test_voiceover_off`: toggle via the `voiceover=` kwarg, plus checks that a Settings change does not switch an existing job.
+  - `test_web_jobs`: options.json now always has `voiceover`.
+- **Full suite: 1249 passed, 2 deselected** (`--basetemp ~/.cache/ac-novo/bt-lead`).
+
+**Real check:**
+- Setup: data copy `~/.cache/ac-novo/data-lead`, legacy job set to `voiceover:false`, the builder's cached translation copied in.
+- `rerender <job> 1 hi`: voice skipped, no LLM call (complete cache), ass engine.
+  - Final -14.2 LUFS vs cut -25.1; one AAC 48 kHz stereo stream; render.json `voiceover:false`.
+  - Frames show shaped Devanagari with the highlight.
+  - 82 words. The pauses at 3.1-3.9, 6.8-8.0, 12.3-13.2 and 26.6-28.0 s now have no caption shown over them.
+- Not checked: the web UI was not opened in a browser after these JS changes (`node --check` passes).
+- No server was started, nothing was committed, nothing was published.
+
+## Builder (voice-over mix quality + Demucs vocal separation), 2026-11-23
+
+Worktree `auto-clipper-novo` (branch `feat-no-voiceover`, on top of 1c99fd0). Nothing was committed or published. The user's server on :8765, its data dir and Voicebox were not touched; Voicebox was not called. Data copy: `~/.cache/ac-mix/data-builder`. Test server: :8781, stopped afterwards.
+
+### Demucs install + timing
+- Install: `uv venv --python 3.11 ~/tools/demucs`, then CPU torch/torchaudio 2.5.1 from download.pytorch.org/whl/cpu, then `demucs==4.0.1 soundfile` from PyPI.
+  - Size: 778 MB.
+  - The model (80 MB) goes to `~/tools/demucs/models` (TORCH_HOME).
+  - Nothing was added to PATH and no profile was changed.
+- Real separation of the user's clip 00 (38.2 s), `htdemucs`, `--two-stems vocals`, segment 7:
+  - First run, including the model download: 31.7 s.
+  - Warm runs: 22.4 s with all threads and 25.4 s with 4 threads. Peak RSS was 1.32 GB and 1.45 GB.
+  - Inside the pipeline: 24.4 s.
+- Stem loudness: cut -9.8 LUFS, vocals -10.2 LUFS, no_vocals -21.2 LUFS. Most of the bed in this video is the streamer talking.
+
+### What I built
+- **Loudness mix**:
+  - New settings: `audio.mix` "loudness" (the default) or "gain" (the old behaviour), `audio.voice_lufs` -16, `audio.background_db_below_voice` 18.
+  - `ffmpeg.measure_loudness` measures with ebur128. Each signal is measured as it is mixed: a mono voice copied to both channels is +3 dB.
+  - The voice is normalised to the target. The bed sits N dB under the voice while it speaks.
+  - Outside the narration the bed is at the voice level × `original_volume_after`. A quiet bed is boosted by at most 12 dB.
+  - The ramps and the final loudnorm + limiter are unchanged. `original_volume` is now used by the gain mix only.
+  - Old settings files load with the new defaults.
+- **Short narration**:
+  - New settings: `audio.short_voice` "trim_clip" (the default) or "keep", `short_voice_below` 0.6, `short_voice_tail` 1 s, with a 3 s minimum.
+  - When the clip is trimmed, the bed stays ducked to the end and a 0.5 s fade runs after the limiter.
+- **render.json `"audio"`** (informational, not part of staleness): mix, background, the measurements and gains, `voice_end`, `trimmed_to`, `warning`. The web detail shows it per clip-lang as `audio`. The job page shows "Audio: ...". The clip page shows Background, Mix and Final length rows.
+- **Lengthen timeout**:
+  - `voicebox.lengthen_timeout_seconds` (240, capped at `timeout_seconds`) applies to the lengthen retry only.
+  - `VoiceboxClient.synthesize/wait(timeout=)` added. It raises the public `VoiceboxTimeout` (a VoiceboxError).
+  - `make_voice` passes the timeout only to clients whose `synthesize` accepts it.
+  - A failed or timed-out lengthen adds a warning to `voice.json warnings`, for example "the lengthened voice took longer than 240s ... kept the original 10.1s voice (26% of the 38.2s clip)". It is shown in the clip warning and in `voice.warnings` in the web detail.
+- **Demucs** (`autoclipper/separation.py`):
+  - New settings section `separation.*`: background original|no_vocals (default original), python, model, segment, threads, timeout, models_dir.
+  - Runs as a subprocess.
+  - The stem is cached in `clips/NN/bed_no_vocals.wav` + `.json`, keyed by the cut's sha256 + the model, and reused across languages and re-renders.
+  - In voice-over mode with no_vocals:
+    - The stem plays under the voice.
+    - The clip's own audio returns outside the narration (crossfade with the same ramps).
+    - In a trimmed clip the stem plays to the end.
+  - Any failure falls back to the original bed with a clip warning and does not fail the render.
+  - Doctor has a `demucs` row (warn only).
+  - README has Linux and Windows install steps.
+- **Web**:
+  - All the new Settings fields have labels. The fields of the mix that is not selected are greyed out, and the separation fieldset is greyed when the voice-over is off.
+  - New endpoint `PUT /api/jobs/{id}/mode {"voiceover": bool}` (strict). It queues a run_job that carries the switch: `Task.voiceover`, `submit_resume(voiceover=)`, the worker passes `run_job(voiceover=)`.
+    - Returns 202 when it queues a run.
+    - Returns 200 no-op when the job is already in that mode and fully rendered.
+    - Returns 409 when a run in another mode is active.
+    - Returns 401/403/404/422 as usual.
+  - The job page has a Mode select (Voice-over + captions / Original audio + captions) with "Apply & re-render" and a confirm dialog.
+  - Documented in CONTRACT_WEB section 12.
+- **Title fix**: `_fix_quotes` strips quotes only when they wrap the whole title. It then removes an unbalanced `"` or a lone curly quote. `"Slipped ..." – Reagan` is kept, `Slipped ..." – Reagan` loses the stray quote, and apostrophes stay.
+
+### Tests
+- New file `tests/test_audio_mix.py` (60 tests plus 1 slow+demucs real test that passes here in 12 s).
+- conftest: Demucs's default runner raises unless a test is marked `demucs`. Marker added in pyproject.
+- Existing tests changed, intentionally, because the default behaviour changed:
+  - test_product_fixes (4 tests) and test_voice_captions_render (1 test) now pin `mix="gain", short_voice="keep"`. They test the old fixed-gain mix, which is still available.
+  - test_voicebox: the timeout error type is now `VoiceboxTimeout`.
+  - test_web_jobs: additive detail keys `audio` and `voice.warnings`.
+- Full suite: **1307 passed**, 3 deselected (`--basetemp ~/.cache/ac-mix/bt-builder`).
+
+### Real renders (copy of the user's job 20261123-123539-320812, clip 00)
+- Method: the voice and the bed were each run through the same gains/envelope as separate passes with no loudnorm, and LUFS was measured over the narration. "final" is the finished file.
+
+| run | length | voice | bed under voice | gap | final I | final narrated / after |
+|---|---|---|---|---|---|---|
+| old en (user's render) | 38.2 | -17.6* | -26.1* | 8.5 dB | -13.6 | -14.4 / **-11.5** |
+| old hi (user's render) | 38.2 | -17.5* | -25.2* | 8.3 dB | -12.9 | -14.6 / **-12.3** (28 s of loud original) |
+| (a) en, original bed | 38.25 | -16.0 | -34.0 | 18.0 dB | -14.5 | -14.3 / -15.2 |
+| (a) hi, original bed | **11.12** (trimmed) | -16.0 | -34.0 | 18.0 dB | -14.6 | -14.6 / -30.2 (fade tail) |
+| (b) en, no_vocals | 38.25 | -16.0 | -34.0 (game sound only) | 18.0 dB | -14.5 | -14.4 / -15.2 (original back) |
+| (b) hi, no_vocals | 11.12 | -16.0 | -34.0 | 18.0 dB | -14.6 | -14.6 / -35.3 |
+| (c) en/hi, original audio | 38.25 | - | - | - | -14.8 / -14.8 (cut -9.8) | - |
+
+  \* Old values were computed from the measured stereo levels with the old gains (voice ×1.0, bed ×0.15).
+- In (a) the bed under the voice is mostly the streamer's speech (vocals stem -10.2 vs no_vocals -21.2). In (b) it is game sound only.
+- Frames (`~/.cache/ac-mix/runs/frames_*.png`): en captions match the narration; hi Devanagari is shaped with the highlight and the last caption is at ~10.5 s, inside the 11.1 s clip; (c) hi has translated captions.
+- Render wall times: en 16.5 s; hi 9 s; (b) en 39.9 s including Demucs; (c) hi 23 s including one Claude translation call.
+- Web check on :8781 with the Reagan job copy:
+  - Mode → Original audio: 4/4 re-rendered (2 Claude translation calls for hi).
+  - Mode → Voice-over: 4/4 re-rendered with no Voicebox call (the voices are reused) and 2 Demucs separations.
+  - The clip page shows "Background: vocals removed (Demucs)". Its Mix row reads "background under it -45.4 LUFS": a speech-only source leaves a nearly silent stem, and the boost is capped at +12 dB.
+  - Settings shows every new field and greys the fields of the mix that is not selected.
+  - No console errors.
+
+### Notes for the lead
+- The hi voice is only 10 s for a long Hindi narration. That looks like Chatterbox truncating the take, which is a Voicebox issue. The trim makes such clips short (11 s), and they then fall below `clips.min_seconds`; only the 3 s floor is enforced.
+- Audio settings, `separation.background` included, do not mark renders stale. This is the same as before for audio. To apply them, re-render a clip or use Mode.
+- `separation.background` defaults to "original" so installs without Demucs do not get a warning on every clip. My data copy has it set to "no_vocals".
+
+## Reviewer (code + robustness: voice-over mix + Demucs), 2026-11-23
+
+Reviewed `git diff HEAD` + separation.py / test_audio_mix.py. Tests in the touched files pass (168). Verified:
+synthetic renders (mono 48k cut + 44.1k stem shorter than the cut, keep / trim_clip, stem / original) all
+produce correct durations and stereo; the user's real settings.json loads with the new defaults.
+Findings (details in the review return):
+1. Demucs subprocess is not cancellable (subprocess.run, no cancel point for up to separation.timeout_seconds);
+   on a SIGTERM'd server the child is orphaned and its demucs-* temp dir is left in clips/NN.
+2. Demucs inherits os.environ incl. ANTHROPIC_* from .env (HyperFrames strips them).
+3. PUT /mode with the job's current mode while a plain resume is queued/running returns 409 (reproduced).
+4. README says the Mode switch applies changed audio settings, but the same-mode switch is a 200 no-op.
+5. Minor: Demucs runs before render_final's input checks / even when the voice is empty; segment up to 60
+   allowed though htdemucs fails above 7; render.json reports an unused outside gain on trimmed clips.
+
+## Reviewer (listening + UX), voice-over mix quality + Demucs, 2026-11-23
+
+Full suite: 1307 passed, 3 deselected (bt-revlisten). Data copy `~/.cache/ac-mix/data-revlisten` (both jobs + the user's old-format settings.json, which loads fine). Test server :8786 (stopped). Voicebox was not called. Measurement scripts are in `~/.cache/ac-mix/rl/scripts` (momentary loudness per window, voice and background run through the render's own gains/envelope in separate passes, loudnorm gain over time, and faster-whisper ASR on the stems).
+
+### Mix measurements (builder renders and my own re-renders of clip 00)
+- **Voice vs background under the narration** (1 s windows, max momentary):
+  - a_en: median gap 18.7 dB, min 12.8 dB.
+  - b_en: median 19.6 dB, min 11.4 dB (game SFX transients).
+  - a_hi / b_hi: median 19.5 / 19.8 dB, min 12.8 / 14.9 dB.
+  - The target holds. There are no windows where the background masks the voice.
+- **Pumping:** I compared the final loudnorm gain over time with the pre-loudnorm sum. In a_en it drifts slowly from +1.0 to +2.1 dB across 38 s, with no pumping. LRA is 1.9-2.4 LU.
+- **Narration end (non-trimmed):** the final momentary stays at -13..-17 LUFS across the 0.4 s ramp. There is no loudness jump; only the content changes, back to the streamer.
+- **Trimmed ending (hi, 11.12 s):** the voice ends at 10.12 s. The background stays ducked at about -34, then the 0.5 s fade runs. The ending is clean.
+- **Peaks:** true peak is -0.9 dBTP on b_en and -1.5 to -1.9 on the others. This is above loudnorm's TP=-1.5 because `alimiter limit=0.97` is sample-peak and comes after loudnorm. The limiter is not new; it is noted here only.
+- **Residual vocals in no_vocals:**
+  - Gaming clip: faster-whisper (small) hears 156 words in cut.mp4 and **0 words** in bed_no_vocals.wav. The stem is 3-17 dB below the cut per 2 s window.
+  - Reagan clip: the stem is about -57 LUFS (near silence). ASR gives one "Thank you." hallucination, even after +12 dB. Separation quality is good.
+
+### Findings
+1. **(major, not fixed by this build) The hi narration of the user's clip 00 is a truncated Voicebox take, and its captions don't match the audio.**
+   - script.json has 115 words. voice.wav is 10.12 s, and ASR hears only about 36 words (the first 2.5 sentences).
+   - Captions get fewer than 30% alignment matches, so `align_words` falls back to `distribute_words` and spreads all 115 words over 10 s. The result is 115 ASS events of about 0.09 s each, and the captions run about 2 s ahead of the voice by 3 s in.
+   - With `trim_clip` the result is an 11 s clip with flashing, unreadable captions of text that is never spoken.
+   - The lengthen retry made this worse: it treated a truncated take as "script too short" and asked Chatterbox for even more text, which then timed out.
+   - Suggestion: detect truncation in make_voice (take duration << words / wps, e.g. < 50% of expected) and handle it separately from "too short":
+     - retry the same text once, or generate sentence by sentence and concatenate;
+     - otherwise mark the take as `trimmed` with `spoken_narration`, so the captions keep only the spoken prefix;
+     - add a voice warning.
+   - Do not lengthen a truncated take.
+2. **(UX) Existing renders made with the old mix give no hint.**
+   - Renders without render.json `audio` (all of the user's current clips, including the "messed up" 00 hi) show `render_stale: false`, with no note.
+   - Mode with the same mode returns a 200 no-op ("Every clip is already rendered in this mode").
+   - So the only way to get the new mix is per-clip Re-render. Suggestion:
+     - mark voice-over renders without `audio` as stale ("Audio mix improved - re-render to apply");
+     - or let Mode/"Apply" with the same mode offer "Re-render all clips".
+3. **(UX) Mode switch on an incomplete job is a full resume.**
+   - The user's real job is interrupted, with 1 clip failed and 8 clip-langs pending. PUT /mode (either value) queues run_job, which finishes the whole job: scripts (Claude), voices (Voicebox) and renders.
+   - The hint "Re-renders every clip made in the other mode." and the confirm text don't say that.
+   - With the same mode on an incomplete job: changed=false and 202, but the toast says "Mode changed; re-render queued." The toast ignores `changed`.
+   - The confirm reads "Switch this job to voice-over..." even when the job is already in voice-over. The Apply button is enabled when the select equals the current mode.
+   - The row text right above the selector still says "(fixed for this job; the Settings switch applies to new jobs)", which contradicts the selector.
+4. **(bug) ANSI escape codes from Demucs leak into the warning.** With segment 30 I got "Demucs failed (exit 1): \x1b[1mFATAL:\x1b[0m Cannot use a Transformer model with a longer segment ... Maximum segment is: 7.8". It shows in render.json, the API and the job-page notice. Strip `\x1b\[[0-9;]*m` in `separation._tail`.
+5. **(robustness) `separation.segment` accepts 1..60, but htdemucs fails above 7.8.**
+   - Every clip then falls back. The help text says "max 7", but neither validation nor doctor catches it.
+   - Suggestion: clamp to 7 for `htdemucs*` (or reject above 7.8 for transformer models). Doctor could also flag it.
+6. **(efficiency) A failed separation is not remembered.** The same failure was re-run per language: 4 Demucs launches for 2 clips here. With a timeout that is 2 x 900 s per clip. Cache the failure per (cut hash, model, segment) for the run, or skip the second language after a failure.
+7. **(minor) What the UI and report show:**
+   - Mix row "background under it -45.1 LUFS" (Reagan, speech-only source): the +12 dB boost cap is hit and the background is silent. Consider a flag or text such as "background nearly silent after vocal removal".
+   - A trimmed clip reports `background_gain_db_outside` (e.g. 4.5 dB) that is not applied. Null it when `trimmed_to` is set.
+   - The render-start log line says "background: vocals removed (Demucs)" even when it then falls back. The "vocals separated in Ns" progress message never reaches the log.
+8. **(minor, title fix):**
+   - `'5" screen'` becomes `'5 screen'`: an inch mark is treated as a stray quote.
+   - `'“Slipped the bonds” – Reagan”'` keeps its stray right curly quote: curly quotes are only cleaned when one side count is 0.
+   - The reported case `Slipped ...Earth" – …` is fixed.
+
+### Checked OK
+- PUT /api/jobs/{id}/mode:
+  - 422 for `{}`, `"false"`, `0`, extra key, non-JSON, `[]`, `null`, text/plain.
+  - 404 for an unknown or well-formed missing job.
+  - 401 without a token; 403 with a bad token or cross-origin; 405 for GET/POST.
+  - The clean error shape everywhere.
+  - Real round trip on the Reagan copy: to original audio (4/4) and back to voice-over (4/4, voices reused, no Voicebox).
+- Settings page: every new field is present with its range, inactive greying works, saving works, and the old settings file loads.
+- Demucs fallback on a real failure: the render completes, with the warning on the clip.
+- Doctor row OK. No console errors.
+- Clip page Background / Mix / Final length rows.
+- The trimmed user clip 00 hi with no_vocals: 11.13 s; the last caption ends at 10.12.
+
+## Lead triage + fixes + sign-off (voice-over mix quality + Demucs), 2026-11-23
+
+Data copy `~/.cache/ac-mix/data-lead` (clip 00 of the user's job 20261123-123539-320812 + the user's settings.json; the builder's cached hi caption translation copied in so no Claude call was needed). No server started, Voicebox not called, nothing committed or published.
+
+### Triage: code + robustness review
+- **1 (Demucs not cancellable, orphaned on SIGTERM): ACCEPTED.** `separation.run_cancellable` runs Demucs in its own process group (stdout/stderr to temp files), polls every 0.5 s and kills the whole tree (`hyperframes._kill_tree`) on the timeout or on anything the poll callback raises. `render_clip(cancel_check=)` <- `_Reporter.cancel_point` (only when the log function is the web worker's, which marks itself `cancel_point`; an empty line is its cancel point). Leftover `demucs-*` temp folders are removed before a new separation.
+- **2 (ANTHROPIC_* reaches Demucs/torch): ACCEPTED.** `separation._env` drops every `ANTHROPIC_*` variable (separation and the doctor check).
+- **3 (PUT /mode current mode during a plain resume = 409): ACCEPTED.** `submit_resume(voiceover=, current=)`: a running task "ends in" its own switch or, with none, the job's current mode; asking for that mode returns it (200), the other mode is 409. `put_mode` only puts a switch on the task when the mode really changes.
+- **4 (docs say Mode re-applies audio settings, but same mode is a no-op): ACCEPTED, fixed in behaviour, not only docs.** render.json now has `audio_key` (the voice-over audio settings: mix, levels, short-voice, loudnorm, `separation.background`/`model`, version 2). A voice-over render with another or no `audio_key` is stale (`render_is_current` / `render_settings_changed`), shown as "Made with an older audio mix or other audio settings - re-render to apply" (`audio_stale` in the detail). Same-mode **Apply & re-render** then queues a plain resume that re-renders exactly the out-of-date clips (render only; narration/voice reused). This also covers listening finding 2.
+  - Consequence, intended: every existing voice-over final (made with the old 0.15-gain mix, including legacy finals without render.json) is stale, so a resume re-renders it once. Voice-over-off renders do not compare `audio_key`. Tests that encoded "legacy final = current" were updated with the reason (test_step3_integration x2, test_voiceover_lead, test_web_step3 stamp helper, test_audio_mix no-op).
+- **5 (Demucs before input checks / with no voice): ACCEPTED.** `_background` skips separation when voice.wav is missing or its speech end is 0.
+- **6 (segment up to 60 but htdemucs fails > 7.8): ACCEPTED.** Settings validation: `htdemucs*` models allow at most 7 (422 in Settings / settings error); other models keep 1..60. `effective_segment` also caps at runtime.
+- **7 (outside gain reported on trimmed clips): ACCEPTED.** `background_gain_db_outside` is null when `trimmed_to` is set.
+- **8 (old titles keep the stray quote): ACCEPTED (cheap).** `write_metadata` applies `fix_title_quotes`, so metadata.json (and publishing) is clean after any render or resume; script.json is cleaned on its next save.
+
+### Triage: listening + UX review
+- **1 (truncated hi take, captions flash 115 words over 10 s): ACCEPTED.**
+  - `make_voice(wps=)`: a take under 0.5 x words / `script.wps_<lang>` was cut short by the TTS. The same text is generated once more and the longer take kept. Still cut short -> `voice.json truncated: true`, `spoken_narration` = the estimated spoken prefix, a warning, and **no lengthen**.
+  - Captions: a truncated take captions only the spoken prefix (as a trimmed take). For voices made before this check (the user's clip 00 hi), `make_captions` detects the same condition from the voice length and does the same.
+  - Real result below: hi captions now cover ~34 words over the 10 s voice instead of 115.
+- **2 (old renders give no hint; same-mode Apply is a no-op): ACCEPTED**, see code 4.
+- **3 (Mode switch UX): ACCEPTED.**
+  - Confirm text says when the job is unfinished that its remaining steps (scripts, voices, renders) run too, and has a separate same-mode text ("re-render the clips that are out of date").
+  - The toast follows `changed` and the status.
+  - The button is disabled when the same mode is selected and nothing is out of date or unfinished. The hint updates with the select.
+  - The "(fixed for this job ...)" label now points at the Mode row.
+- **4 (ANSI codes in the warning): ACCEPTED.** `_tail` strips escape sequences and progress-bar carriage returns.
+- **5 (segment): ACCEPTED**, see code 6.
+- **6 (failed separation re-run per language): ACCEPTED.** The failure is remembered in the run's `hf_env_cache` per (cut, model, segment, python); the other language gets "...; not retried for this language". A new run/re-render tries again.
+- **7 (report/log details): ACCEPTED.** `background_note` ("nearly silent after vocal removal (the clip is mostly speech)" when the stem is unmeasurable or the +12 dB cap is hit), shown in the job and clip pages. The render start line says "removing vocals"; after the render a line says what actually happened ("background: vocals removed (Demucs, separated in 24s / cached stem)") and the fallback warning otherwise. `separation_seconds` / `separation_cached` in render.json audio.
+- **8 (title: inch marks, stray curly quote): ACCEPTED.** A `"` after a digit followed by a space/punctuation/end is an inch mark and is kept; curly quotes are paired left-to-right and unpaired ones dropped.
+
+### Bug found while fixing
+- `separation.no_vocals_bed` would have shadowed its new `info` argument with the ffprobe result. Caught by the new timing test before any real run.
+
+### Defaults (unchanged from the builder unless noted)
+- `audio.mix=loudness`, `voice_lufs=-16`, `background_db_below_voice=18`, `short_voice=trim_clip` (below 0.6, tail 1 s, 3 s floor), `voicebox.lengthen_timeout_seconds=240`.
+- `separation.background=original`: Demucs is an optional 780 MB install, and as the default every install without it would warn on every clip. The user turns it on in Settings.
+- `htdemucs`, segment 7, 4 threads, timeout 900 s.
+- New: truncation threshold 0.5 (constant `voice.TRUNCATED_BELOW`).
+
+### Tests
+- New file `tests/test_mix_lead.py` with 24 tests:
+  - cancel/timeout kill of a real child process, and cancel propagating through render_clip with temp cleanup
+  - stale temp removal, env secrets, ANSI tail
+  - segment validation (model + API 422)
+  - failure memo across languages, no separation without a voice, timing fields
+  - trimmed-clip report and quiet-stem note
+  - audio_key staleness matrix and old-title metadata clean-up
+  - inch/curly title cases
+  - cut-short retry recovers / truncated twice (no lengthen, prefix captions) / old voices get prefix captions
+  - PUT /mode current mode during a plain resume (200, no side effect) and other mode (409)
+  - same-mode Apply on old-mix renders queues a resume (202, `changed:false`, `audio_stale` true)
+- Tests updated on purpose: the two test_audio_mix pipeline fakes now speak at a realistic rate (0.2-0.25 s/word; 0.1 s/word is now "cut short"), plus the staleness tests listed above and the detail key lists (`audio_stale`, `voice.truncated`).
+- One more fix after the real render (below): with a cut-short take the captions end before the audio does (the hi voice talks until 9.9 s, the last aligned word ends at 9.1 s). The short-narration trim and its fade now follow the voice's own speech end when that is later (`render_final`), so the trim never fades over speech. Test `test_trim_never_cuts_speech_after_the_last_caption_word`.
+- **Full suite: 1332 passed, 3 deselected** (`--basetemp ~/.cache/ac-mix/bt-lead`). The real-Demucs test (`-m demucs`) also passes (20 s).
+
+### Real compare renders (copy of the user's clip 00, finals in `~/.cache/ac-mix/compare/{en,hi}/*.mp4`)
+- Settings: the user's settings.json plus the new defaults. For `voiceover_novocals` only `separation.background=no_vocals` was changed; for `original` the job copy's `voiceover` was set to false.
+- Voice and bed levels are measured by the render itself, before the final loudnorm. "after" is the final file after the narration.
+
+| variant | length | voice | bed under voice | gap | final I / TP | final narrated / after |
+|---|---|---|---|---|---|---|
+| en voiceover_original | 38.25 | -16.0 | -34.0 (streamer's speech + game) | 18.0 dB | -14.5 / -1.5 dBTP | -14.3 / -15.2 |
+| en voiceover_novocals | 38.25 | -16.0 | -34.0 (game only) | 18.0 dB | -14.5 / **-0.4 dBTP** | -14.3 / -15.2 (original audio back) |
+| en original | 38.25 | - | - | - | -14.8 / -4.3 | - |
+| hi voiceover_original | 11.13 (trimmed) | -16.0 | -34.0 | 18.0 dB | -14.6 / -1.9 | -14.6 / -30.2 (fade) |
+| hi voiceover_novocals | 11.13 (trimmed) | -16.0 | -34.0 | 18.0 dB | -14.6 / -1.7 | -14.6 / -35.5 (fade) |
+| hi original | 38.25 | - | - | - | -14.8 / -4.3 | - |
+
+- Old user render for comparison (builder's numbers): about an 8.5 dB gap, with 28 s of loud original audio after the 10 s hi voice.
+- Captions:
+  - hi voice-over: 32 words over the 10.1 s voice, minimum word 0.10 s. Before this fix it was 115 words at about 0.09 s each, drifting about 2 s ahead.
+  - The last caption is at 9.1 s, while the voice speaks until 9.9 s: those last words could not be aligned.
+  - en voice-over: 104 words to 31.2 s.
+  - The original-audio variants have 157 (en) and 171 (hi) words to 38.2 s.
+- Timings, first run (fresh Demucs):
+  - en: 16.2 s with the original bed, 42.6 s with no_vocals (Demucs 26 s).
+  - hi: 10.8 s, and 9.6 s reusing the cached stem.
+  - original audio: 9.6 s (en) and 9.3 s (hi); the hi translation came from the cache, so there was no Claude call.
+  - The second run, after the trim fix, took 15-29 s per render on a busier machine.
+
+### Sign-off: APPROVED (not committed)
+Remaining issues, none blocking:
+1. **True peak.** `en voiceover_novocals` is at -0.4 dBTP. `alimiter limit=0.97` is sample-peak and runs after loudnorm (TP=-1.5). This is pre-existing and hits every mode. Follow-up: an oversampled or lower-ceiling limiter, which needs its own tests because it changes every render's level.
+2. **The hi voice of clip 00 is still the cut-short 10 s Voicebox take.** This build captions it correctly and trims the clip. A real re-generation (the retry path) was not run against Voicebox here. The user can re-render the clip after shortening the narration, or delete voice.wav to regenerate it; the retry then happens automatically.
+3. **Resume re-renders old finals.** Every voice-over final made before this build is now "re-render to apply" (old mix), and a resume re-renders it once (render only, about 10-45 s per clip-language). This is intended and documented.
+4. **The Mode/stale UI changes were not clicked through in a browser this round.** `node --check` passes; the API is covered by tests.
+5. **Truncation can be misjudged.** It is judged from `script.wps_*`. An unusually fast speaker (over 2x the configured rate) would be treated as cut short: one extra generation, and prefix captions.

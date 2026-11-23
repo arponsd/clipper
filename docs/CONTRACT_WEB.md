@@ -548,3 +548,94 @@ These are part of the contract now. Tests: `tests/test_web_review_fixes.py` plus
   a new or regenerated script may be lengthened, but a resume never rewrites a narration the user edited.
   `rerender` never lengthens.
 
+
+## 11. Voice-over on/off ("captions only"), additive (feature builder, 2026-11-23)
+
+- **Setting** `voiceover: bool = true` (top level of `Settings`, shown in Settings > General as "Voice-over
+  narration"). `PUT /api/settings` is strict: a non-boolean is 422 `errors.voiceover`.
+- **Job model** `Job.voiceover: bool | None = None` in job.json: the job's mode, fixed at creation (the
+  setting at that moment unless overridden). None = a job made before the option existed = **on** (lead fix:
+  a Settings change never switches an existing job). Effective mode = `pipeline.job_voiceover(job)`;
+  `pipeline.settings_for_job` gives settings with it.
+- **POST /api/jobs** `options.voiceover: bool | null` (strict; `"false"`/`1` -> 422 `errors.options.voiceover`).
+  null = the current setting. The resolved bool is written to `options.json`, to `job.json` at creation, and
+  passed to `run_job(..., voiceover=...)` by the worker. The web form always sends the checkbox value.
+  CLI `run` (new job, no flag) stores the setting in job.json the same way.
+- **GET /api/jobs/{id}** adds `voiceover: bool` (effective) and `voiceover_override: bool | null` (job.json's
+  raw value; null only for legacy jobs); every
+  clip-lang adds `voiceover: bool` (effective) and `rendered_voiceover: bool | null` (from render.json; null
+  without a final). `render_stale` is also true when the two differ.
+- **PUT .../script**: an empty narration is accepted (200) when the job's voice-over is off, or when the saved
+  script has no narration yet (re-render writes one); otherwise 422 `errors.narration` as before. `voice_stale` (web and publish) is false for a final rendered without voice.
+- **Pipeline, voice-over off:** script = `write_metadata_script` (LLM `write_publish_metadata`, narration "");
+  voice stage `skipped` / message `voice-over off` (no Voicebox client is built); captions =
+  `stages/original_captions.make_original_captions` (Whisper words re-based, or LLM `translate_segments` per
+  clip-lang cached in `caption_translation.json`), stamp `captions.json` `{"voiceover": false, "source": ...}`;
+  render has no voice input (original at `audio.original_volume_after`, loudnorm + limiter); render.json gets
+  `"voiceover": false` (absent = on, so every older render stays current).
+- **Staleness:** captions are redone when `captions.json`'s mode differs from the effective mode (absent stamp
+  = voice-over); the render when render.json's mode differs. Turning the voice-over on for a script with an
+  empty narration writes one (`add_narration`, title/description/hashtags kept). voice.wav is never deleted by
+  a mode switch, so switching back reuses a matching voice.
+
+## 12. Voice-over mix quality, vocal separation and the job Mode switch, additive (builder, 2026-11-23)
+
+- **Settings (all additive, old settings.json files load with the defaults):**
+  - `audio.mix: "loudness" | "gain" = "loudness"`, `audio.voice_lufs = -16` (-30..-8),
+    `audio.background_db_below_voice = 18` (0..40). `audio.original_volume` is used only by `"gain"`;
+    `audio.original_volume_after` is relative to the voice in `"loudness"` (1 = as loud as the voice).
+  - `audio.short_voice: "trim_clip" | "keep" = "trim_clip"`, `audio.short_voice_below = 0.6` (0.1..0.95),
+    `audio.short_voice_tail = 1.0` (0..5 s).
+  - `voicebox.lengthen_timeout_seconds = 240` (10..7200; capped at `voicebox.timeout_seconds`).
+  - `separation: {background: "original" | "no_vocals" = "original", python = "~/tools/demucs/bin/python",
+    model = "htdemucs" (1-64 of `[A-Za-z0-9_-]`), segment = 7 (1..60; at most 7 when model starts with
+    "htdemucs": 422 / settings error otherwise), threads = 4 (0..64),
+    timeout_seconds = 900 (30..7200), models_dir = "~/tools/demucs/models"}`. Paths: <= 500 chars, no NUL/CR/LF.
+- **Render (voice-over on):** `render_final(..., bed=, report=)` measures (ebur128, `ffmpeg.measure_loudness`) the
+  voice up to its speech end and the background (under the voice and whole clip) as they are mixed (mono
+  copied to stereo), then uses `loudness_gains` in the same `duck_envelope` graph; `"gain"` builds the
+  step-2 graph unchanged. A narration ending before `short_voice_below` x clip with `trim_clip` -> `-t` =
+  max(voice end + tail, 3 s), background held at the under-voice level, 0.5 s fade after the limiter.
+- **Separation:** `autoclipper/separation.py` runs `<separation.python> -m demucs.separate -n <model>
+  --two-stems vocals -d cpu --segment N -j 1` on a 44.1 kHz stereo wav (subprocess, env `TORCH_HOME`,
+  `OMP/MKL_NUM_THREADS`), caches `clips/NN/bed_no_vocals.wav` + `.json` keyed by `cut_sha256` + `model`.
+  Any failure -> the original background and `RenderOutcome.audio_warning`
+  ("vocal separation failed (...); used the original audio as the background").
+- **render.json** adds `"audio"`: `mix` ("loudness" | "gain" | "original" = no voice), `background`
+  ("original" | "no_vocals" | "none"), `clip_duration`, `duration`, `voice_end`, `trimmed_to`, `trim_reason`,
+  `voice_lufs`, `background_lufs_under_voice`, `background_lufs`, `voice_gain_db`,
+  `background_gain_db_under_voice`, `background_gain_db_outside` (null when the clip is trimmed: there is no
+  "outside"), `background_note` (e.g. "nearly silent after vocal removal ..."), `separation_seconds`,
+  `separation_cached`, `warning`. Informational.
+- **render.json `audio_key`** (lead triage): the voice-over audio settings the render used (mix, levels,
+  short-voice, loudnorm, `separation.background`/`model`, version 2). `render_is_current` /
+  `render_settings_changed` treat a voice-over render with another or no `audio_key` (every final from before
+  this build, including legacy finals without render.json) as stale; voice-over-off renders do not compare it.
+- **Demucs process**: own process group, polled every 0.5 s; `render_clip(cancel_check=)` (the web worker's
+  cancel point) and the timeout kill the whole tree. `ANTHROPIC_*` env vars are removed. Stale `demucs-*`
+  temp folders are removed. A failure is remembered for the run (`hf_env_cache`) so the other language does
+  not run the same failing separation ("...; not retried for this language"). No separation without a voice.
+- **voice.json** adds `truncated: bool` (Voicebox stopped early: take < 0.5 x words / wps after one retry of
+  the same text; `spoken_narration` = the estimated spoken prefix; never lengthened; a warning).
+- **voice.json** adds `warnings: list[str]` (e.g. the lengthen retry timed out / failed; first take kept).
+  `ClipLangState.warning` after a render = the HyperFrames fallback, the separation warning and the voice
+  warnings joined with "; ".
+- **GET /api/jobs/{id}**: every clip-lang adds `audio: dict | null` (render.json "audio", the keys above,
+  null without a final) and `audio_stale: bool` (a voice-over final with another/no audio_key; render_stale is
+  then true too); `voice` adds `warnings: list[str]` and `truncated: bool`.
+- **PUT /api/jobs/{id}/mode** body `{"voiceover": bool}` (strict, extra keys forbidden). Auth like every
+  `/api` route (401 no token, 403 bad token / host / cross-origin). 404 unknown job, 422 invalid body.
+  - The mode is the same and every clip-lang has a final rendered in it that is not stale
+    (`render_settings_changed` with the job's settings, so audio_key included), no run active -> **200**
+    `{"job": <summary>, "voiceover": bool, "changed": false, "task": null}`.
+  - The mode is the same but some final is missing or stale -> a plain resume (task `voiceover` null) is
+    queued -> **202** with `changed: false` (the "re-render all out-of-date clips" action).
+  - Otherwise a `run_job` task carrying `voiceover` is queued (`Worker.submit_resume(job_id, voiceover=)`;
+    the worker passes `run_job(..., voiceover=)`, which stores it in job.json, then the normal resume
+    redoes captions + render of every clip-lang made in the other mode, writing narrations / voices when
+    turning the voice-over on) -> **202** `{"job", "voiceover", "changed": <mode differs>, "task": <task>}`.
+  - A run of the job already queued/running that ends in the asked mode (its own switch, or none = the
+    job's current mode) -> 200 with that task; one ending in the other mode -> **409**. A live CLI owner ->
+    409 (as resume).
+  - The job page shows a Mode select ("Voice-over + captions" / "Original audio + captions") with
+    "Apply & re-render" (confirm dialog); the clip page shows Background / Mix / Final length rows.

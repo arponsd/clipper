@@ -51,9 +51,10 @@ class JobStore:
 
     # ---- lifecycle -------------------------------------------------------
     @classmethod
-    def create(cls, source: str) -> "JobStore":
+    def create(cls, source: str, *, voiceover: bool | None = None) -> "JobStore":
+        """A brand-new job; ``voiceover`` is the job's fixed voice-over mode (None = decided by run_job)."""
         job_id = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
-        job = Job(id=job_id, source=source, created_at=time.time(),
+        job = Job(id=job_id, source=source, created_at=time.time(), voiceover=voiceover,
                   stages={s: StageState() for s in JOB_STAGES})
         store = cls(job)
         store.save()

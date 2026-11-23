@@ -85,6 +85,8 @@ class JobOptionsIn(BaseModel):
     min_seconds: float | None = Field(None, ge=5, le=180, allow_inf_nan=False)
     max_seconds: float | None = Field(None, ge=10, le=180, allow_inf_nan=False)
     langs: list[Literal["en", "hi"]] | None = Field(None, min_length=1, max_length=2)
+    # Voice-over for this job; None = the `voiceover` setting. False = captions only (original audio).
+    voiceover: bool | None = None
 
     @field_validator("langs")
     @classmethod
@@ -111,9 +113,8 @@ class ClipScriptIn(BaseModel):
     @field_validator("narration")
     @classmethod
     def _narration(cls, v: str) -> str:
+        # Emptiness is checked by the route: an empty narration is fine when the job's voice-over is off.
         n = len(v.strip())
-        if n == 0:
-            raise ValueError("narration must not be empty")
         if n > 5000:
             raise ValueError("narration must be at most 5000 characters")
         return v
@@ -140,6 +141,13 @@ class ClipScriptIn(BaseModel):
 # ---------------------------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------------------------
+class JobModeIn(BaseModel):
+    """PUT /api/jobs/{id}/mode: the job's voice-over mode (true = voice-over + captions, false = original
+    audio + captions)."""
+    model_config = ConfigDict(extra="forbid", strict=True)
+    voiceover: bool
+
+
 def _web_settings(settings: Settings) -> tuple[int, list[str]]:
     web = getattr(settings, "web", None)
     mb = getattr(web, "max_upload_mb", DEFAULT_MAX_UPLOAD_MB) if web is not None else DEFAULT_MAX_UPLOAD_MB
@@ -195,14 +203,36 @@ def _clip_dir(job_id: str, clip: int, lang: str | None = None) -> Path:
 
 
 def _voice_stale(out_dir: Path, narration: str | None) -> bool:
+    from ..stages.render import read_render_stamp, rendered_voiceover
     from ..stages.voice import narration_hash
 
     if narration is None:
         return False
+    if _nonempty_file(out_dir / "final.mp4") and not rendered_voiceover(read_render_stamp(out_dir)):
+        return False  # final.mp4 has no voice-over: the narration text is not in it
     voice = _read_json(out_dir / "voice.json")
     if not isinstance(voice, dict) or not voice.get("narration_hash"):
         return False
     return voice["narration_hash"] != narration_hash(narration)
+
+
+def _saved_narration(out_dir: Path) -> str:
+    data = _read_json(out_dir / "script.json")
+    n = data.get("narration") if isinstance(data, dict) else None
+    return n if isinstance(n, str) else ""
+
+
+def _job_settings(job: Job, settings: Settings | None) -> Settings | None:
+    from ..pipeline import settings_for_job
+
+    return settings_for_job(job, settings) if settings is not None else None
+
+
+def _job_voiceover(job: Job, settings: Settings | None) -> bool:
+    """The job's voice-over mode, fixed in job.json at creation (pipeline.job_voiceover; legacy = on)."""
+    from ..pipeline import job_voiceover
+
+    return job_voiceover(job, settings)
 
 
 def _render_info(out_dir: Path, final: bool, settings: Settings | None) -> tuple[str | None, str | None, bool]:
@@ -216,6 +246,35 @@ def _render_info(out_dir: Path, final: bool, settings: Settings | None) -> tuple
     style = stamp.get("style") if engine == "hyperframes" and isinstance(stamp.get("style"), str) else None
     stale = settings is not None and render_settings_changed(out_dir, settings)
     return engine, style, bool(stale)
+
+
+def _rendered_voiceover(out_dir: Path) -> bool:
+    from ..stages.render import read_render_stamp, rendered_voiceover
+
+    return rendered_voiceover(read_render_stamp(out_dir))
+
+
+_AUDIO_KEYS = ("mix", "background", "background_outside", "background_note", "separation_seconds",
+               "separation_cached", "clip_duration", "duration", "voice_end", "trimmed_to", "trim_reason",
+               "voice_lufs", "background_lufs_under_voice", "background_lufs", "voice_gain_db",
+               "background_gain_db_under_voice", "background_gain_db_outside", "warning")
+
+
+def _audio_stale(out_dir: Path, settings: Settings) -> bool:
+    """A voice-over final made with an older mix or other audio settings (render.json audio_key)."""
+    from ..stages.render import audio_settings_changed, read_render_stamp
+
+    return audio_settings_changed(read_render_stamp(out_dir), settings)
+
+
+def _render_audio(out_dir: Path) -> dict | None:
+    """render.json "audio" (what the mix did: background, loudness, trim), known keys only."""
+    from ..stages.render import read_render_stamp
+
+    audio = read_render_stamp(out_dir).get("audio")
+    if not isinstance(audio, dict):
+        return None
+    return {k: audio.get(k) for k in _AUDIO_KEYS}
 
 
 def _read_script(path: Path) -> ClipScript | None:
@@ -289,6 +348,9 @@ class App:
             settings: Settings | None = self.settings_loader()
         except (ValidationError, ValueError, OSError):
             settings = None  # a broken settings.json must not break the job page
+        d["voiceover"] = _job_voiceover(job, settings)
+        d["voiceover_override"] = job.voiceover
+        settings = _job_settings(job, settings)
         clips = []
         for c in job.clips:
             cdir = _clip_dir(job.id, c.index)
@@ -308,11 +370,14 @@ class App:
                     voice = {"duration": voice.get("final_duration"), "clip_duration": voice.get("clip_duration"),
                              "tempo": voice.get("tempo"), "shortened": bool(voice.get("shortened", False)),
                              "trimmed": bool(voice.get("trimmed", False)),
-                             "lengthened": bool(voice.get("lengthened", False))}
+                             "lengthened": bool(voice.get("lengthened", False)),
+                             "truncated": bool(voice.get("truncated", False)),
+                             "warnings": [str(w) for w in voice.get("warnings") or [] if isinstance(w, str)]}
                 else:
                     voice = None
                 base = f"/api/jobs/{job.id}/clips/{c.index}/{lang}"
                 caption_engine, caption_style, render_stale = _render_info(out, final, settings)
+                rendered_vo = _rendered_voiceover(out) if final else None
                 langs[lang] = {
                     "stages": _stage_dict(st.stages, list(CLIP_STAGES)),
                     "error": st.error,
@@ -327,6 +392,10 @@ class App:
                     "caption_engine": caption_engine,
                     "caption_style": caption_style,
                     "render_stale": render_stale,
+                    "voiceover": d["voiceover"],
+                    "rendered_voiceover": rendered_vo,
+                    "audio": _render_audio(out) if final else None,
+                    "audio_stale": bool(final and settings is not None and _audio_stale(out, settings)),
                     "task": self.worker.task_dict(self.worker.active_task_for(job.id, c.index, lang)),
                 }
             m = c.moment
@@ -653,8 +722,11 @@ def create_app(*, worker: Worker | None = None, settings_loader: Callable[[], Se
                 if job is not None:
                     return JSONResponse(state.summary(job), status_code=200)
                 store.pop(key, None)  # the job is gone: treat the key as fresh
+            vo = o.voiceover
+            if vo is None:  # fix the job's mode now: a later Settings change must not switch this job
+                vo = state.load_settings().voiceover
             options = JobOptions(clips=o.clips, min_seconds=o.min_seconds, max_seconds=o.max_seconds,
-                                 langs=list(o.langs) if o.langs is not None else None)
+                                 langs=list(o.langs) if o.langs is not None else None, voiceover=vo)
             if body.upload_id is not None:
                 found = _find_upload(body.upload_id)
                 if found is None:
@@ -734,6 +806,46 @@ def create_app(*, worker: Worker | None = None, settings_loader: Callable[[], Se
         return JSONResponse({"job": state.summary(_load_job(job_id)), "task": state.worker.task_dict(task)},
                             status_code=202 if created else 200)
 
+    @app.put("/api/jobs/{job_id}/mode")
+    def put_mode(job_id: JobId, body: Annotated[JobModeIn, Body()]) -> JSONResponse:
+        """Switch a job between voice-over + captions and original audio + captions, and queue a run that
+        re-renders every clip-language made in the other mode (CONTRACT_WEB section 12)."""
+        from ..stages.render import render_settings_changed
+
+        job = _load_job(job_id)
+        try:
+            settings: Settings | None = state.settings_loader()
+        except (ValidationError, ValueError, OSError):
+            settings = None
+        current = _job_voiceover(job, settings)
+        want = body.voiceover
+        active = state.worker.active_run_job(job_id)
+        target = _job_settings(job, settings)
+        if target is not None:
+            target = target.model_copy(update={"voiceover": want})
+
+        def up_to_date(out: Path) -> bool:
+            # rendered in that mode and with the current audio/caption settings (else: re-rendered)
+            if not _nonempty_file(out / "final.mp4") or _rendered_voiceover(out) != want:
+                return False
+            return target is None or not render_settings_changed(out, target)
+
+        if active is None and current == want and job.clips and all(
+                up_to_date(_clip_dir(job_id, c.index, lang)) for c in job.clips for lang in c.langs):
+            return JSONResponse({"job": state.summary(job), "voiceover": want, "changed": False, "task": None},
+                                status_code=200)
+        if active is None:
+            _check_no_other_owner(state.worker, job_id)
+        try:
+            # the task carries the switch only when it is one; a run already queued in the job's current mode
+            # is the answer to "same mode" (no 409)
+            task, created = state.worker.submit_resume(job_id, voiceover=want if want != current else None,
+                                                       current=current)
+        except WorkerConflict as e:
+            raise APIError(409, str(e))
+        return JSONResponse({"job": state.summary(_load_job(job_id)), "voiceover": want, "changed": current != want,
+                             "task": state.worker.task_dict(task)}, status_code=202 if created else 200)
+
     # ---- clip review ------------------------------------------------------------------------
     @app.get("/api/jobs/{job_id}/clips/{clip}/{lang}/script")
     def get_script(job_id: JobId, clip: ClipNo, lang: Lang) -> dict:
@@ -754,6 +866,15 @@ def create_app(*, worker: Worker | None = None, settings_loader: Callable[[], Se
 
         job = _load_job(job_id)
         _clip_lang(job, clip, lang)
+        if not body.narration.strip():
+            try:
+                vo = _job_voiceover(job, state.load_settings())
+            except APIError:
+                vo = True
+            # With the voice-over off (captions only) the narration is not used and may be empty. With it
+            # on, an empty narration is kept only if none was written yet (Re-render then writes one).
+            if vo and _saved_narration(_clip_dir(job_id, clip, lang)).strip():
+                raise APIError(422, VALIDATION_FAILED, {"narration": ["narration must not be empty"]})
         out = _clip_dir(job_id, clip, lang)
         script = normalize_script(ClipScript(narration=body.narration, title=body.title,
                                              description=body.description, hashtags=list(body.hashtags)))

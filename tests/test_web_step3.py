@@ -16,6 +16,10 @@ from autoclipper.web.auth import TOKEN_HEADER
 
 
 def _stamp(store: JobStore, clip: int, lang: str, **data) -> None:
+    from autoclipper.config import Settings
+    from autoclipper.stages.render import audio_key
+
+    data.setdefault("audio_key", audio_key(Settings()))  # made with the current voice-over mix
     (store.clip_dir(clip, lang) / "render.json").write_text(json.dumps(data), encoding="utf-8")
 
 
@@ -49,8 +53,9 @@ def test_clip_detail_caption_fields_three_cases(api):
                     {"warning": (str, type(None)), "caption_engine": (str, type(None)),
                      "caption_style": (str, type(None)), "render_stale": bool})
     en, hi = langs["en"], langs["hi"]
-    # 1. no stamp, engine ass: an ASS render, current
-    assert en["warning"] is None and en["caption_engine"] == "ass" and en["render_stale"] is False
+    # 1. no stamp, engine ass: an ASS render; stale only because it was made with the old voice-over mix
+    assert en["warning"] is None and en["caption_engine"] == "ass"
+    assert en["render_stale"] is True and en["audio_stale"] is True
     # 2. fallback stamp: engine used ass, warning shown
     assert hi["warning"].startswith("HyperFrames captions failed") and hi["caption_engine"] == "ass"
     assert hi["render_stale"] is True  # the stamp's caption_engine (hyperframes) differs from the setting (ass)

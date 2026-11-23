@@ -69,7 +69,8 @@ class VoiceboxAPI(Protocol):
 
     def synthesize(self, text: str, *, profile_id: str, language: str, engine: str,
                    dst: Path, on_progress: ProgressFn | None = None) -> Path:
-        """generate -> poll history until completed -> download audio bytes to dst. Returns dst."""
+        """generate -> poll history until completed -> download audio bytes to dst. Returns dst.
+        A client may also accept ``timeout=`` (seconds) for one call; make_voice passes it only then."""
         ...
 
 
@@ -78,4 +79,19 @@ class Transcriber(Protocol):
     def transcribe(self, audio: Path, language: str | None = None,
                    on_progress: ProgressFn | None = None) -> Transcript:
         """Word-timestamped transcript. language=None -> auto-detect."""
+        ...
+
+
+@runtime_checkable
+class CaptionsOnlyLLM(Protocol):
+    """Optional LLM capabilities for voice-over off (captions only). Not part of LLM so older fakes and
+    clients stay valid; callers use getattr(llm, ..., None) and fall back when they are missing."""
+
+    def write_publish_metadata(self, *, lang: str, clip_transcript: str, moment: Moment,
+                               duration: float) -> ClipScript:
+        """Title/description/hashtags in `lang` for a clip posted with its original audio (narration "")."""
+        ...
+
+    def translate_segments(self, *, lang: str, source_lang: str, segments: list[dict]) -> dict[int, str]:
+        """Translate caption lines [{"id": int, "text": str}] into `lang`; returns {id: translated text}."""
         ...

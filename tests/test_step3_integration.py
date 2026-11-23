@@ -251,13 +251,16 @@ def test_render_key_stamp_and_is_current(media: dict) -> None:
     assert render_key(hfs) == {"caption_engine": "hyperframes", "style": "pop", "format": "webm", "fps": None}
     assert not render_is_current(out, ass)  # no final.mp4
     (out / "final.mp4").write_bytes(b"x")
-    assert render_is_current(out, ass)  # legacy final without render.json = ASS
+    # legacy final without render.json = ASS, made with the pre-loudness voice-over mix: stale since the
+    # loudness mix (render.json audio_key, lead triage of the mix review)
+    assert not render_is_current(out, ass)
     assert not render_is_current(out, hfs)
     write_render_stamp(out, hfs, render.RenderOutcome(path=out / "final.mp4", engine_used="hyperframes",
                                                       warning=None, hf_version="0.9.52", fps=25))
     stamp = json.loads((out / "render.json").read_text(encoding="utf-8"))
     assert stamp == {"caption_engine": "hyperframes", "style": "pop", "format": "webm", "fps": None,
-                     "engine_used": "hyperframes", "warning": None, "hf_version": "0.9.52", "resolved_fps": 25}
+                     "engine_used": "hyperframes", "warning": None, "hf_version": "0.9.52", "resolved_fps": 25,
+                     "audio_key": render.audio_key(hfs)}
     assert render_is_current(out, hfs) and not render_is_current(out, ass)
     hfs.hyperframes.style = "karaoke"
     assert not render_is_current(out, hfs)
@@ -274,7 +277,7 @@ def test_render_key_stamp_and_is_current(media: dict) -> None:
     write_render_stamp(out, hfs, render.RenderOutcome(path=out / "final.mp4", engine_used="ass", warning="w"))
     assert not render_is_current(out, hfs)
     (out / "render.json").write_text("{corrupt", encoding="utf-8")
-    assert render_is_current(out, ass)  # unreadable stamp = legacy ASS
+    assert not render_is_current(out, ass)  # unreadable stamp = legacy ASS render with the old mix: stale
 
 
 # --------------------------------------------------------------------------------------------- pipeline
@@ -424,7 +427,9 @@ def test_failed_or_cancelled_render_does_not_leave_a_stampless_final(video: Path
         assert render_is_current(o, _settings("ass"))
 
 
-def test_legacy_final_without_stamp_is_not_rerendered(video: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_legacy_final_without_stamp_is_rerendered_once(video: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A step-2 final (no render.json) was made with the old voice-over mix: a resume re-renders it once
+    (render.json audio_key), then it is current."""
     c = Counting()
     store = run_job(str(video), settings=_settings("ass"), deps=c.deps(), langs=["en"], log=lambda _m: None)
     for idx, lang, _ in _states(store):
@@ -432,6 +437,9 @@ def test_legacy_final_without_stamp_is_not_rerendered(video: Path, monkeypatch: 
     calls = []
     real = render.render_clip
     monkeypatch.setattr(render, "render_clip", lambda **kw: calls.append(1) or real(**kw))
+    run_job("", settings=_settings("ass"), deps=c.deps(), job_id=store.job.id, langs=["en"], log=lambda _m: None)
+    assert calls and len(calls) == len(list(_states(store)))
+    calls.clear()
     run_job("", settings=_settings("ass"), deps=c.deps(), job_id=store.job.id, langs=["en"], log=lambda _m: None)
     assert calls == []
 
