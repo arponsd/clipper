@@ -486,3 +486,152 @@ step-by-step credential setup with Windows (PowerShell paths `%USERPROFILE%`) an
    `tests/publish_fakes.py` FIRST; note "interface ready" in TEAM_LOG. 2. In parallel: core clients/runner/
    worker/CLI; web routes/UI/README against the stubs. 3. Each runs its own tests with the TMPDIR/basetemp
    command; full suite green before sign-off. 4. Lead review.
+
+## 15. G6 scheduled publishing (team B, branch `feat/publish-schedule-covers`)
+
+### 15.1 Researched APIs (official docs, read 2026-11-23)
+- **YouTube** `videos` resource (developers.google.com/youtube/v3/docs/videos): `status.publishAt` = "the date
+  and time when the video is scheduled to publish", ISO 8601; it "can be set only if the privacy status of
+  the video is private", only on a video that was never published; a time in the past publishes right away.
+  So native YouTube scheduling = `videos.insert` with `status.privacyStatus=private` +
+  `status.publishAt=<UTC ISO>`, and YouTube switches it to **public** at that time. Not possible for a
+  scheduled unlisted/private post: those are uploaded by the app at the time.
+- **Facebook Reels** (developers.facebook.com/docs/video-api/guides/reels-publishing): finish step
+  `POST /{page-id}/video_reels` `upload_phase=finish, video_state=SCHEDULED, scheduled_publish_time=<Unix
+  timestamp>`; the time must be "greater than 10 minutes from the current time and within 29 days";
+  Meta recommends the app also enforces the publishing rate limit for scheduled posts.
+- **Instagram** content publishing (developers.facebook.com/docs/instagram-platform/instagram-graph-api/
+  reference/ig-user/media): no scheduling parameter exists (container -> upload -> `media_publish`), so
+  Instagram schedules are always posted by the app at the time.
+
+### 15.2 Model and files
+- `data/schedules.json` `{"version": 1, "schedules": [Schedule...]}`, written atomically under a thread lock +
+  an OS file lock on `data/schedules.lock` (CLI and server may both write). A corrupt file (not JSON / wrong
+  shape) is moved to `schedules.broken-<t>.json`; a read error (e.g. a Windows sharing violation) is retried
+  5 times and then raises `ScheduleStoreError` - the store is never treated as empty and never overwritten.
+- One scheduler per data folder: the scheduler thread holds a non-blocking exclusive OS lock on
+  `data/scheduler.lock` (released by `Worker.stop` after the last publish task). A second `serve` on the same
+  data folder does not fire anything (`GET /api/schedules` -> `scheduler.running: false` + `blocked` reason)
+  and takes over when the first one stops.
+- Settings `publish.schedule` (in `publish/settings.py`, no `config.py` edit): `prefer_native` (true),
+  `native_lead_minutes` (60, 15..1440), `grace_minutes` (30, 0..1440), `daily_limits` {youtube 5 (1..100),
+  facebook 10 (1..30), instagram 10 (1..100)}, `timezone` ("" = this computer; an IANA name this computer
+  knows, else 422), `check_interval_seconds` (15). Daily limits count per local day in THIS zone (not the
+  browser's); a native post counts on the day it goes public (ledger `day_t`), not the hand-off day.
+- Schedule (API shape): `{"id": "s_<12 hex>"|null, "job_id", "clip", "lang", "title", "publish_at": epoch,
+  "publish_at_utc": "…Z", "publish_at_local": ISO with offset, "timezone": IANA name or "UTC+06:00",
+  "state": "upcoming|done|missed|failed|cancelled" ("preview" in a dry run), "platforms": [...],
+  "items": {platform: Item}, "created_at", "updated_at", "dry_run": bool}`.
+- Item: `{"platform", "mode": "native|app", "mode_note", "handoff_at", "account": {"id","name"}|null,
+  "state": "scheduled|queued|running|handed_off|done|failed|missed|cancelled", "message", "task_id",
+  "fired_at", "finished_at", "remote_id", "url", "cancellable"}`.
+- Mode: YouTube native only when privacy is public; Facebook native when >= 15 min ahead (5 min margin over
+  Meta's 10); Instagram always app; `prefer_native=false` -> all app. `handoff_at = max(now, publish_at -
+  native_lead_minutes)`; app items fire at `publish_at`.
+- Plans gain `"schedule"`: `{"id", "publish_at", "publish_at_utc", "publish_at_local", "timezone", "mode",
+  "mode_note", "handoff_at"}` (null for Publish now). Status files gain `"scheduled_for"` (epoch of a native
+  schedule, else null) and `"cover"` (15.4/16). Both additive; the exact-key tests were updated.
+
+### 15.3 Rules
+- Scheduling is the explicit confirm: live create needs `dry_run` off, `confirm: true`, an `Idempotency-Key`,
+  and `check_live` passing (connected, enabled, mapping, final.mp4/metadata.json, voice not stale, limits).
+  Already published -> 409; the same clip-lang-platform already actively scheduled -> 409; daily limit ->
+  409 "daily limit reached: N of N <Platform> posts for <account> on <Day> (published or scheduled) …".
+- Time: ISO 8601 `YYYY-MM-DD[T ]HH:MM[:SS][Z|±HH:MM]`; without an offset it is read in `timezone` (body),
+  else the settings zone, else this computer's. 2 minutes .. 90 days ahead. An unknown zone name with an
+  explicit offset falls back to the offset (Windows without tzdata).
+- Dry run: returns the plans with `schedule` and writes the plan files; stores no schedule.
+- Fire (web/scheduler.py, a thread started/stopped with the worker; one tick at start-up, then every
+  `check_interval_seconds`): due items of one schedule and mode go out as ONE publish task
+  (`Worker.submit_publish(..., schedule={"id","publish_at","native","plans"})`, Idempotency-Key
+  `schedule-<id>-<platforms>`). Before that, per item: dry run on -> failed ("dry run was on …"); `check_live`
+  problems -> failed with them; already published -> done ("not posted again"); daily limit -> failed;
+  WorkerConflict -> stays scheduled ("waiting: …") until the grace window ends.
+- Native hand-off time: if dry run is on, the YouTube privacy is no longer public, or the time is too close,
+  the item is NOT failed: it switches to app mode (`mode_note` says why) and is checked again at the time
+  (dry run still on then -> failed). A hand-off that fails before anything can be live (no publishing
+  request sent; for YouTube no finished upload) also switches to app mode and is posted at the time.
+  Facebook re-checks the "more than 10 minutes" window (+60 s) right before the finish call.
+- **Once handed off, the platform publishes it**: turning dry run on or cancelling in Auto Clipper no longer
+  stops it (change or delete it in YouTube Studio / Meta Business Suite). The confirm dialog, the plan
+  warnings and the Schedule page say so (`GET /api/schedules` -> `handed_off` count).
+- Missed: `now > publish_at + grace` while still `scheduled` -> `missed` with the time, lateness and grace.
+  A native item whose hand-off was missed but whose time is still >= 2 min (YouTube) / 15 min (Facebook)
+  ahead is still handed off; closer than that it switches to app mode.
+- Follow: task finished -> status file decides: published + `scheduled_for` before the time -> `handed_off`
+  (-> `done` at the time; the platform is not re-checked, the message says so), published -> `done`, else
+  `failed` with the status message. A task lost in a
+  restart is fired again within the grace window (the published record and the runner's resume records
+  prevent a second post), else failed.
+- Cancel: `scheduled` items, and `queued` items through `Worker.cancel_if_queued` (removes a task only while
+  it still waits; never signals a running publish; a task this server does not know after a restart is
+  cancelled unless its status file is already published); `running`/`handed_off` and started tasks are
+  refused (409 when nothing could be cancelled; `refused` lists why). Edit (new time) only while every live
+  item is `scheduled`; re-runs every create check.
+
+### 15.4 HTTP API (`web/schedule_routes.py`; token/Host/Origin guards as everywhere)
+| Method | Path | Success | Errors |
+|---|---|---|---|
+| GET | `/api/schedules?state=all\|upcoming\|done\|missed\|failed\|cancelled&job_id&clip&lang` | 200 `{"schedules": [...], "now", "timezone", "dry_run", "handed_off": int, "scheduler": {"running", "blocked": str\|null, "grace_minutes", "native_lead_minutes", "prefer_native"}}` | 422 bad query |
+| POST | `/api/schedules` body `{job_id, clip, lang, platforms, publish_at, timezone?, dry_run?, confirm}` | dry 200 `{"dry_run": true, "schedule", "plans"}`; live 201 `{"dry_run": false, "schedule"}`; same key replay 200 | 422 body/time/zone/missing key or confirm; 404 job/clip/lang; 409 dry-run mode, not ready, already published/scheduled, daily limit, key reused for another body |
+| GET | `/api/schedules/{id}` | 200 Schedule | 404; 422 id format |
+| PATCH | `/api/schedules/{id}` body `{publish_at, timezone?}` | 200 Schedule | 404; 422; 409 started / dry-run mode / limits |
+| POST | `/api/schedules/{id}/cancel` body optional `{platforms}` | 200 Schedule + `refused` | 404; 422; 409 nothing cancellable |
+
+### 15.5 Limits / not verified
+- Not tested against the real APIs (MockTransport only): the exact Facebook status strings of a SCHEDULED
+  reel (after finish the app reads the status once for processing errors and does not wait for publishing).
+  The Facebook cover is sent before `finish`; Meta's docs give no order (only that the video belongs to the
+  Page), so this order is unverified - a cover failure is reported and the reel still posts.
+- Native hand-off needs the server running at the hand-off time; app items need it at the time.
+
+### 15.6 CLI
+`autoclipper schedule add <job> --clip N --lang en|hi --platform …|all --at "YYYY-MM-DD HH:MM" [--tz Zone]
+[--dry-run] [--yes]`, `schedule list [--state …] [--json]`, `schedule edit <id> --at … [--tz …]`,
+`schedule cancel <id> [--platform …]`. Exit 0 ok, 2 usage/not ready. Live `add` needs dry_run off AND `--yes`;
+`--yes` while dry run is on prints the plan and exits 2 (nothing stored), like the API's 409.
+
+## 16. G7 cover frame picker
+
+### 16.1 Researched APIs (official docs, read 2026-11-23)
+- **YouTube** `thumbnails.set` (developers.google.com/youtube/v3/docs/thumbnails/set):
+  `POST https://www.googleapis.com/upload/youtube/v3/thumbnails/set?videoId=<id>`, body = the image
+  (`image/jpeg`, `image/png` or `application/octet-stream`), max 50 MB, about 50 quota units, scopes include
+  `youtube.upload`. Applies to Shorts: "for a YouTube Short, call this method only after the video has
+  finished processing" (`processingDetails.processingStatus`), otherwise the thumbnail might not apply.
+  Errors: 400 `invalidImage`, 403 `forbidden` (no permission to set custom thumbnails), 404
+  `videoNotFound`, 429 `uploadRateLimitExceeded`.
+- **Facebook** video thumbnails (developers.facebook.com/docs/graph-api/reference/video/thumbnails): `POST
+  /{video-id}/thumbnails` multipart `source` (image, required), `is_preferred` (bool) -> `{success}`; max 10 MB,
+  same aspect as the video recommended; permissions listed: `pages_read_user_content`,
+  `pages_manage_engagement`, `pages_show_list`. The reels-publishing guide links to it for "a custom cover
+  photo for your reel".
+- **Instagram** REELS container (`/{ig-user-id}/media`): `cover_url` (a public URL that Meta cURLs) or
+  `thumb_offset` (ms of the frame; default 0); `cover_url` wins if both are given.
+
+### 16.2 What is implemented
+- Files: `clips/NN/<lang>/cover.jpg` (1080x1920 JPEG, <= 2 MB), `cover.json` {"source": "frame"|"upload",
+  "time", "title", "width", "height", "size", "sha256", "final_sha256", "created_at"}, `cover_upload.<ext>`.
+  Made with ffmpeg (fill-crop) and an ASS title line via libass with complex shaping (Devanagari).
+- YouTube: after the upload, poll `GET /youtube/v3/videos?part=processingDetails&id=` (1 unit; interval
+  `poll_interval_seconds` doubling to 60 s, total `poll_timeout_seconds`), then `thumbnails.set` (one auth
+  refresh on 401). Facebook: `POST /{video-id}/thumbnails` (Page token, `is_preferred=true`) after the upload,
+  before finish. Instagram: `thumb_offset` for a frame cover; an uploaded image or the title cannot be sent
+  (no public URL) - plan warning. A cover failure never fails the post: status `cover` =
+  `{"state": "set|failed|skipped", "message"}` and the status message gets "; cover not set: …".
+- Plans gain `"cover"`: `{"path", "size", "sha256", "source", "time", "title", "outdated", "use"}` or null,
+  plus the extra request steps (`processing`, `thumbnail`; FB `thumbnail`; IG `thumb_offset` in the
+  container body). A FRAME cover made from an earlier render gives the warning "pick it again" (an uploaded
+  image never goes out of date); a frame offset past the end of the current render is not sent to Instagram.
+
+### 16.3 HTTP API
+| Method | Path | Success | Errors |
+|---|---|---|---|
+| GET | `/api/jobs/{id}/clips/{n}/{lang}/cover` | 200 `{"cover": {source,time,title,width,height,size,sha256,final_sha256,created_at,outdated,thumb_offset_ms,url}\|null, "final", "duration", "has_upload", "max_title": 100, "max_upload_bytes", "upload_types"}` | 404 |
+| GET | `…/cover/frame?t=<s>` | 200 image/jpeg 270x480 preview | 422 (`errors.t`) t missing / not a finite number / outside 0..duration-0.05; 409 no final; 404 |
+| POST | `…/cover/image` raw body, Content-Type image/jpeg\|png\|webp | 201 `{"image": {type,width,height,size}, …view}` | 415 type; 413 > 10 MB; 422 empty / bytes do not match the type / undecodable / outside 64..8192 px; 409 clip busy; 404 |
+| PUT | `…/cover` `{source: frame\|upload, time?, title?}` (strict) | 200 view | 422 time outside clip / missing for frame, title > 100 chars or control chars, extra keys; 409 no upload / no final / clip busy; 404 |
+| GET | `…/cover.jpg` | 200 image/jpeg | 404 no cover |
+| DELETE | `…/cover` | 204 (idempotent) | 409 clip busy; 404 |
+Writes hold `Worker.exclusive_publish` (refused while the clip-lang is being published or rendered). The UI
+fetches images with the token header and shows them from `blob:` URLs (CSP unchanged).

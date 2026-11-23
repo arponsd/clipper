@@ -25,7 +25,7 @@ LEDGER = "publish_ledger.jsonl"
 ACTIVE_STATES = ("queued", "uploading", "processing", "publishing")
 STATUS_KEYS = ("platform", "lang", "job_id", "clip", "state", "progress", "message", "attempts", "error",
                "remote_id", "url", "account", "video_sha256", "video_size", "idempotency_key", "started_at",
-               "updated_at", "published_at")
+               "updated_at", "published_at", "scheduled_for", "cover")  # G6/G7: additive
 _ledger_lock = threading.Lock()
 
 
@@ -160,9 +160,15 @@ def ledger_path() -> Path:
     return secrets.secrets_dir() / LEDGER
 
 
-def append_ledger(platform: str, account_id: str, lang: str, t: float | None = None) -> None:
-    line = json.dumps({"t": time.time() if t is None else t, "platform": platform, "account_id": account_id,
-                       "lang": lang})
+def append_ledger(platform: str, account_id: str, lang: str, t: float | None = None, *,
+                  day_t: float | None = None) -> None:
+    """`t` = when the API request went out (the platforms' rolling 24 h limits); `day_t` (G6 native
+    schedules only) = when the post goes public, the day the daily limits count it on."""
+    entry: dict = {"t": time.time() if t is None else t, "platform": platform, "account_id": account_id,
+                   "lang": lang}
+    if day_t is not None:
+        entry["day_t"] = day_t
+    line = json.dumps(entry)
     with _ledger_lock:
         p = ledger_path()
         fd = os.open(p, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)

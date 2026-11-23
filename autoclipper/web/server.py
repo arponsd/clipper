@@ -36,6 +36,7 @@ from .auth import DEFAULT_ALLOWED_HOSTS, GuardMiddleware, is_loopback, load_or_c
 from .errors import APIError, VALIDATION_FAILED, error_body, error_response, install_error_handlers, validation_errors
 from ..joblock import has_lock_file
 from .publish_routes import install_publish_routes  # step 4
+from .schedule_routes import install_schedule_routes  # G6 schedules + G7 covers
 from .worker import RECOVER_MIN_AGE, JobOptions, Task, Worker, WorkerConflict, read_job, read_options, uploads_root
 
 log = logging.getLogger("autoclipper.web")
@@ -1097,6 +1098,7 @@ def create_app(*, worker: Worker | None = None, settings_loader: Callable[[], Se
                 "warnings": sum(c["level"] == "warn" for c in out)}
 
     install_publish_routes(app, state, publish_http=publish_http)  # step 4 (CONTRACT_STEP4 section 9)
+    install_schedule_routes(app, state)  # G6/G7 (CONTRACT_STEP4 sections 15-16)
     return app
 
 

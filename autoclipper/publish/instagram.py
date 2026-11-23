@@ -53,6 +53,8 @@ class InstagramPublisher:
             problems.append(f"duration {item.duration:.1f} s is outside 3 s - 15 min (Instagram Reels limit)")
         if item.width > MAX_WIDTH:
             problems.append(f"video width {item.width} > {MAX_WIDTH} (Instagram limit)")
+        if item.publish_at is not None:
+            problems.append("Instagram's API has no scheduling; Auto Clipper posts it at the time instead")
         return problems
 
     def warnings(self, item: PublishItem, payload: dict) -> list[str]:
@@ -64,7 +66,20 @@ class InstagramPublisher:
             w.append(f"only the first {IG_MAX_HASHTAGS} hashtags are used")
         if count_hashtags(payload["caption"]) > IG_MAX_HASHTAGS:
             w.append(f"caption has more than {IG_MAX_HASHTAGS} hashtags; Instagram may reject it")
+        c = item.cover
+        if c and c.get("thumb_offset_ms") is None:
+            w.append("the uploaded cover image is not used: Instagram needs a public cover_url, and Auto "
+                     "Clipper only runs on this computer")
+        elif c and c.get("title"):
+            w.append("Instagram uses the picked frame as the cover (thumb_offset); the title text is not shown")
         return w
+
+    def container_form(self, item: PublishItem, payload: dict) -> dict:
+        form = {"media_type": "REELS", "upload_type": "resumable", "caption": payload["caption"],
+                "share_to_feed": "true" if payload["share_to_feed"] else "false"}
+        if item.cover and item.cover.get("thumb_offset_ms") is not None:  # G7: frame cover
+            form["thumb_offset"] = str(int(item.cover["thumb_offset_ms"]))
+        return form
 
     def plan(self, item: PublishItem, target: Any, account: dict | None) -> dict:
         ig = (account or {}).get("id") or getattr(target, "ig_user_id", "") or "{ig-user-id}"
@@ -75,8 +90,7 @@ class InstagramPublisher:
              "?fields=quota_usage,config", "headers": auth, "body": None,
              "note": f"checked live before sending ({DAILY_LIMIT} posts per 24 h)"},
             {"step": "container", "method": "POST", "url": self.g(f"{ig}/media"), "headers": auth,
-             "body": {"media_type": "REELS", "upload_type": "resumable", "caption": payload["caption"],
-                      "share_to_feed": "true" if payload["share_to_feed"] else "false"},
+             "body": self.container_form(item, payload),
              "note": "returns {id: <container id>, uri}"},
             {"step": "upload", "method": "POST", "url": self.upload_url("{container_id}"),
              "headers": {"Authorization": "OAuth ***", "offset": "0", "file_size": str(item.size)},
@@ -206,9 +220,8 @@ class InstagramPublisher:
         if not media_id:
             self._check_quota(ig, auth)
             if cid is None:
-                data = self.http.json("POST", self.g(f"{ig}/media"), headers=auth, data={
-                    "media_type": "REELS", "upload_type": "resumable", "caption": payload["caption"],
-                    "share_to_feed": "true" if payload["share_to_feed"] else "false"})
+                data = self.http.json("POST", self.g(f"{ig}/media"), headers=auth,
+                                      data=self.container_form(item, payload))
                 cid = str(data.get("id") or "")
                 if not cid.isdigit():
                     raise PublishError("Instagram did not return a container id", kind="unknown",
@@ -256,4 +269,10 @@ class InstagramPublisher:
                 url = data.get("permalink") if isinstance(data.get("permalink"), str) else None
             except PublishError:
                 url = None  # published anyway; the link is a nicety
-        return {"remote_id": str(media_id), "url": url}
+        out: dict[str, Any] = {"remote_id": str(media_id), "url": url}
+        if item.cover:
+            off = item.cover.get("thumb_offset_ms")
+            out["cover"] = ({"state": "set", "message": f"cover frame at {off} ms (thumb_offset)"} if off is not None
+                            else {"state": "skipped", "message": "uploaded cover image not supported by the "
+                                                                 "Instagram API without a public URL"})
+        return out
