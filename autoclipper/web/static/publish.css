@@ -44,6 +44,24 @@
 .pub-public { color: var(--fail); font-weight: 600; }
 .pub-force { border-top: 1px solid var(--border); padding-top: .6rem; }
 
+/* G7 cover picker + G6 schedule (schedule.js) */
+.h-small { margin: 0; font-size: 1rem; }
+.pub-warn-text { color: var(--warn); }
+.cover-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr)); gap: 1rem; }
+.cover-fig { margin: 0; display: grid; gap: .3rem; justify-items: start; }
+.cover-img { width: 180px; height: 320px; object-fit: cover; border-radius: var(--radius-sm); background: var(--surface-2); border: 1px solid var(--border); }
+.cover-card input[type=range] { flex: 1 1 12rem; min-width: 0; }
+.cover-card input[type=text] { width: 100%; }
+.sched-box { border-top: 1px solid var(--border); padding-top: .75rem; }
+.sched-mini { padding-left: 1.2rem; display: grid; gap: .3rem; margin: 0; }
+.sched-card .sched-head { align-items: baseline; flex-wrap: wrap; }
+.sched-when { font-size: 1.05rem; }
+.sched-title { overflow-wrap: anywhere; }
+.sched-title:lang(hi) { font-family: var(--font-hi); }
+.sched-items { list-style: none; padding: 0; margin: 0; display: grid; gap: .6rem; }
+.sched-items > li { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: .5rem .7rem; min-width: 0; overflow-wrap: anywhere; }
+.sched-tabs { flex-wrap: wrap; }
+
 /* OAuth callback page (served without app.js) */
 .oauth-page { display: grid; place-items: center; min-height: 100vh; margin: 0; padding: 1rem; background: var(--bg); color: var(--text); font-family: var(--font); }
 .oauth-card { max-width: 32rem; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 1.5rem; box-shadow: var(--shadow); }

@@ -269,3 +269,6 @@ def register(sub: Any, common: argparse.ArgumentParser) -> None:
     dc.add_argument("--lang", choices=["en", "hi"], required=True)
     dc.add_argument("--no-revoke", action="store_true", help="youtube: do not revoke the token at Google")
     dc.set_defaults(func=cmd_disconnect)
+
+    from .schedule_cli import register as register_schedule  # G6: `autoclipper schedule ...`
+    register_schedule(sub, common)

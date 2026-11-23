@@ -1699,3 +1699,261 @@ Remaining issues, none blocking:
 3. **Resume re-renders old finals.** Every voice-over final made before this build is now "re-render to apply" (old mix), and a resume re-renders it once (render only, about 10-45 s per clip-language). This is intended and documented.
 4. **The Mode/stale UI changes were not clicked through in a browser this round.** `node --check` passes; the API is covered by tests.
 5. **Truncation can be misjudged.** It is judged from `script.wps_*`. An unusually fast speaker (over 2x the configured rate) would be treated as cut short: one extra generation, and prefix captions.
+
+## Builder (team B: G6 scheduled publishing + G7 cover picker), 2026-11-23
+
+Worktree `auto-clipper-publish`, branch `feat/publish-schedule-covers` (from `feat/audio-modes` 497e3e9).
+Nothing committed, nothing posted, no real Google/Meta API called (tests: MockTransport; manual server: fake
+accounts AND every outbound HTTP(S) forced into a dead proxy). Team A's caption files were not touched.
+Contract: `docs/CONTRACT_STEP4.md` sections 15 (G6) and 16 (G7), with the official-doc research.
+
+### What I built
+- **G7 cover** (`publish/cover.py`): `cover.jpg` 1080x1920 (<= 2 MB) per clip-lang from a frame of final.mp4
+  or an uploaded JPEG/PNG/WebP (<= 10 MB, 64-8192 px, magic bytes must match the Content-Type), optional title
+  burned in with libass complex shaping. Used when publishing: YouTube `thumbnails.set` after a
+  `processingDetails` poll (the API doc says a Short's thumbnail only sticks after processing), Facebook
+  `POST /{video-id}/thumbnails` before finish, Instagram `thumb_offset` (frame only; `cover_url` needs a
+  public URL). A cover failure never fails the post (status `cover` + "cover not set: …").
+- **G6 schedules** (`publish/schedules.py` store/checks, `web/scheduler.py` timer thread started/stopped with
+  the worker, `web/schedule_routes.py`, `publish/schedule_cli.py`): native YouTube (`publishAt`, public only)
+  and Facebook (`SCHEDULED`, 10 min-29 days) hand-off `native_lead_minutes` before; everything else (and all
+  Instagram) posted by the app at the time. Persisted in `data/schedules.json` (thread + file lock), grace
+  window / missed, cancel + edit before start, daily limits per account and local day, one publish task per
+  schedule and mode with a stable key; a second fire finds the published record and posts nothing.
+- **UI** (`static/schedule.js`): Cover card + "Schedule for later" box in the clip Publish panel, `#/schedule`
+  page (filters, per-platform state, cancel, change time), Scheduling card on the Accounts page.
+
+### Shared-file edits (all small insertions)
+- `web/server.py`: 1 import + 1 `install_schedule_routes(app, state)` call. `web/worker.py`: `Task.schedule`,
+  `Worker.scheduler` start/stop hook, `submit_publish(schedule=)` passed to the runner only when set.
+  `static/app.js`: 1 route line. `index.html`: 1 script tag + 1 nav link. `README.md`: 2 subsections before
+  "Data layout" + 3 data-layout lines. No `config.py`/`cli.py` edit (settings live in `publish/settings.py`,
+  the CLI registers from `publish/cli.py`).
+- Step-4 files: `publish/{base,common,youtube,facebook,instagram,records,runner,service,settings,cli}.py`,
+  `static/publish.js|css`, `tests/publish_fakes.py` (thumbnail + processingDetails fakes, additive).
+- **Contract change (additive, lead please note):** Plan gains `cover` and `schedule`; Status gains
+  `scheduled_for` and `cover`. I updated the exact-key sets in `tests/test_publish_clients.py` and
+  `tests/test_web_publish_clip.py`.
+
+### Tests
+- New: `tests/test_schedule_cover_core.py` (72), `tests/test_web_schedule.py` (105 incl. parametrised: every
+  route happy/422/401/403/404/structure/side effects, the 409 matrix, idempotency, end-to-end fire through the
+  worker), `tests/test_schedule_cli.py` (5).
+- Full suite: `TMPDIR=~/.cache/ac-pub uv run pytest -q -p no:cacheprovider --basetemp ~/.cache/ac-pub/bt-builder`
+  -> **1514 passed, 3 deselected**.
+
+### Manual run (port 8801, `AUTOCLIPPER_DATA_DIR=~/.cache/ac-pub/data-builder`, copies of jobs 20261123-123539-320812 + 20261122-185849-65a6bd and settings.json)
+- Fake accounts for en/hi on all 3 platforms (no network), hi YouTube privacy public, `grace_minutes=1`,
+  `native_lead_minutes=15`. The server ran with HTTPS_PROXY/HTTP_PROXY pointing at a dead port as a safety
+  net; its log has no Google/Meta request and no secret.
+- **Covers** for gaming clip 00: en frame 12.5 s with an English title, hi frame 21.0 s with a Devanagari title.
+  Both 1080x1920 JPEG (139 KB / 126 KB); the Devanagari conjuncts (क्लच, प्ले) render correctly. t=38.3 and
+  t=99 -> 422 "outside the clip (0 - 38.20 s)". The cover frame includes the burned-in caption of that moment
+  (it is a frame of final.mp4).
+- **Dry-run schedule** of en and hi to all three: 200, nothing in `schedules.json`. Stored plans
+  `clips/00/{en,hi}/publish/*.json` carry `schedule` + `cover`: en YouTube app (privacy private), hi YouTube
+  native (`privacyStatus` private + `publishAt` 11:42Z), Facebook native (`SCHEDULED` + Unix time, thumbnail
+  step before finish), Instagram app with `thumb_offset` 12500 / 21000. No token in any plan.
+- **Persistence + missed:** dry run off for a few seconds to create live schedules (en 17:09, hi 17:48 +06:00),
+  dry run back on at once. Restart -> both listed as upcoming. Server stopped through 17:09 + grace; restart at
+  17:10:49 -> all en items `missed` ("due at 2026-11-23 17:09 (UTC+06:00) … late by 1 min, grace 1 min;
+  nothing was posted"). hi cancelled through the API (200, then 200 again). No status file exists, nothing was
+  sent. Schedule page and clip page checked in the browser at 375 px (no overflow, no console errors). The
+  server is stopped; settings are left with dry run ON.
+- Not exercised: a real hand-off (would need real accounts; covered by tests with the fakes).
+
+## Reviewer (team B: security + correctness of G6/G7), 2026-11-23
+
+Read-only review of `git diff 497e3e9` + new files. Docs checked: YouTube videos resource (`status.publishAt`:
+private only, never published before; a past time publishes right away), Meta Reels publishing guide
+(`video_state=SCHEDULED`, `scheduled_publish_time` > 10 min and within 29 days; cover only via the video
+thumbnails edge). Nothing was run against a platform.
+
+### Findings
+1. MEDIUM `publish/schedules.py` cancel(): for a `queued` item it calls `cancel_task(task_id)`; when the worker
+   has already started the task, `Worker.cancel_ex` returns "requested" AND sets the cancel event, so the
+   running publish is aborted while the API answers 409 "it is being published right now". The store says
+   `queued` for up to one tick (15 s) after the worker picked it up. Only call cancel when the worker still
+   has it queued (e.g. a `cancel_if_queued` that never touches a running task).
+2. MEDIUM `web/scheduler.py` _follow(): a task id the worker does not know is read as "lost in a restart" and
+   fired again within the grace window. A second `autoclipper serve` on the same data dir (no single-instance
+   guard) sees the first one's running task as lost and starts the same publish at the same time. Store an
+   owner/boot id on the item, or take a data-dir lock in `serve`.
+3. MEDIUM native hand-off: once handed to YouTube/Facebook (default 60 min before), turning dry run on, or
+   cancelling in the app, no longer stops the post; the confirm dialog says "You can cancel it before it
+   starts" and the contract says dry run is checked at fire time. Say so in the dialog/README, or keep lead
+   short by default.
+4. MEDIUM `publish/schedules.py` _load(): any OSError on read (on Windows a sharing violation from AV or the
+   indexer is common) is treated as a broken file: schedules.json is renamed away and the store starts empty,
+   so upcoming schedules silently vanish and never fire. Rename only on ValueError; retry/raise on OSError.
+5. LOW daily limits: a native item's ledger line is written at the hand-off time (`runner.append_ledger(now)`),
+   and `handed_off` items are not counted, so a hand-off before local midnight counts on the previous day.
+   Limit days also use the schedule's own zone (the browser zone), not `publish.schedule.timezone`.
+6. LOW Facebook native with `native_lead_minutes=15`: the window is checked before the upload; a slow upload
+   can leave < 10 min at the finish call, Meta rejects it and the item fails (no fall-back to app mode).
+7. LOW a native hand-off that fails (transient error) ends `failed` ~60 min early; no retry, no fall-back.
+8. LOW `handed_off` -> `done` at the time without checking the platform; YouTube privacy changed to non-public
+   after scheduling makes the hand-off fail instead of switching to app mode; an outdated cover's
+   `thumb_offset` may be past a shorter re-render (Instagram).
+
+### Checked OK
+Upload validation (type allow-list + magic bytes, 10 MB stream cap, 64..8192 px, no path input), frame time
+NaN/inf/out of range -> 422, ASS escaping of the title, idempotency key replay/mismatch, dry run at create and
+fire (app items), token-free plans/store/logs, socket guard in tests, lock ordering (schedule lock -> worker
+lock only), Windows msvcrt lock loop.
+
+## Reviewer (UX + API fidelity, team B: G6 schedules + G7 covers), 2026-11-23
+
+Server on port 8806, `AUTOCLIPPER_DATA_DIR=~/.cache/ac-pub/data-rev-ux` (copies of jobs 20261123-123539-320812 and
+20261122-185849-65a6bd and settings.json), fake accounts, outbound HTTP(S) sent to a dead proxy. Nothing was posted. No
+publish status file was written, and the server log has no platform request and no secret. Dry run was off only
+while I created 3 live schedules for tomorrow. All of them are now cancelled, missed or failed. The server is
+stopped and dry run is ON. Docs re-read with WebFetch: YouTube thumbnails.set, Reels publishing, Video thumbnails,
+IG /media. New test files: 182 passed.
+
+### Findings (most important first)
+1. **Native hand-off + dry run fails the schedule too early.** `scheduler._ready` runs at the hand-off time
+   (`native_lead_minutes`, default 60, before the time). If dry run is on at that point, the item is marked
+   terminally `failed` with "dry run was on when the schedule was due", even though the publish time is still up
+   to 60 min away. Reproduced: hi YouTube+Facebook failed 40 min before 17:57. Suggestion: while dry run is on
+   and the publish time is ahead, keep the item waiting or switch it to app mode, and fail it only at the publish
+   time. At minimum, say "at the hand-off time".
+2. **The Schedule confirm dialog is weaker than the Publish-now dialog.** It shows only generic per-platform text
+   ("Handed to the platform … when its API allows it"). It has no account, no privacy, no title, no real mode
+   (en YouTube is private, so app mode), no public-post warning, no cover, and no fresh plan/problem check
+   before confirming. Publish now shows all of these (publish.js ~700-731). Suggestion: run the dry preview
+   first and list its mode, account, privacy and problems.
+3. **Plan warnings show UTC, the rest shows local time.** YouTube says "YouTube makes it public at
+   2026-11-23T11:30:00Z" and Facebook says "Facebook publishes it at 2026-11-23 12:15 UTC". The same plan's
+   schedule row says "11/23/2026, 6:15:00 PM" and the dry-run warning says "2026-11-23 18:15 (UTC+06:00)". The
+   goal asks for local time. Use `fmt_local` (schedule zone) in `youtube.warnings` / `facebook.warnings`.
+4. **An unknown `publish.schedule.timezone` is accepted** (PUT /api/publish/settings with "Mars/Base" returns
+   200). After that, every schedule sent without an offset (CLI `--at "YYYY-MM-DD HH:MM"`, API) gets 422
+   errors.timezone "unknown time zone 'Mars/Base'", although the caller sent no timezone.
+   GET /api/schedules then reports timezone "Mars/Base". Validate it in the settings model.
+5. **Upload covers get a wrong "outdated" warning.** `cover.public_info` / `item_cover` set `outdated` whenever
+   final.mp4 changed, whatever the source. An uploaded image does not depend on the render, yet after a
+   re-render it shows "Made from an earlier render - pick it again" and a plan warning. Limit this to
+   `source == "frame"`. Frame covers do need it, because thumb_offset and the burned captions change.
+6. **The Facebook plan note is wrong for a scheduled reel.** The status step says "polled until publishing is
+   complete", but with `publish_at` the code reads the status once (`_check_scheduled`). The note should say so.
+   Also, the thumbnail is POSTed before `finish`. The docs only say the video must be "associated with a Page"
+   and give no order, so this is unverified against the real API. The fallback is fine (the cover failure is
+   reported and the reel still posts).
+7. **Native items show no hand-off time.** The Schedule page and the clip mini list say "waiting for the hand-off"
+   without saying when. The `handoff_at` value is in the API but never shown, so the user cannot tell when the
+   server must be running.
+8. **Small UX points:**
+   - The datetime-local input has no `min`/`max` (now+2 min .. 90 days).
+   - Cancel is one click with no confirm and cannot be undone.
+   - The cover card text says "Pick the frame shown in the grid", but there is no grid (it is a slider).
+   - The frame preview does not show the title, so its layout is only visible after saving.
+   - The toast says "(app)/(native)" (jargon).
+   - The Publish panel's dry-run state is read once at page load, so the Schedule… / Preview button goes stale
+     if dry run changes on another tab.
+   - Finished cards repeat the future-tense mode_note ("Auto Clipper uploads it at the time").
+   - Blob URLs from scrubbing are only revoked when you leave the page.
+   - `/cover/frame?t=nan` returns "time must be 0 or more seconds", and the query param is `t` while the errors
+     key is `time`.
+   - The past-time error says only "must be at least 2 minutes from now".
+   - CLI `schedule add --yes` while dry run is on exits 0 and stores nothing (it prints a note). The web API
+     returns 409 for dry_run:false in the same state.
+
+### Checked OK
+- **Local time:** the picker is labelled "(Asia/Dhaka)" and sends `+06:00` and the IANA zone. Cards and toasts
+  show GMT+6. Limit refusals name the local day: 23:30 on the 24th was refused at limit 1, and 00:30 on the 25th
+  was accepted.
+- **Validation:** schedule 422s (format, Feb 30, unknown zone, >90 d, past, duplicate/empty/unknown platform),
+  404s, 401, 409s (dry-run mode, same clip-lang-platform already scheduled, Idempotency-Key reused for another
+  body, no final, daily limit). The replay of the same key returns 200 with the same id.
+- **Restart:** with the server stopped, an item 2 h late was marked `missed` with a clear message ("late by
+  2 h 2 min, grace 30 min; nothing was posted").
+- **Cover:** frame preview == cover.jpg (same 9:16 fill-crop, same frame at 21 s). cover.jpg is 1080x1920 JPEG.
+  The Devanagari title renders correctly (क्ल, प्ले, क्या, श्रृं, ज़्या and the left i-matra are right) and a
+  long English title wraps. EXIF orientation 6 is applied (ffmpeg 7.1). Cover validation works: t outside the
+  clip, negative, NaN, inf, missing all give 422; 415 / 413 (also chunked) / 422 for mismatched bytes, empty
+  and 40x40; 422 for control characters and >100 characters; 409 for a missing upload. The frame preview
+  takes about 0.2 s.
+- **Request plans vs docs:** YouTube native = `privacyStatus` private + `publishAt` (UTC Z), only when the
+  target is public. YouTube thumbnails.set follows a processingDetails poll (as the doc's Shorts note asks) and
+  the 2 MB cap is under the 50 MB limit. Facebook finish = `video_state=SCHEDULED` + Unix
+  `scheduled_publish_time`, with a 15 min margin over Meta's 10. Facebook thumbnails = `source` +
+  `is_preferred`, ≤10 MB. Instagram `thumb_offset` is in ms; an uploaded image or title is not sent, and the
+  plan warns about it. No token appears in plans.
+- **Layout:** the Schedule page at 375 px has no horizontal overflow.
+
+## Lead triage + fixes + sign-off (team B: G6 schedules + G7 covers), 2026-11-23
+
+Worktree `auto-clipper-publish`, branch `feat/publish-schedule-covers`. Nothing posted, no real Google/Meta call
+(tests use the fakes; my server ran with every outbound HTTP(S) sent to a dead proxy, log has no platform host
+and no secret). Team A's caption files untouched. Regression tests: NEW `tests/test_schedule_lead_fixes.py` (40)
++ 8 more in `tests/test_web_schedule.py`.
+
+### Triage: security + correctness review
+1. ACCEPT (cancel interrupts a running publish). New `Worker.cancel_if_queued(task_id)`: removes a task only while
+   it is queued, under one lock hold; never sets a cancel event ("running"/"finished"/"unknown"). The cancel route
+   uses it (never `cancel_ex`). "unknown" (fired before a restart; nothing in this server runs it) now cancels the
+   item, unless its status file is already published. Tests: running task refused + not signalled, queued
+   removed, unknown cancelled, unknown-but-published refused, route never calls `cancel_ex`.
+2. ACCEPT (two `serve` on one data folder). The scheduler thread takes a non-blocking exclusive OS lock on
+   `data/scheduler.lock` before each tick; without it it never fires and reports `scheduler.blocked`. The lock is
+   released by `Worker.stop` after the last publish task ended (or by `Scheduler.stop` when the worker is not
+   running), so a second server takes over when the first stops. Checked live: 8809 owner, 8808 blocked.
+3. ACCEPT (hand-off can't be stopped). Confirm dialog, plan warnings, README and contract now say that once
+   handed off, cancel / dry run no longer stop it; the Schedule page warns when dry run is on and N posts are
+   handed off (`GET /api/schedules` -> `handed_off`). Combined with UX-1 below.
+4. ACCEPT (OSError empties the store). `_load` retries 5x on OSError then raises `ScheduleStoreError`; only a
+   parse error / wrong shape (also a list or non-list `schedules`, previously silently `[]`) moves the file aside.
+5. ACCEPT (limits on the wrong day / zone). Ledger lines of native posts get `day_t` = scheduled time (`t` stays
+   the upload time for the platforms' rolling 24 h windows); daily limits now use `publish.schedule.timezone`
+   (else this computer), not the browser's label.
+6. ACCEPT (FB window after a slow upload). Facebook re-checks "> 10 min (+60 s)" right before `finish`; too close
+   -> PublishError `schedule_window` before anything is sent, and item 7's fallback posts it app-side at the time.
+7. ACCEPT (failed hand-off gives up early). A failed native hand-off before the time goes back to `scheduled`
+   in app mode, when nothing can be live: no `sent` resume record, no `maybe_published`, and for YouTube no
+   finished upload (`remote_id`). Otherwise it stays failed (never risk a second post).
+8. a) PARTLY: `handed_off -> done` still does not query the platform (needs tokens + network in the scheduler);
+   the message now says so. b) ACCEPT: YouTube privacy no longer public at hand-off -> app mode. c) ACCEPT: a
+   frame offset past the end of the current render is not sent to Instagram (plan says why).
+
+### Triage: UX + API fidelity review
+1. ACCEPT: at hand-off, dry run on -> switch to app mode (not failed); checked again at the time.
+2. ACCEPT: the Schedule confirm dialog first runs a dry preview and shows per platform account, final privacy,
+   title, hand-off time, mode note, cover use, the public-post warning and the hand-off warning; blocks on problems.
+3. ACCEPT: plan warnings and the native status message use local time with offset (`common.fmt_local`).
+4. ACCEPT: `publish.schedule.timezone` must be a zone this computer knows (422 from the settings API).
+5. ACCEPT: `outdated` only for frame covers.
+6. ACCEPT: FB status step note "read once to confirm the reel is scheduled"; cover-before-finish documented as
+   unverified (README + contract 15.5); kept, the fallback is safe.
+7. ACCEPT: hand-off time shown on the Schedule page and the clip-page list.
+8. Small points: picker `min`/`max` ACCEPT; cancel confirm ACCEPT (`window.confirm`); "grid" -> "slider" ACCEPT;
+   frame preview without title REJECT (the preview is the raw frame, the saved cover shows the title; cost of a
+   libass render per scrub step); "(app)/(native)" toast ACCEPT; stale dry-run flag in the panel ACCEPT via the
+   fresh preview before confirm (create still 409s); finished cards hide the future-tense mode note ACCEPT; old
+   preview blob URLs revoked ACCEPT; `t=nan` -> "finite" message under key `t` ACCEPT; past time "is in the past"
+   ACCEPT; CLI `add --yes` in dry run exits 2 like the API's 409 ACCEPT.
+
+### Tests
+- `TMPDIR=~/.cache/ac-pub uv run pytest -q -p no:cacheprovider --basetemp ~/.cache/ac-pub/bt-lead` ->
+  **1561 passed, 3 deselected** (baseline before the fixes: 1514).
+
+### Walkthrough (port 8809, `AUTOCLIPPER_DATA_DIR=~/.cache/ac-pub/data-lead`, copies of both jobs + settings.json)
+- Fake accounts (publish_fakes), hi YouTube public. Dry-run schedule hi clip 00 to all three at +3 h: 200,
+  `schedules.json` never created; YouTube/Facebook native, Instagram app; warnings in local time
+  ("2026-11-23 20:29 (UTC+06:00)") with the hand-off warning; no token in any plan.
+- Covers: hi frame 21.0 s + Devanagari title, en frame 12.5 s + English title, job 65a6bd en uploaded PNG + title,
+  all 1080x1920 JPEG; plan cover uses shown (thumbnails.set / FB thumbnails / thumb_offset 21000). `t=nan` and
+  `t=99` -> 422 under `t`; past time -> 422 "is in the past"; timezone `Mars/Base` -> 422.
+- Browser: Cover card, Preview schedule (dry run) toast in plain words; dry run off for under a minute only to
+  open the Schedule confirm dialog (it shows account, public privacy, title, hand-off 17:30 GMT+6, covers and the
+  warnings) - cancelled, nothing stored, dry run back ON. Schedule page at 375 px: no overflow, no console errors.
+- Second server on 8808 with the same data dir: `scheduler.running=false`, `blocked` message. Both stopped.
+- Samples: `~/.cache/ac-pub/showcase/cover_{hi_frame21_title,en_frame12_title,en_upload_title}.jpg`.
+
+### Remaining
+- `handed_off -> done` is not verified against the platform (would need an authenticated status read).
+- Native items need the server running at the hand-off time; no tray/OS-level wake-up.
+- Facebook cover-before-finish order and the SCHEDULED status strings unverified against the real Graph API.
+- No in-app warning at the moment dry run is switched on (only the Schedule page note).
+
+### Sign-off: APPROVED, committed on `feat/publish-schedule-covers` (not pushed)

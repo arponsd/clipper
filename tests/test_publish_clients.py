@@ -54,7 +54,8 @@ def assert_no_token_in_urls(net):
 
 # ---- plans (dry run) ---------------------------------------------------------------------------
 PLAN_KEYS = {"platform", "lang", "job_id", "clip", "dry_run", "created_at", "api_version", "account", "video",
-             "metadata", "requests", "limits", "problems", "warnings"}
+             "metadata", "requests", "limits", "problems", "warnings",
+             "cover", "schedule"}  # G7/G6 additive keys
 
 
 def test_dry_run_plans_exact_shape_no_network_no_secrets(job, monkeypatch):

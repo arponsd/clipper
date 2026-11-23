@@ -140,6 +140,7 @@ class FakeGoogle(_Base):
         self.next_video = 1
         self.refresh_tokens_issued: list[str] = []
         self.code_refresh_token = REFRESH_TOKEN["hi"]
+        self.thumbnails: dict[str, bytes] = {}  # G7: video id -> JPEG sent to thumbnails.set
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         rec = self._record(request)
@@ -218,6 +219,26 @@ class FakeGoogle(_Base):
                 return _json(201 if not is_probe else 200, sess["video"])
             headers = {"Range": f"bytes=0-{n - 1}"} if n else {}
             return httpx.Response(308, headers=headers)
+        if host == "www.googleapis.com" and path == "/youtube/v3/videos" and request.method == "GET":
+            # G7: processingDetails poll before thumbnails.set
+            hit = self._take("processing", request)
+            if hit is not None:
+                return hit
+            vid = url.params.get("id", "")
+            if not any(v["id"] == vid for v in self.videos):
+                return _json(200, {"items": []})
+            return _json(200, {"items": [{"id": vid, "processingDetails": {"processingStatus": "succeeded"}}]})
+        if host == "www.googleapis.com" and path == "/upload/youtube/v3/thumbnails/set" and request.method == "POST":
+            hit = self._take("thumbnail", request)
+            if hit is not None:
+                return hit
+            vid = url.params.get("videoId", "")
+            if not any(v["id"] == vid for v in self.videos):
+                return google_error(404, "videoNotFound", "video not found")
+            assert request.headers.get("Content-Type") == "image/jpeg"
+            assert rec.body[:3] == b"\xff\xd8\xff", "thumbnail is not a JPEG"
+            self.thumbnails[vid] = rec.body
+            return _json(200, {"kind": "youtube#thumbnailSetResponse", "items": [{"default": {"url": "x"}}]})
         return _json(404, {"error": {"code": 404, "message": f"fake google: no route {request.method} {url}"}})
 
 
@@ -284,6 +305,18 @@ class FakeGraph(_Base):
                 self._lost("fb_finish", request)
                 return _json(200, {"success": True})
             return meta_error(100, "bad upload_phase")
+        if edge == "thumbnails" and request.method == "POST":  # G7: reel cover
+            hit = self._take("fb_thumbnail", request)
+            if hit is not None:
+                return hit
+            if node not in self.reels:
+                return meta_error(100, "Invalid video id")
+            ctype = request.headers.get("Content-Type", "")
+            assert ctype.startswith("multipart/form-data"), ctype
+            assert b'name="source"' in rec.body and b"\xff\xd8\xff" in rec.body
+            assert b'name="is_preferred"' in rec.body
+            self.reels[node]["thumbnail"] = True
+            return _json(200, {"success": True})
         if edge == "content_publishing_limit":
             hit = self._take("ig_limit", request)
             if hit is not None:

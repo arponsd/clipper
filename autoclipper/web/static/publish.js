@@ -104,6 +104,7 @@
         mappingCard(),
         googleClientCard(),
         LANGS.map((l) => langCard(l, errs)),
+        scheduleCard(errs),
         advancedCard(errs),
         saveBar(errs, summary));
     }
@@ -372,6 +373,20 @@
             bindNumber('poll_timeout_seconds', 'Processing timeout (s)', '60-3600.', errs, { min: '60', max: '3600', step: '1' }))));
     }
 
+    function scheduleCard(errs) { // G6 scheduled publishing settings (publish.schedule)
+      return el('section', { class: 'card stack', 'aria-labelledby': 'pub-sched-h' },
+        el('details', null,
+          el('summary', { id: 'pub-sched-h', class: 'pub-sched-sum', text: 'Scheduling' }),
+          el('div', { class: 'fields' },
+            bindCheck('schedule.prefer_native', 'Use the platform\'s own scheduling when possible', 'YouTube (public videos) and Facebook get the post before the time and publish it themselves. Instagram is always posted by Auto Clipper at the time.', errs),
+            bindNumber('schedule.native_lead_minutes', 'Hand over to the platform (minutes before)', '15-1440.', errs, { min: '15', max: '1440', step: '1' }),
+            bindNumber('schedule.grace_minutes', 'Grace window after a missed time (minutes)', '0-1440. A schedule found later than this (server was off) is marked missed instead of posted.', errs, { min: '0', max: '1440', step: '1' }),
+            bindNumber('schedule.daily_limits.youtube', 'YouTube posts per channel per day', '1-100.', errs, { min: '1', max: '100', step: '1' }),
+            bindNumber('schedule.daily_limits.facebook', 'Facebook reels per Page per day', '1-30 (Facebook allows 30 per 24 h).', errs, { min: '1', max: '30', step: '1' }),
+            bindNumber('schedule.daily_limits.instagram', 'Instagram reels per account per day', '1-100 (Instagram allows 100 per 24 h).', errs, { min: '1', max: '100', step: '1' }),
+            bindText('schedule.timezone', 'Time zone for days and CLI times', 'Like Asia/Dhaka; empty = this computer.', errs, { maxlength: '64' }))));
+    }
+
     let stateLabel = null;
     function markDirty() { dirty = true; if (stateLabel) stateLabel.textContent = 'Unsaved changes'; }
 
@@ -489,6 +504,7 @@
   function panel(ctx, jobId, clip, clipLang, container) {
     const { el, append, swap, api, apiGet, toast, makePoller, fmtBytes, fmtSecs, fmtDate, chip, bar, uuid, Queue } = A();
     const base = `/api/jobs/${encodeURIComponent(jobId)}/clips/${clip}/${clipLang}/publish`;
+    if (window.ACSchedule) window.ACSchedule.coverCard(ctx, jobId, clip, clipLang, container); // G7 cover picker
     const body = el('div', { class: 'stack' });
     const card = el('section', { class: 'card stack pub-panel', 'aria-labelledby': 'pub-panel-h' },
       el('h2', { id: 'pub-panel-h', text: 'Publish' }), body);
@@ -500,6 +516,11 @@
     const checked = new Set();
     let busy = false;
     let lastTaskId = null;
+    // G6: "Schedule for later" (schedule.js); kept across renders so the picked time survives polling
+    const schedBox = window.ACSchedule ? window.ACSchedule.scheduleBox(ctx, {
+      jobId, clip, lang: clipLang, platforms: () => PLATFORMS.filter((p) => checked.has(p)),
+      onPlans: (p) => { plans = Object.assign({}, plans, p); render(); },
+    }) : null;
 
     function isActive(v) {
       return !!(v && v.task && (v.task.state === 'queued' || v.task.state === 'running'));
@@ -558,7 +579,9 @@
       swap(body, mode, finalNote, taskLine,
         el('fieldset', { class: 'pub-choose' }, el('legend', { text: 'Platforms' }), rows),
         el('div', { class: 'row' }, previewBtn, publishBtn,
-          checked.size ? null : el('span', { class: 'small muted', text: 'Choose at least one platform.' })));
+          checked.size ? null : el('span', { class: 'small muted', text: 'Choose at least one platform.' })),
+        schedBox ? schedBox.node : null);
+      if (schedBox) schedBox.update(dry);
     }
 
     function platformRow(p, dry) {
@@ -593,6 +616,8 @@
           el('strong', { text: (ERROR_KIND[st.error.kind] || 'Error') + ': ' }), st.error.message || '',
           st.error.retry_after ? el('div', { class: 'small', text: `Try again in about ${fmtSecs(st.error.retry_after)}.` }) : null));
       }
+      if (st.scheduled_for) kids.push(el('div', { class: 'small', text: `Scheduled on ${PNAME[p]} for ${fmtDate(st.scheduled_for)}` }));
+      if (st.cover && st.cover.state !== 'set') kids.push(el('div', { class: 'small pub-warn-text', text: st.cover.message || 'cover not set' }));
       if (st.state === 'published' && st.url && /^https:\/\//.test(st.url)) {
         kids.push(el('div', { class: 'small' }, 'Published ', st.published_at ? fmtDate(st.published_at) + ' ' : '',
           el('a', { href: st.url, target: '_blank', rel: 'noopener noreferrer', text: st.url })));
@@ -616,7 +641,9 @@
         el('dl', { class: 'kv' },
           el('dt', { text: 'Account' }), el('dd', { text: plan.account ? `${plan.account.name || ''} (${plan.account.id})` : 'not connected' }),
           el('dt', { text: 'API' }), el('dd', { class: 'mono', text: String(plan.api_version || '') }),
-          el('dt', { text: 'File' }), el('dd', { text: `${v.path || ''} · ${typeof v.size === 'number' ? fmtBytes(v.size) : '?'} · ${typeof v.duration === 'number' ? fmtSecs(v.duration) : '?'} · ${v.width || '?'}×${v.height || '?'}` })),
+          el('dt', { text: 'File' }), el('dd', { text: `${v.path || ''} · ${typeof v.size === 'number' ? fmtBytes(v.size) : '?'} · ${typeof v.duration === 'number' ? fmtSecs(v.duration) : '?'} · ${v.width || '?'}×${v.height || '?'}` }),
+          plan.schedule ? [el('dt', { text: 'Schedule' }), el('dd', { text: `${fmtDate(plan.schedule.publish_at)} · ${plan.schedule.mode === 'native' ? 'native' : 'posted by Auto Clipper'} - ${plan.schedule.mode_note || ''}` })] : null,
+          el('dt', { text: 'Cover' }), el('dd', { text: plan.cover ? `${plan.cover.path} (${plan.cover.source}${plan.cover.title ? ', with title' : ''}, ${fmtBytes(plan.cover.size)}): ${plan.cover.use}` : 'none picked (platform default)' })),
         el('h4', { text: 'Metadata sent' }),
         metadataView(md),
         el('h4', { text: `Requests (${reqs.length})` }),

@@ -62,6 +62,10 @@ class PublishItem:
     sha256: str
     metadata: dict
     rel_path: str = ""
+    # G7: the clip-lang's cover (cover.json facts + cover.jpg), None = platform default cover
+    cover: dict | None = None
+    # G6: native scheduling time (epoch seconds) for this run; None = publish now
+    publish_at: float | None = None
 
 
 class StatusWriter(Protocol):

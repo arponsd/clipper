@@ -73,6 +73,43 @@ class LangTargets(_Strict):
     instagram: InstagramTarget = Field(default_factory=InstagramTarget)
 
 
+class DailyLimits(_Strict):
+    """G6: scheduled + published posts per account per local calendar day (refused above this)."""
+    youtube: int = Field(5, ge=1, le=100)
+    facebook: int = Field(10, ge=1, le=30)  # Facebook: 30 API-published reels per Page per 24 h
+    instagram: int = Field(10, ge=1, le=100)  # Instagram: 100 API-published posts per 24 h
+
+
+class ScheduleSettings(_Strict):
+    """G6 scheduled publishing (docs/CONTRACT_STEP4.md section 15)."""
+    # Use the platform's own scheduling where the API has it (YouTube status.publishAt for public videos,
+    # Facebook video_state=SCHEDULED); Instagram is always posted by Auto Clipper at the time.
+    prefer_native: bool = True
+    # Native schedules are handed to the platform (uploaded) this many minutes before the time.
+    native_lead_minutes: int = Field(60, ge=15, le=1440)
+    # A schedule whose time passed while the server was not running is still posted within this window,
+    # later it is marked "missed".
+    grace_minutes: int = Field(30, ge=0, le=1440)
+    daily_limits: DailyLimits = Field(default_factory=DailyLimits)
+    # IANA zone ("Asia/Dhaka") for CLI times without an offset and for daily limits; "" = this computer.
+    timezone: str = ""
+    check_interval_seconds: float = Field(15.0, ge=1, le=300)
+
+    @field_validator("timezone")
+    @classmethod
+    def _tz(cls, v: str) -> str:
+        if v and not re.match(r"\A[A-Za-z][A-Za-z0-9_+-]{0,40}(/[A-Za-z0-9_+-]{1,40}){0,2}\Z", v):
+            raise ValueError("invalid time zone name (like Asia/Dhaka)")
+        if v and v.upper() != "UTC":
+            try:
+                from zoneinfo import ZoneInfo
+                ZoneInfo(v)
+            except Exception:  # noqa: BLE001 - ZoneInfoNotFoundError, no tzdata, ...
+                raise ValueError(f"unknown time zone {v!r} on this computer (use an IANA name like "
+                                 "Asia/Dhaka, or leave it empty for this computer's zone)") from None
+        return v
+
+
 class PublishSettings(_Strict):
     dry_run: bool = True  # GLOBAL: nothing is sent while true
     graph_api_version: str = "v27.0"
@@ -85,6 +122,7 @@ class PublishSettings(_Strict):
     # poll_interval_seconds and backs off (doubling) up to 60 s; the default total wait is 5 minutes.
     poll_interval_seconds: float = Field(10.0, ge=1, le=60)
     poll_timeout_seconds: float = Field(300.0, ge=60, le=3600)
+    schedule: ScheduleSettings = Field(default_factory=ScheduleSettings)  # G6
 
     @field_validator("graph_api_version")
     @classmethod
