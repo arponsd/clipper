@@ -327,7 +327,7 @@ def test_job_detail_structure(api):
     assert_keys(en, {"stages": dict, "error": (str, type(None)), "final": bool, "video_url": (str, type(None)),
                      "download_url": (str, type(None)), "script": (dict, type(None)),
                      "metadata": (dict, type(None)), "voice": (dict, type(None)), "voice_stale": bool,
-                     "task": (dict, type(None))})
+                     "task": (dict, type(None)), "publish_url": str})  # step 4: publish_url (additive)
     assert set(en["stages"]) == {"script", "voice", "captions", "render"}
     assert en["final"] is True and en["video_url"] == f"/api/jobs/{store.job.id}/clips/0/en/video"
     assert en["download_url"] == f"/api/jobs/{store.job.id}/clips/0/en/download"

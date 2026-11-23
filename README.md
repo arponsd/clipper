@@ -203,6 +203,159 @@ kill -INT 1796838      # or: pkill -INT -f "autoclipper serve --host 127.0.0.1 -
 
 ---
 
+## Publishing (step 4)
+
+Auto Clipper can upload a finished clip to **YouTube Shorts**, **Facebook Page Reels** and **Instagram Reels**. It sends the clip's `final.mp4` together with the title, description and hashtags from its `metadata.json`.
+
+### What is posted where
+
+| Clip language | YouTube | Facebook | Instagram |
+|---|---|---|---|
+| English (`en`) | the channel connected as **English** | the Page connected as **English** | the Instagram account connected as **English** |
+| Hindi (`hi`) | the channel connected as **Hindi** | the Page connected as **Hindi** | the Instagram account connected as **Hindi** |
+
+- English clips only go to the English accounts, and Hindi clips only go to the Hindi accounts.
+- Publishing is refused if both languages point at the same channel, Page or Instagram account. To allow that, tick "Allow English and Hindi on the same account" under Accounts -> Advanced.
+- **Nothing is posted while dry run is on.** On a fresh install, `publish.dry_run` is `true`. In that mode, Publish only writes the exact request plan and the page shows it:
+  - The plan goes to `data/jobs/<job>/clips/NN/<lang>/publish/<platform>.json`.
+  - It lists the endpoints, the metadata and the file size.
+  - Every token in it is shown as `***`.
+- Every platform starts **off**; you enable each one per language.
+- YouTube uploads are **private** by default, so only you see them until you change the privacy to unlisted or public.
+- Facebook Reels and Instagram Reels are always public once they are published.
+- A real upload happens only when all of these are true:
+  - dry run is off;
+  - the platform is enabled and connected for that language;
+  - you tick the platform in the clip's Publish panel;
+  - you confirm the dialog (in the CLI, you also pass `--yes`).
+- Publishing is idempotent:
+  - A clip that is already published on a platform is not sent again; the panel shows the existing link instead. To post it again, tick "publish again" and type the confirmation word.
+  - An interrupted YouTube upload is resumed rather than started as a second video.
+  - If Facebook or Instagram may have published the reel but the answer was lost (a timeout, a crash), the clip shows "failed" with a note that the post may already be live. Pressing **Publish** again checks the platform first: it records the existing reel, or refuses with "check the account". It never posts a second copy unless you tick "publish again".
+  - A clip whose narration was edited but not re-rendered cannot be published until you re-render it, so the new title is never paired with the old voice.
+- Facebook reels are sent with Meta's "AI-generated" label (`is_ai_generated`), the same way YouTube marks the AI narration as synthetic media. You can turn this off per language with `publish.<lang>.facebook.is_ai_generated` in settings.json.
+
+**Web:** you set up publishing on the **Accounts** page (top bar). It is where you connect accounts, switch dry run on or off, and enable platforms per language. To preview or publish a clip, use the **Publish** panel at the bottom of the clip's review page.
+
+**CLI:**
+```bash
+uv run autoclipper accounts                                   # who is connected, what is enabled
+uv run autoclipper publish <job> --clip 1 --lang hi --platform youtube --dry-run
+uv run autoclipper settings set publish.dry_run=false         # turn real publishing on
+uv run autoclipper publish <job> --clip 1 --lang hi --platform all --yes   # real upload
+```
+
+### Credentials: YouTube (Google OAuth, Desktop app)
+
+You do this once, with your own Google Cloud project. No Google library is installed.
+
+1. Create a project at <https://console.cloud.google.com/> (for example "Auto Clipper").
+2. Go to **APIs & Services -> Library**, open **YouTube Data API v3** and press **Enable**.
+3. Set up the **OAuth consent screen** (Google Auth Platform):
+   - Choose **External**, enter the app name and your e-mail, and add yourself under **Test users**.
+   - While the app is in **Testing**, its refresh tokens expire after **7 days**, so you would have to reconnect every week. To avoid that, press **Publish app** on the Audience page. A personal app does not need verification; Google shows an "unverified app" warning that you click through.
+4. Create the client:
+   - Go to **Credentials -> Create credentials -> OAuth client ID**.
+   - Choose application type **Desktop app**. A "Web application" client is rejected.
+   - Download the JSON file (`client_secret_<...>.json`).
+5. Give the file to Auto Clipper:
+   - Web: on the Accounts page, use "Upload client_secret.json".
+   - CLI, Linux:
+     ```bash
+     uv run autoclipper accounts google-client ~/Downloads/client_secret_XXXX.json
+     ```
+   - CLI, Windows (PowerShell):
+     ```powershell
+     uv run autoclipper accounts google-client "$env:USERPROFILE\Downloads\client_secret_XXXX.json"
+     ```
+   - You can delete the downloaded file afterwards.
+6. Connect each language separately.
+   - **Web:**
+     - On the Accounts page, under **English clips -> YouTube**, press **Connect YouTube**. Google's sign-in opens in a new tab.
+     - Pick the **English** channel (Brand Account channels appear in the account chooser) and allow access. The tab then says "YouTube connected".
+     - Do the same under **Hindi clips** and pick the Hindi channel.
+   - **CLI:**
+     - Run `uv run autoclipper accounts connect youtube --lang en`, then again with `--lang hi`.
+     - Each run opens the browser and waits once on `127.0.0.1` for Google's redirect.
+     - With `--no-browser`, it prints the URL for you to open.
+   - **Same computer:** connect on the computer that runs Auto Clipper, with the page opened at `http://127.0.0.1:<port>` or `http://localhost:<port>`. Google only redirects a Desktop client back to a loopback address.
+   - **Scopes:** Auto Clipper asks for `youtube.upload` (to upload) and `youtube.readonly`, which is used only to show which channel you connected.
+7. Quota: a project gets about 100 `videos.insert` uploads a day. The quota resets at midnight Pacific time. When it runs out, the panel says "YouTube daily upload quota used up".
+
+### Credentials: Facebook Page and Instagram (long-lived Page token)
+
+You need a Facebook **Page**. For Instagram you also need a **professional** account (Business or Creator) that is **linked to that Page**. You link it in Instagram -> Settings -> Account type and tools, or in Meta Business Suite. Use one Page and Instagram account for English and another pair for Hindi.
+
+1. Create a Meta app:
+   - At <https://developers.facebook.com/apps/>, choose **Create app**, type **Business**.
+   - Add **Facebook Login for Business**.
+   - The app can stay in development mode as long as you only post to Pages and accounts that you manage.
+2. Get a user token in the **Graph API Explorer** (<https://developers.facebook.com/tools/explorer/>):
+   - Select your app and choose **Get User Access Token**.
+   - Tick `pages_show_list`, `pages_read_engagement`, `pages_manage_posts`, `instagram_basic` and `instagram_content_publish`. Add `business_management` if a Business Manager owns the Page.
+   - Press **Generate Access Token** and approve.
+3. Exchange it for a long-lived user token, valid about 60 days. The app id and app secret are under App settings -> Basic.
+   - Linux:
+     ```bash
+     curl -s "https://graph.facebook.com/v27.0/oauth/access_token?grant_type=fb_exchange_token&client_id=APP_ID&client_secret=APP_SECRET&fb_exchange_token=SHORT_USER_TOKEN"
+     ```
+   - Windows (PowerShell):
+     ```powershell
+     Invoke-RestMethod "https://graph.facebook.com/v27.0/oauth/access_token?grant_type=fb_exchange_token&client_id=APP_ID&client_secret=APP_SECRET&fb_exchange_token=SHORT_USER_TOKEN"
+     ```
+4. Get the Page id and Page token. A Page token taken from a long-lived user token does not expire.
+   - Linux:
+     ```bash
+     curl -s -H "Authorization: Bearer LONG_USER_TOKEN" "https://graph.facebook.com/v27.0/me/accounts?fields=id,name,access_token"
+     ```
+   - Windows (PowerShell):
+     ```powershell
+     Invoke-RestMethod -Headers @{Authorization = "Bearer LONG_USER_TOKEN"} "https://graph.facebook.com/v27.0/me/accounts?fields=id,name,access_token"
+     ```
+   - In the reply, each Page's `id` is the **Page id** and its `access_token` is the **Page token**.
+5. Get the Instagram account id linked to the Page:
+   - Linux:
+     ```bash
+     curl -s -H "Authorization: Bearer PAGE_TOKEN" "https://graph.facebook.com/v27.0/PAGE_ID?fields=instagram_business_account"
+     ```
+   - Windows (PowerShell):
+     ```powershell
+     Invoke-RestMethod -Headers @{Authorization = "Bearer PAGE_TOKEN"} "https://graph.facebook.com/v27.0/PAGE_ID?fields=instagram_business_account"
+     ```
+   - `instagram_business_account.id` is the **Instagram account id**.
+6. Enter the values in Auto Clipper.
+   - **Web:**
+     - On the Accounts page, under **English clips** or **Hindi clips**, open "Connect a Page and Instagram account".
+     - Fill in the Page id, the Page token and the Instagram account id.
+     - The Instagram token field is optional. Fill it in only if Instagram rejects the Page token.
+   - **CLI:**
+     - Run `uv run autoclipper accounts connect meta --lang hi --page-id PAGE_ID --ig-user-id IG_ID`.
+     - The token is read from a hidden prompt, never from the command line.
+     - You can also put it in `AUTOCLIPPER_PAGE_TOKEN` or `AUTOCLIPPER_IG_TOKEN` instead.
+   - **Check:** Auto Clipper checks the token with Facebook once and stores the Page and Instagram names.
+7. Limits:
+   - **Facebook Reels:** 9:16, 3-90 s long, and at most 30 reels a Page can publish through the API in 24 h.
+   - **Instagram Reels:** 3 s to 15 min long, at most 300 MB, and at most 100 posts through the API in 24 h. A caption can have up to 2200 characters and 30 hashtags.
+   - A clip outside these limits shows up as a problem in the dry-run plan and is not sent.
+
+The Graph API version is **v27.0**. You can change it under Accounts -> Advanced.
+
+### Where the secrets live, and disconnecting
+
+- Everything is stored in `data/secrets/`:
+  - `google_client.json` holds the OAuth client;
+  - `youtube_en.json` and `youtube_hi.json` hold the refresh tokens;
+  - `meta_en.json` and `meta_hi.json` hold the Page and Instagram tokens.
+- The directory is created with mode `0700` and every file with mode `0600`.
+- On Windows, file modes do not restrict access, and the project folder (for example `C:\code\auto-clipper`) may be readable by every local account. So the app replaces the ACL of `data\secrets` with "full control for your user only" (`icacls data\secrets /inheritance:r /grant:r "%USERNAME%:(OI)(CI)F"`) the first time it is used; new files inherit it. To check, run `icacls data\secrets`: only your account should be listed. If the app logs that it could not set the ACL, run that command yourself.
+- A token or the client secret is never shown again on any page, API response, log, plan file or error message. You only see "connected", the account name and the id.
+- To disconnect, press **Disconnect** on the Accounts page, or run `uv run autoclipper accounts disconnect youtube|facebook|instagram|meta --lang hi`.
+  - For YouTube, the refresh token is also revoked at Google.
+  - For Facebook and Instagram, the stored token is deleted. To remove the app's access entirely, go to Facebook -> Settings -> Business integrations.
+- Do not share or commit `data/secrets/`.
+
+---
+
 ## Data layout
 
 Everything is stored under `data/`, or under `$AUTOCLIPPER_DATA_DIR` if that is set:

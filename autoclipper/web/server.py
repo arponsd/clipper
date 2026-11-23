@@ -35,6 +35,7 @@ from ..stages.script import MAX_HASHTAGS
 from .auth import DEFAULT_ALLOWED_HOSTS, GuardMiddleware, is_loopback, load_or_create_token
 from .errors import APIError, VALIDATION_FAILED, error_body, error_response, install_error_handlers, validation_errors
 from ..joblock import has_lock_file
+from .publish_routes import install_publish_routes  # step 4
 from .worker import RECOVER_MIN_AGE, JobOptions, Task, Worker, WorkerConflict, read_job, read_options, uploads_root
 
 log = logging.getLogger("autoclipper.web")
@@ -473,7 +474,8 @@ def _find_upload(upload_id: str) -> tuple[Path, str] | None:
 def create_app(*, worker: Worker | None = None, settings_loader: Callable[[], Settings] = load_settings,
                doctor: Callable[[Settings], Any] = run_doctor, voicebox_factory: Callable[[Settings], Any] | None = None,
                allowed_hosts: set[str] | None = None, start_worker: bool = True,
-               static_dir: Path | None = None, stop_on_signal: bool = False) -> FastAPI:
+               static_dir: Path | None = None, stop_on_signal: bool = False,
+               publish_http: Callable[[], Any] | None = None) -> FastAPI:
     if worker is None:
         worker = Worker(settings_loader=settings_loader)
     token = load_or_create_token()
@@ -826,7 +828,14 @@ def create_app(*, worker: Worker | None = None, settings_loader: Callable[[], Se
         errors.update(_settings_value_errors(s))
         if errors:
             raise APIError(422, VALIDATION_FAILED, errors)
-        write_text_atomic(settings_path(), json.dumps(s.model_dump(), indent=2, ensure_ascii=False))
+        from ..publish import service as publish_service  # step 4: one settings write lock
+
+        with publish_service._settings_lock:
+            if "publish" not in body:
+                # step 4: the Accounts page owns `publish` (dry-run switch, mapping, ids filled by connect);
+                # a body without it keeps the stored section instead of resetting or reverting it
+                s.publish = load_settings().publish
+            write_text_atomic(settings_path(), json.dumps(s.model_dump(), indent=2, ensure_ascii=False))
         return s.model_dump()
 
     @app.get("/api/voicebox/profiles")
@@ -873,6 +882,7 @@ def create_app(*, worker: Worker | None = None, settings_loader: Callable[[], Se
         return {"checks": out, "problems": sum(c["level"] == "fail" for c in out),
                 "warnings": sum(c["level"] == "warn" for c in out)}
 
+    install_publish_routes(app, state, publish_http=publish_http)  # step 4 (CONTRACT_STEP4 section 9)
     return app
 
 

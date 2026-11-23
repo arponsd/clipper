@@ -23,6 +23,7 @@ from pydantic import ValidationError
 
 from . import __version__
 from .config import FONTS_DIR, Settings, data_dir, load_settings, save_settings, settings_path
+from .publish.cli import register as register_publish  # step 4
 
 MIN_NODE_MAJOR = 22
 REQUIRED_FILTERS = ("subtitles", "ass", "amix", "atempo")
@@ -602,6 +603,7 @@ def build_parser() -> argparse.ArgumentParser:
     sv.add_argument("--port", type=_port, default=8765, help="port (default 8765)")
     sv.add_argument("--no-browser", action="store_true", help="do not open a browser tab")
     sv.set_defaults(func=cmd_serve)
+    register_publish(sub, common)  # step 4: `publish`, `accounts`
     return p
 
 

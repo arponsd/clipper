@@ -838,3 +838,200 @@ Voicebox is untouched and still running.
 - QA's non-atomic `hold_job_lock`.
 - The /tmp cleanup decision, which is the user's.
 - A native-speaker check of the Hindi pronunciation.
+
+## Team Lead (step 4 plan: auto-publish)
+
+Worktree `/home/ptl-admin/projects/auto-clipper-step4`, branch `step4-publish` (base 6288baf). Contract: `docs/CONTRACT_STEP4.md`.
+
+**Plan.** English clips go to the en YouTube channel / FB Page / IG account and Hindi clips to the hi ones. The new `autoclipper/publish/` package holds one client per platform behind a `Publisher` protocol. Every Google and Meta call goes through `httpx`, so pyproject needs no new dependency. `settings.publish` defaults: `dry_run` true, every target disabled, YouTube privacy private. Secrets live in `data/secrets/` with mode 0600 and never leave the process. A dry run writes `clips/NN/<lang>/publish/<platform>.json` (the request plan). A live run is a `publish` task on the one worker. It writes `<platform>.status.json`, is idempotent through the published record plus the Idempotency-Key, and resumes interrupted uploads.
+
+**APIs researched (official docs, 2026-11-23).**
+- YouTube Data API v3 `videos.insert`, resumable (`uploadType=resumable`, chunks of 256 KiB multiples, 308/Range, `bytes */N` probe). Quota is 100 inserts a day. A Short is vertical or square and at most 3 min.
+- Graph **v27.0** (latest, 2026-11-04). FB `/{page}/video_reels` start -> rupload `video-upload/v27.0` -> finish PUBLISHED. Limits: 3-90 s, 30 a day per Page.
+- IG `/{ig}/media` REELS `upload_type=resumable` -> rupload `ig-api-upload/v27.0` -> poll `status_code` -> `media_publish`. Limits: 3 s-15 min, 300 MB, 100 posts a day.
+- Google loopback OAuth with PKCE. Refresh tokens expire after 7 days while the app's consent screen is in "Testing".
+
+**Split (no overlapping files; the agreed interface is `publish/service.py` + Worker.submit_publish + the JSON shapes + `tests/publish_fakes.py`).**
+- **core:** `autoclipper/publish/*`, one import + one field in `config.py`, the publish task kind in `web/worker.py`, the one-line subcommand registration in `cli.py`, `tests/publish_fakes.py`, `tests/test_publish_*.py`. Deliver the settings model, `service.py` stubs and the fakes first, and log "interface ready".
+- **web:** `web/publish_routes.py`, minimal hooks in `server.py`, `static/publish.js`, `static/publish.css`, small hooks in `index.html` and `app.js`, `tests/test_web_publish*.py`, `README.md`.
+
+**Merge note.** Step 3 edits config.py, cli.py, server.py, app.js, styles.css and README in the main checkout. Keep our edits to those files to small insertions, so merging later stays easy.
+
+**Hard rules repeated.** Never post anything and never call a real social or Google API: tests use MockTransport. No real OAuth and no account creation. Run pytest with `TMPDIR=~/.cache/ac-step4` and `--basetemp ~/.cache/ac-step4/bt-<role>`. For manual runs use `AUTOCLIPPER_DATA_DIR=~/.cache/ac-step4/data` and port 8767 only. No commits.
+
+## Web builder (step 4: publish routes, UI, README)
+
+**Started.** Building `web/publish_routes.py`, `static/publish.js`, `static/publish.css`, `tests/test_web_publish*.py` and the README section against CONTRACT_STEP4 sections 7-9 and 11. `autoclipper/publish/` does not exist yet, so the routes are written against the agreed `service.py` signatures. I will wait for "interface ready" before running tests, and I will not write core code.
+
+**Requests to core (additive, please confirm):**
+1. `complete_youtube_connect` could add `"lang"` to the returned AccountStatus dict (or expose the pending state's lang). The callback page then says "Connected <channel> for Hindi". The routes otherwise fall back to "Connected <channel>".
+2. `Task.to_dict` gaining `"platforms"` changes the exact-key `TASK_KEYS` in `tests/test_web_support.py` (and `assert_task`'s kind list). That file is shared step-2 test support. Please update it with the worker change, or tell me and I will do it.
+
+## Core builder (step 4: publish package, clients, worker task, CLI)
+
+**Interface ready.** `autoclipper/publish/` exists with the final `service.py` signatures and real implementations (not stubs): settings, secrets, accounts, oauth_google, base, metadata, records, youtube, facebook, instagram, runner, service. `config.py` has its one import + one field. `web/worker.py` has the `publish` kind, `Task.platforms`/`Task.force`, `submit_publish`, `active_publish`, `exclusive_publish`. `tests/publish_fakes.py` is ready: `FakeNet` (FakeGoogle + FakeGraph as one MockTransport handler, `.client()`), `make_job()`, `connect_all()`, `connect_youtube/connect_meta(lang)`, `set_publish(**kw)`, `client_secret_json()`, `no_network_client()`, `grep_secrets()`, `tree_text()`, `LogSink`, fake token constants `ALL_SECRETS`, injection via `net.google.inject["chunk"] = [response, ...]` / `net.graph.inject["fb_start"] = [...]`.
+
+**Answers to web:**
+1. `complete_youtube_connect` now returns the AccountStatus plus `"lang"` (additive).
+2. I updated `tests/test_web_support.py`: `TASK_KEYS` gains `"platforms": (list, None)`, `assert_task` accepts kind `publish` and checks that platforms is null exactly for non-publish tasks.
+3. **Bug in your `publish_routes.py`**: pydantic `Field(pattern=r"\A...\Z")` crashes at import (the Rust regex engine has no `\Z`; it made `import autoclipper.web.server` fail). Use `^...$` in `pattern=` (Rust `$` matches only at the very end, so no `\n` loophole) or a `field_validator` with Python `re` + `\Z` like `publish/settings.py` does.
+
+**Deviations from the contract (please note, lead):**
+- Resume state (YouTube session URI, FB video id, IG container id) is NOT in `<platform>.status.json`: section 0 says a resumable session URI is a secret and must never be written to a job dir. It lives in `data/secrets/resume_<job>_<NN>_<lang>_<platform>.json` (0600) and is deleted after success. The status file therefore never has a `resume` key; `records.public_status` strips everything outside the contract keys anyway.
+- `service._update_settings(fn)` / `service.save_publish_settings(ps)` (extra helpers) replace only the `publish` section of settings.json atomically.
+- YouTube connect fills `settings.publish.<lang>.youtube.channel_id` only when it is empty (so a wrong channel picked in Google's chooser shows as "settings channel differs from the connected one" instead of silently remapping). Meta connect always sets `page_id` (and `ig_user_id` when given), since the user typed them.
+- `disconnect facebook` keeps Instagram only when it has its own `ig_token`; otherwise the whole meta record goes. Meta tokens are not revoked remotely (no API for a Page token; revoke only applies to YouTube).
+- Force re-publish appends the old published record to `<platform>.history.jsonl` before overwriting.
+
+**Web builder: done (2026-11-23).** Full suite: `TMPDIR=~/.cache/ac-step4 uv run pytest -q -p no:cacheprovider --basetemp ~/.cache/ac-step4/bt-web` passed with **1076 tests**. 151 of them are mine: 103 in `tests/test_web_publish.py` and 48 in `tests/test_web_publish_clip.py`. Nothing was posted, no real API was called and nothing was committed.
+
+- **Routes.** `autoclipper/web/publish_routes.py` registers every route in section 9 through `install_publish_routes(app, state, publish_http=...)`. `server.py` change is three small edits: the import, the `publish_http` kwarg and the install call.
+  - Service exceptions map to errors as follows: PublishInputError->422, PublishConflict->409 (with per-platform `errors`), PublishNotFound->404, PublishUpstreamError->503.
+  - `PUT /api/publish/google-client` streams the body and stops at 64 KiB with 413.
+  - YouTube connect builds `redirect_uri` from the request Host, and returns 409 when that Host is not loopback.
+  - `/oauth/google/callback` returns HTML in every case. Headers: no-store, no-referrer and the same CSP; the page has no script and the service message is escaped.
+  - An `OAuthQueryRedactFilter` on `uvicorn.access` turns `code=` and `state=` in the logged URL into `***`.
+  - Publish POST checks run in this order:
+    1. Idempotency-Key format (422).
+    2. Clip 404.
+    3. For a live publish, a missing key or `confirm` -> 422.
+    4. `dry_run:false` while settings say dry run -> 409.
+    5. No final.mp4 -> 409. A live publish also needs metadata.json.
+    6. Dry run: runs under `worker.exclusive_publish` and returns 200 `{dry_run, plans}`.
+    7. Live: runs under `idem_lock` as `publish:<key>`, with the same replay and 409 rules as step 2. Then `_check_no_other_owner`, then `check_live`, then `submit_publish` -> 202. Nothing left to send -> 200 with `task: null` and `already_published`.
+  - `resume` is stripped from every status that leaves the API.
+  - `JobDetail...langs[lang].publish_url` is added by wrapping `state.detail` inside `install_publish_routes` (server.py's `detail()` is untouched).
+- **UI.** The two new files are `static/publish.js` (`window.ACPublish = {viewAccounts, panel}`) and `static/publish.css`. index.html gets 2 tags and the nav link `#/accounts`. app.js gets one line each for:
+  - the route;
+  - the `window.ACApp` export;
+  - the `ACPublish.panel(...)` hook in `viewClip`;
+  - `taskDesc` for `publish`;
+  - skipping the `publish` section on `#/settings` (still kept on save via deepClone).
+- **Browser check.** Port 8767 with `AUTOCLIPPER_DATA_DIR=~/.cache/ac-step4/data`, using a copy of the sample job and the FAKE accounts from publish_fakes; the server is stopped now.
+  - The Accounts page and the mapping table render. Devanagari names show correctly.
+  - The Hindi clip dry-run preview shows the full plan (the YouTube plan has 3 requests) with tokens as `***`, and the toast reads "Nothing was posted".
+  - The confirm dialog shows each platform -> account, privacy, title, the warning "This posts publicly to … on Facebook", and the force box that needs "again" typed. I opened it with dry run off and pressed **Cancel**. I never pressed "Publish now". Dry run was turned back on, and no status file or publish task exists.
+  - A bad category id comes back as a field error.
+  - At 375 px nothing overflows on the Accounts, clip or Settings pages. There were no console errors and no server errors.
+- **Shared test edit.** `tests/test_web_jobs.py::test_job_detail_structure` now expects `"publish_url": str` (the contract's additive key). That is a one-line change.
+- **README.** Added the section "Publishing (step 4)" before "Data layout". It covers what is posted where, YouTube and Meta credential setup with Linux and Windows commands, where secrets live, and how to disconnect. It is a single insertion.
+- **Open.**
+  - The callback page says "Connected <channel>" without the language, because `complete_youtube_connect` does not return `lang` (request 1 above, optional).
+  - The Instagram Page-token acceptance is still unconfirmed against the real API (lead note).
+
+**Core builder: done (2026-11-23).** Full suite: `TMPDIR=~/.cache/ac-step4 uv run pytest -q -p no:cacheprovider --basetemp ~/.cache/ac-step4/bt-core` passed with **1076 tests**. 103 of them are core tests in `tests/test_publish_{settings_secrets,metadata,clients,service,worker,cli}.py`. Every request goes to `httpx.MockTransport` fakes. Nothing was posted, no real Google or Meta endpoint was called, no OAuth login was done and nothing was committed.
+- **Web, re-check your open item 1:** `complete_youtube_connect` does return `"lang"` now, so the callback page can say "for Hindi".
+- **Clients:**
+  - **YouTube:** token refresh, then a resumable start (`notifySubscribers` from settings; Location must be on googleapis.com), then chunk PUTs. Chunks are `chunk_mb` MiB and each is a multiple of 256 KiB.
+    - 308/Range moves the next offset.
+    - A 5xx or network error is retried with backoff (Retry-After respected), and a `bytes */N` probe finds where to continue.
+    - A 404 starts a new session (at most 2 restarts).
+    - A 401 refreshes the token once.
+    - After an interrupt, a new run probes the saved session first. If the upload had already finished, it recovers that video id and uploads nothing.
+  - **Facebook:** start, then rupload, resuming from `bytes_transfered` after a transient failure. Then finish PUBLISHED, then poll `status` until publishing is complete or an error state appears. A timeout becomes a `processing` error that says the reel may still appear.
+  - **Instagram:**
+    1. `content_publishing_limit`, checked live (a full quota sends nothing else).
+    2. REELS container.
+    3. rupload.
+    4. Poll `status_code` every `poll_interval_seconds`, up to `poll_timeout_seconds`.
+    5. `media_publish`.
+    6. permalink.
+    - A FINISHED/IN_PROGRESS container younger than 23 h is reused on resume.
+- **Error kinds and their messages:** `auth` ("… login expired or was revoked - reconnect on the Accounts page"), `quota` ("YouTube daily upload quota used up; it resets at midnight Pacific time"), `rate_limit`, `unsupported_video`, `processing`, `transient`, `network`, `invalid`, `unknown`. Every message goes through `redact` (known secret values, `Bearer/OAuth <token>`, `*_token=`, `upload_id=`).
+- **Manual check:** `autoclipper publish 20261122-185849-65a6bd --clip 1 --lang hi --platform all`, with `AUTOCLIPPER_DATA_DIR=~/.cache/ac-step4/data` on a copy of the sample job. It ran ffprobe on the real final.mp4 (11156919 bytes, 28.84 s, 1080x1920), printed and saved the 3 plans, sent nothing, and exited 0.
+- **Fixed during the run:**
+  - The `OAuth <token>` redaction pattern was masking prose ("Google OAuth client" became "Google OAuth ***"). It now needs a token-like word of 8 or more characters that includes a digit or punctuation.
+  - The IG "uploaded" resume flag is now saved before the next cancel point.
+- **Known limits (not blockers):**
+  - `media_publish` and FB `finish` are retried on network errors like any request. If the first call succeeded but its answer was lost, the retry fails with an "invalid" error even though the post went out. The message does not say so; the user would need to check the account before using `force`.
+  - The Instagram Page-token acceptance is still unconfirmed against the real API (lead note). The connect form takes a separate IG token.
+
+## Security reviewer (step 4)
+
+Reviewed the step 4 diff for secret leakage, file permissions, OAuth state/loopback, test network isolation, publish gating (confirm/dry_run), idempotency and path traversal. Gating, OAuth state (single use, PKCE, loopback-only redirect), redaction and path validation look sound. The real findings:
+1. HIGH, instagram.py: when a resumed container reports status_code PUBLISHED, the code creates and publishes a new container, so the reel is posted twice. Reproduced with MockTransport: the resume record had uploaded=True, no media_id, and the container was PUBLISHED.
+2. MEDIUM, runner.py: the resume record is cleared on any non-transient error, even one raised after the post already went live. Example: the Facebook status poll gets a rate_limit or auth error after finish. The next Publish then starts a new reel.
+3. MEDIUM, secrets.py and README: on Windows, os.chmod does not restrict access, and data/ sits in the project folder rather than the user profile, so the "user-only ACL" claim does not hold.
+4. LOW, app.js settings page: PUT /api/settings sends back the stale `publish` snapshot, which can undo a dry_run=true set on the Accounts page.
+
+## API + correctness reviewer (step 4)
+
+**Verified.** The full suite passed: 1076 tests (`--basetemp ~/.cache/ac-step4/bt-review`).
+
+On port 8767 with `AUTOCLIPPER_DATA_DIR=~/.cache/ac-step4/data` and the FAKE accounts:
+- Accounts and the hi dry-run worked, and the Devanagari metadata was correct.
+- The 401/403/404/422 matrix behaved as documented, and so did the callback with a bad state (400 HTML).
+- The UI publish panel rendered.
+- Nothing was posted. The server is stopped, and the server log has no token.
+
+Against the official docs (fetched 2026-11-23):
+- YouTube `videos.insert`: the endpoint, 1 unit in the uploads bucket (100/day), title 100 chars, description 5000 bytes, the tag rule, and `containsSyntheticMedia` being writable all match.
+- FB `video_reels` and IG REELS resumable (Page token on graph.facebook.com, rupload `ig-api-upload`) match too.
+
+**Findings:**
+1. HIGH. A lost response on IG `media_publish` or FB `finish` leads to a duplicate post on the next publish. Http.request retries the non-idempotent POST. The retry's non-transient error is then classed `invalid`. runner clears the resume record and the status is `failed` (not published). A normal re-publish, with no force needed, creates a new container/reel. Reproduced with the fakes: run 2 made a 2nd container and media.
+2. MEDIUM. The `#/settings` save sends back a stale `publish` section from deepClone(loaded). PUT /api/settings then overwrites it without `service._settings_lock`. This can silently revert dry_run, enabled flags or the channel/page ids set by connect.
+3. LOW-MEDIUM. Publish is allowed while voice_stale. The narration was edited but not re-rendered, while metadata.json is already rewritten. The post would pair the new title with the old narration, and there is no problem or warning.
+4. LOW:
+   - FB finish does not send `is_ai_generated` (YouTube does disclose the synthetic media).
+   - `uploadLimitExceeded` is reported as the API quota "resets at midnight Pacific", but it is the channel's upload limit.
+   - IG polling defaults (10 s for up to 600 s) exceed the docs' "once per minute, no more than 5 minutes".
+
+## Lead (step 4 triage of security + API reviews)
+
+**Result.** All 10 findings ACCEPTED (SEC-1 and F1, SEC-2, and SEC-4 and F2 are the same bugs, so each pair got one fix). Fixed with regression tests in `tests/test_publish_lead_fixes.py` (18 tests). Full suite: `TMPDIR=~/.cache/ac-step4 uv run pytest -q -p no:cacheprovider --basetemp ~/.cache/ac-step4/bt-lead` passed with **1094 tests**. Nothing was posted, no real API was called (MockTransport only), no server was started and nothing was committed.
+
+**Decisions:**
+- **SEC-1 + F1 + SEC-2 (HIGH, duplicate posts): accepted.** I confirmed all three paths against the code. They share one root cause: the resume record was dropped, or ignored, after the non-idempotent publish request may already have gone out. Fix (a "commit point"):
+  - `base.Http.request(..., retries=0)`: IG `media_publish` and FB `finish` are sent exactly once and never auto-retried.
+  - Before sending either request, the resume record gets `"sent": true`. `records.resume_sent()` lets `runner.run_publish` keep the record on every error once it is set. Only success or `force` clears it, and `force` drops a `sent` record before posting anew. The failure message then adds "the post may already be live; publishing again checks … first and does not post twice".
+  - **IG:** on any `media_publish` error, it reads the container `status_code`. On resume, it checks any stored container that is `sent` or `uploaded`, at any age and for any render. `PUBLISHED` means the reel is live and is never re-published. The media id is recovered from `GET /{ig}/media?fields=id,caption,permalink,timestamp` when exactly one post has the same caption and was posted after the container was created. Otherwise the clip is `failed` with error code `maybe_published` and a "check the account; force only if missing" message. A verified FINISHED/ERROR/EXPIRED drops the `sent` flag, because nothing went live.
+  - **FB:** on a `finish` error, or on resume with `sent`, it reads `status`. If `publishing_phase` has started (anything but not_started) or video_status is ready/published, it skips `finish` and only polls. A repeated `finish` only ever targets the same video id, and a new `start` never happens without force. A `rate_limit`/`auth` error while polling after finish now keeps the record, so the next Publish just polls (the SEC-2 scenario).
+  - The core builder's "known limit" (the lost `media_publish`/`finish` answer) is resolved by this.
+- **SEC-3 (Windows ACL): accepted.** On `os.name == "nt"`, `secrets_dir()` runs `icacls <dir> /inheritance:r /grant:r DOMAIN\USER:(OI)(CI)F` once per process, and logs a warning with the command to run by hand if that fails. New files inherit the ACL. The README claim is corrected. Tested with a mocked `subprocess.run`; it is not verified on a real Windows box.
+- **SEC-4 + F2 (stale publish section on Settings save): accepted.**
+  - `app.js` now deletes `out.publish` before `PUT /api/settings`.
+  - `server.put_settings` keeps the stored `publish` section when the body has none, and writes under `publish.service._settings_lock`.
+  - A body that includes `publish` is still accepted, as a full replace (step-2 contract kept).
+- **F3 (voice_stale): accepted, as a blocking problem rather than a warning.** It posts the wrong narration under a new title. `service.voice_stale()` (same rule as the web view) adds `VOICE_STALE_PROBLEM` to `load_item`'s extra problems. So it appears in plans, `publish_view`, `check_live` (409) and the runner's last-moment check.
+- **F4 (FB `is_ai_generated`): accepted.** I checked it against the official reels-publishing doc: an optional boolean on finish, default false. New setting `FacebookTarget.is_ai_generated = True`. It is sent on finish and shown in the plan.
+- **F5 (`uploadLimitExceeded`): accepted.** It has its own message ("this YouTube channel has reached YouTube's upload limit for now … not the API quota"), kind still `quota`.
+- **F6 (IG polling): accepted.** IG polling starts at `poll_interval_seconds` and doubles to 60 s, with the last sleep capped to the remaining time. The default `poll_timeout_seconds` is now 300 (was 600). That gives at most 8 status GETs per reel instead of 61. The interval default stays 10 s. FB polling also uses the 300 s default: a timeout is `processing` and keeps the record, so publishing again resumes the poll.
+
+**Files touched:**
+- `publish/{base,facebook,instagram,runner,records,service,secrets,settings}.py`
+- `web/server.py` (put_settings only)
+- `web/static/app.js` (one line plus a comment)
+- `tests/publish_fakes.py`, additive:
+  - `lose[step]` = do the work, then drop the answer
+  - a container becomes `PUBLISHED` after media_publish, and a second publish of it is rejected
+  - `GET /{ig}/media` listing
+- `README.md`: Windows secrets paragraph, plus idempotency and AI-label notes.
+- `docs/CONTRACT_STEP4.md`: sections 2.2, 2.3, 3, 4 and the status/resume notes.
+
+**Still open (not blockers):**
+- The real Windows ACL run.
+- The exact real-world `publishing_phase.status` strings. The code treats anything other than empty/`not_started` as started, which is the safe direction.
+
+## Lead sign-off (step 4)
+
+**Result: APPROVED.** The full suite passed: 1094 tests (`--basetemp ~/.cache/ac-step4/bt-signoff`).
+
+The manual run used port 8767 with `AUTOCLIPPER_DATA_DIR=~/.cache/ac-step4/data-signoff`, a fresh copy of the sample job and FAKE secrets. All six accounts (en/hi x 3 platforms) were enabled, with separate ids per language.
+- **Accounts page:** it rendered with dry run ON, the "what is posted where" table, the per-language cards and the Disconnect controls.
+- **Clip 01 Publish panel (en and hi, all 3 platforms):** the browser dry-run wrote `clips/01/{en,hi}/publish/{youtube,facebook,instagram}.json`.
+  - The en plans used only the en channel, Page and IG account; the hi plans used only the hi ones.
+  - The Devanagari title, description and tags were intact.
+  - Limits were respected: the hi YouTube title is 43 characters, the description is 538 bytes and the tags total 54.
+  - Privacy was as set (en private, hi unlisted). `is_ai_generated` and `containsSyntheticMedia` were both true.
+  - Every token was `***`. No token or secret appeared in the plans or the server log.
+- **Refusals:**
+  - `confirm:true` with dry_run on returned plans only (200) and queued nothing.
+  - `dry_run:false` while the settings had dry run on returned 409.
+  - With dry run off and nothing connected, the publish returned 409 "not connected" for each platform.
+  - A live publish without `confirm` or `Idempotency-Key` returned 422.
+  - The rest of the matrix: no token 401, bad token 403, clip 99 404, and lang/platform 422.
+- **CLI:** `autoclipper accounts` and `publish --dry-run` worked. The server is stopped and dry_run was set back to true.
+- **Notes:**
+  - DELETE on a YouTube account revokes at Google by default (`revoke=true`), so a disconnect makes a network call. Use `?revoke=false` or `--no-revoke` for tests with fake tokens.
+  - The README's `icacls ... "%USERNAME%"` is cmd syntax. In PowerShell it is `$env:USERNAME`, so it should say "run in cmd".
