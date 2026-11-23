@@ -11,6 +11,8 @@ Auto Clipper is a local app that turns one long video into short vertical clips.
 7. burns word-by-word captions in the clip's language (Noto Sans for English, Noto Sans Devanagari for Hindi) and mixes in the original audio: it is ducked to `audio.original_volume` while the narration plays and comes back to `audio.original_volume_after` before and after it (with `audio.duck_ramp_seconds` ramps), then the mix is loudness-normalised,
 8. writes `final.mp4` and `metadata.json` for each clip in each language.
 
+You can also switch the narration off and keep only captions on the clip's own audio: see [Captions only (no voice-over)](#captions-only-no-voice-over).
+
 The narration is sized to the clip from the voice's words per second (`script.wps_en` / `script.wps_hi`, `script.fill_ratio`). If a voice-over is longer than its clip, it is sped up slightly, never more than `audio.max_speedup`. If it would need more than that, it is first shortened by the LLM, and trimmed with a fade only as a last resort. If a new voice-over is much shorter than its clip (below `script.lengthen_below`), the LLM lengthens the narration once; the longer take is kept only if it fits, otherwise the original take stays. Lengthening happens only when the script was just written or regenerated, or no voice exists yet: resuming a job (`run --job`) never rewrites a narration you edited, and `rerender` never lengthens.
 
 Step 1 (the command-line pipeline) and step 2 (a local web UI, see [Usage: Web UI](#usage-web-ui)) exist today. See the [Roadmap](#roadmap) for what comes next.
@@ -171,7 +173,7 @@ uv run autoclipper doctor
 - ffmpeg and ffprobe are on PATH,
 - ffmpeg has the subtitles, ass, amix and atempo filters,
 - the fonts are installed, either in assets/fonts or found by `fc-list`,
-- Voicebox is reachable and the profile ids are set,
+- Voicebox is reachable and the profile ids are set (skipped when `voiceover` is `false`),
 - the API key is present,
 - HyperFrames (optional, warnings only): the Node version in `hyperframes.node_bin_dir`, the installed `hyperframes` version, its headless Chrome, FFmpeg's `libvpx-vp9` decoder (WebM alpha) and whether the caption engine will work or fall back to ASS.
 
@@ -182,7 +184,7 @@ It exits with code 1 if anything required is missing. HyperFrames rows are only 
 ## CLI usage
 
 ```bash
-uv run autoclipper run <file-or-url> [--clips N] [--min S] [--max S] [--langs en,hi] [--job ID]
+uv run autoclipper run <file-or-url> [--clips N] [--min S] [--max S] [--langs en,hi] [--job ID] [--no-voiceover | --voiceover]
 uv run autoclipper rerender <job_id> <clip> <lang>
 uv run autoclipper status <job_id>
 uv run autoclipper jobs
@@ -225,6 +227,27 @@ Progress lines look like `[<job_id>] <stage> <clip>/<lang> <pct>% <message>`, fo
 **Rerender** uses the saved `script.json`, which you may have edited. The voice is regenerated only when the narration text changed: the sha256 of the narration is compared with `narration_hash` in `voice.json`. Captions, `final.mp4` and `metadata.json` are always rebuilt. If the voice stage had to shorten the narration to fit the clip, the shortened text is written back to `script.json`, so the captions always match the audio.
 
 Clip indexes are 0-based and match the `clips/NN` folders.
+
+### Captions only (no voice-over)
+
+Turn the narration off when you only want captions on the clip's own audio:
+
+```bash
+uv run autoclipper settings set voiceover=false                 # every new job (or Settings > General > Voice-over narration)
+uv run autoclipper run "~/Videos/talk.mp4" --no-voiceover       # just this job (--voiceover forces it on)
+uv run autoclipper run --job 20261122-101500-ab12cd --no-voiceover   # switch an existing job, then resume it
+```
+
+On the web, the **New job** form has a **Voice-over narration** checkbox (it starts at the setting).
+
+With the voice-over off, for every clip and language:
+- **Script:** Claude still writes the title, description and hashtags in that language; the narration stays empty. On the clip page the narration field is hidden and the rest stays editable.
+- **Voice:** skipped (`voice-over off`). Voicebox is never called and does not need to run; `doctor` does not check it.
+- **Captions:** made from the original speech. When the clip language is the video's spoken language (the language Whisper detected), the captions are Whisper's own words and timings. Otherwise Claude translates each spoken line of the clip once (cached in `caption_translation.json`, so a re-render does not ask again; if a line was left out, the next render asks again) and each translated line is shown while its original line is spoken (long pauses skipped; a very short line is held a little longer so it can be read). The word highlight follows the line, not each spoken word. Both caption engines (`ass`, `hyperframes`) and the Devanagari font for Hindi work as usual.
+- **Audio:** the original audio at `audio.original_volume_after`, with no ducking, then loudness-normalised as usual.
+- **Publishing:** unchanged; the title, description and hashtags come from `metadata.json`.
+
+Each job keeps the mode it was created with (the setting at that moment, or `--no-voiceover` / `--voiceover` / the New job checkbox), so changing the setting later only affects new jobs; jobs made before this option existed are voice-over jobs. To switch an existing job, use `run --job ID --no-voiceover` (or `--voiceover`). Switching the mode makes the affected stages stale: a resume or a re-render redoes the captions and the render (and, when turning the voice-over on, writes a narration for a script that has none, keeping your title, and makes the voice). An earlier voice-over take is kept on disk, so switching back does not regenerate it.
 
 ---
 
@@ -417,10 +440,12 @@ data/
       cut.mp4                       1080x1920 cut with original audio
       en/
         script.json                 narration, title, description, hashtags  <- editable
-        voice_raw.wav               Voicebox output
+        voice_raw.wav               Voicebox output (not made with the voice-over off)
         voice.wav                   fitted voice (<= clip length)
         voice.json                  durations, tempo, narration_hash
         words.json                  timed caption words
+        captions.json               voice-over off only: captions came from the original speech ("transcript" or "translation")
+        caption_translation.json    voice-over off, other language: the translated caption lines (cache)
         captions.ass                word-by-word ASS subtitles (also the HyperFrames fallback)
         hf/                         HyperFrames composition (captions.engine=hyperframes): index.html, assets/, overlay.json
         captions_overlay.webm       transparent caption overlay rendered by HyperFrames (.mov with hyperframes.format=mov)
@@ -440,6 +465,7 @@ Change settings with `autoclipper settings set key.path=value`. The value is par
 | Key | Default | Meaning |
 |---|---|---|
 | `languages` | `["en","hi"]` | Output languages (`en`, `hi`). `languages=en` also works. |
+| `voiceover` | `true` | Voice-over narration. `false` = captions only: no narration or Voicebox, the original audio is kept and the captions come from the original speech (see [Captions only](#captions-only-no-voice-over)). Used for new jobs; each job keeps its own mode. `run --no-voiceover` / `--voiceover` override it per job |
 | `llm.model` | `claude-opus-5-5` | Claude model used for moments and scripts |
 | `llm.effort` | `medium` | `low` / `medium` / `high` / `xhigh` / `max` |
 | `llm.use_fallbacks` | `true` | Server-side fallback if a request is declined |

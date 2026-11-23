@@ -277,13 +277,20 @@ def render_clip(*, cut: Path, out_dir: Path, settings: Settings, on_progress: Pr
     """
     out_dir = Path(out_dir)
     final = out_dir / "final.mp4"
-    voice = out_dir / "voice.wav"
+    # Voice-over off: no voice input at all; the original audio plays at audio.original_volume_after.
+    voice = out_dir / "voice.wav" if settings.voiceover else None
     words = out_dir / "words.json"
     ass = out_dir / "captions.ass"
     common = dict(cut=Path(cut), voice=voice, dst=final, audio=settings.audio, words_json=words)
     if settings.captions.engine != "hyperframes":
         render_final(ass=ass, on_progress=on_progress, **common)
         return RenderOutcome(path=final, engine_used="ass", warning=None)
+
+    if _no_words(words):
+        # Nothing is said in this clip (e.g. captions only over music): there are no captions to draw,
+        # so there is no overlay to make - not a HyperFrames failure.
+        render_final(ass=None, on_progress=on_progress, **common)
+        return RenderOutcome(path=final, engine_used="hyperframes", warning=None)
 
     from . import hyperframes as hf
 
@@ -304,6 +311,15 @@ def render_clip(*, cut: Path, out_dir: Path, settings: Settings, on_progress: Pr
     except (OSError, ValueError, AttributeError):
         pass
     return RenderOutcome(path=final, engine_used="hyperframes", warning=None, hf_version=env.hf_version, fps=fps)
+
+
+def _no_words(words_json: Path) -> bool:
+    """True only when words.json exists and is a valid, empty list (a missing/broken file is an error
+    the HyperFrames path reports as usual)."""
+    try:
+        return json.loads(Path(words_json).read_text(encoding="utf-8")) == []
+    except (OSError, ValueError):
+        return False
 
 
 def _fallback(e: BaseException, out_dir: Path, on_progress: ProgressFn | None, ass: Path,
@@ -343,6 +359,8 @@ def render_key(settings: Settings) -> dict:
 def write_render_stamp(out_dir: Path, settings: Settings, outcome: RenderOutcome) -> Path:
     data = dict(render_key(settings))
     data.update({"engine_used": outcome.engine_used, "warning": outcome.warning})
+    if not settings.voiceover:
+        data["voiceover"] = False  # absent = rendered with the voice-over (every render before this key)
     if outcome.engine_used == "hyperframes":
         data["hf_version"] = outcome.hf_version
         data["resolved_fps"] = outcome.fps
@@ -361,11 +379,18 @@ def read_render_stamp(out_dir: Path) -> dict:
     return {"caption_engine": "ass", "engine_used": "ass"}
 
 
+def rendered_voiceover(stamp: dict) -> bool:
+    """Whether a final.mp4 was rendered with the voice-over (stamps without the key: yes)."""
+    return stamp.get("voiceover") is not False
+
+
 def render_settings_changed(out_dir: Path, settings: Settings) -> bool:
     """True when the render settings (render_key) differ from the ones final.mp4 was made with. Unlike
     render_is_current this ignores an ASS fallback: the user changed nothing, so the UI shows the fallback
     warning instead of a "re-render to apply" hint (resume still retries the fallback)."""
     stamp = read_render_stamp(out_dir)
+    if rendered_voiceover(stamp) != settings.voiceover:
+        return True
     return any(stamp.get(k) != v for k, v in render_key(settings).items())
 
 
@@ -374,6 +399,8 @@ def render_is_current(out_dir: Path, settings: Settings) -> bool:
     if not (final.is_file() and final.stat().st_size > 0):
         return False
     stamp = read_render_stamp(out_dir)
+    if rendered_voiceover(stamp) != settings.voiceover:
+        return False
     key = render_key(settings)
     if any(stamp.get(k) != v for k, v in key.items()):
         return False

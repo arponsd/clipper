@@ -485,9 +485,12 @@ def voice_stale(job_id: str, clip: int, lang: str) -> bool:
     """True when script.json's narration no longer matches the voice that final.mp4 was rendered with
     (same rule as the web clip view's `voice_stale`): metadata.json is already rewritten on script save, so
     publishing now would pair the new title with the old narration."""
+    from ..stages.render import read_render_stamp, rendered_voiceover
     from ..stages.voice import narration_hash
 
     d = clip_dir(job_id, clip, lang)
+    if not rendered_voiceover(read_render_stamp(d)):
+        return False  # rendered with the voice-over off: the narration is not part of final.mp4
     try:
         script = json.loads((d / "script.json").read_text(encoding="utf-8"))
         voice = json.loads((d / "voice.json").read_text(encoding="utf-8"))

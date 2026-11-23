@@ -548,3 +548,32 @@ These are part of the contract now. Tests: `tests/test_web_review_fixes.py` plus
   a new or regenerated script may be lengthened, but a resume never rewrites a narration the user edited.
   `rerender` never lengthens.
 
+
+## 11. Voice-over on/off ("captions only"), additive (feature builder, 2026-11-23)
+
+- **Setting** `voiceover: bool = true` (top level of `Settings`, shown in Settings > General as "Voice-over
+  narration"). `PUT /api/settings` is strict: a non-boolean is 422 `errors.voiceover`.
+- **Job model** `Job.voiceover: bool | None = None` in job.json: the job's mode, fixed at creation (the
+  setting at that moment unless overridden). None = a job made before the option existed = **on** (lead fix:
+  a Settings change never switches an existing job). Effective mode = `pipeline.job_voiceover(job)`;
+  `pipeline.settings_for_job` gives settings with it.
+- **POST /api/jobs** `options.voiceover: bool | null` (strict; `"false"`/`1` -> 422 `errors.options.voiceover`).
+  null = the current setting. The resolved bool is written to `options.json`, to `job.json` at creation, and
+  passed to `run_job(..., voiceover=...)` by the worker. The web form always sends the checkbox value.
+  CLI `run` (new job, no flag) stores the setting in job.json the same way.
+- **GET /api/jobs/{id}** adds `voiceover: bool` (effective) and `voiceover_override: bool | null` (job.json's
+  raw value; null only for legacy jobs); every
+  clip-lang adds `voiceover: bool` (effective) and `rendered_voiceover: bool | null` (from render.json; null
+  without a final). `render_stale` is also true when the two differ.
+- **PUT .../script**: an empty narration is accepted (200) when the job's voice-over is off, or when the saved
+  script has no narration yet (re-render writes one); otherwise 422 `errors.narration` as before. `voice_stale` (web and publish) is false for a final rendered without voice.
+- **Pipeline, voice-over off:** script = `write_metadata_script` (LLM `write_publish_metadata`, narration "");
+  voice stage `skipped` / message `voice-over off` (no Voicebox client is built); captions =
+  `stages/original_captions.make_original_captions` (Whisper words re-based, or LLM `translate_segments` per
+  clip-lang cached in `caption_translation.json`), stamp `captions.json` `{"voiceover": false, "source": ...}`;
+  render has no voice input (original at `audio.original_volume_after`, loudnorm + limiter); render.json gets
+  `"voiceover": false` (absent = on, so every older render stays current).
+- **Staleness:** captions are redone when `captions.json`'s mode differs from the effective mode (absent stamp
+  = voice-over); the render when render.json's mode differs. Turning the voice-over on for a script with an
+  empty narration writes one (`add_narration`, title/description/hashtags kept). voice.wav is never deleted by
+  a mode switch, so switching back reuses a matching voice.

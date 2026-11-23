@@ -122,9 +122,12 @@ def parse_langs(value: str | list[str] | None) -> list[str] | None:
 
 
 def effective_settings(settings: Settings, *, langs: list[str] | None = None, count: int | None = None,
-                       min_seconds: float | None = None, max_seconds: float | None = None) -> Settings:
+                       min_seconds: float | None = None, max_seconds: float | None = None,
+                       voiceover: bool | None = None) -> Settings:
     """Copy of settings with CLI overrides applied and re-validated (bounds from config.py)."""
     data = settings.model_dump()
+    if voiceover is not None:
+        data["voiceover"] = bool(voiceover)
     if langs is not None:
         data["languages"] = parse_langs(langs)
     if count is not None:
@@ -143,6 +146,21 @@ def effective_settings(settings: Settings, *, langs: list[str] | None = None, co
         raise PipelineError(f"min clip length ({out.clips.min_seconds}s) is greater than max "
                             f"({out.clips.max_seconds}s)")
     return out
+
+
+def job_voiceover(job: Any, settings: Settings | None = None) -> bool:
+    """The voice-over mode of a job. It is fixed in job.json when the job is created (the `voiceover`
+    setting at that moment, or run --no-voiceover / --voiceover, web options.voiceover), so a later
+    Settings change never switches an existing job. A job without one was made before the option
+    existed, i.e. with the voice-over: on. ``settings`` is unused (kept for call-site symmetry)."""
+    own = getattr(job, "voiceover", None)
+    return own if isinstance(own, bool) else True
+
+
+def settings_for_job(job: Any, settings: Settings) -> Settings:
+    """settings with `voiceover` set to the job's effective mode (a copy when it differs)."""
+    vo = job_voiceover(job, settings)
+    return settings if vo == settings.voiceover else settings.model_copy(update={"voiceover": vo})
 
 
 def _validation_summary(e: ValidationError) -> str:
@@ -182,8 +200,8 @@ def _unlink_outputs(out_dir: Path, *names: str) -> None:
 
 
 # Per clip-lang files that depend on cut.mp4 (script.json does not: it comes from the transcript).
-_CUT_DEPENDENT_OUTPUTS = ("voice.wav", "voice.json", "words.json", "captions.ass", "final.mp4", "render.json",
-                          "captions_overlay.webm", "captions_overlay.mov")
+_CUT_DEPENDENT_OUTPUTS = ("voice.wav", "voice.json", "words.json", "captions.ass", "captions.json", "final.mp4",
+                          "render.json", "captions_overlay.webm", "captions_overlay.mov")
 
 
 def _invalidate(store: JobStore, clip: ClipState, lang: str, stages: Sequence[str]) -> None:
@@ -558,7 +576,7 @@ def _run_voice(store: JobStore, rep: _Reporter, settings: Settings, deps: _LazyD
 
     out_dir = store.clip_dir(clip.index, lang)
     cut = store.clip_dir(clip.index) / "cut.mp4"
-    _unlink_outputs(out_dir, "words.json", "captions.ass", "final.mp4", "render.json")
+    _unlink_outputs(out_dir, "words.json", "captions.ass", "captions.json", "final.mp4", "render.json")
     _invalidate(store, clip, lang, ("captions", "render"))
     rep.start("voice", clip.index, lang, f"engine {_engine_label(settings, lang)}")
     result = make_voice(client=deps.voicebox, narration=script.narration, lang=lang,
@@ -589,13 +607,68 @@ def _engine_label(settings: Settings, lang: str) -> str:
     return "chatterbox" if lang == "hi" else settings.voice_for(lang).engine
 
 
+VOICEOVER_OFF = "voice-over off"
+
+
+def _skip_voice(store: JobStore, rep: _Reporter, clip: ClipState, lang: str) -> None:
+    """Voice-over off: the voice stage is skipped (no Voicebox call). voice.wav/voice.json of an earlier
+    voice-over render are kept, so turning the voice-over back on reuses a voice that still matches."""
+    store.set_stage("voice", "skipped", 1.0, VOICEOVER_OFF, clip=clip.index, lang=lang)
+    rep.line("voice", 1.0, f"skipped ({VOICEOVER_OFF})", clip.index, lang)
+
+
+def _translate_fn(deps: _LazyDeps):
+    """translate(lang=, source_lang=, segments=) resolving the LLM only when a translation is needed."""
+
+    def translate(**kwargs):
+        fn = getattr(deps.llm, "translate_segments", None)
+        if not callable(fn):
+            from .stages.captions import CaptionsError
+
+            raise CaptionsError("the language model cannot translate captions (no translate_segments)")
+        return fn(**kwargs)
+
+    return translate
+
+
+def _load_transcript(store: JobStore) -> Transcript:
+    p = store.dir / "transcript.json"
+    try:
+        return Transcript.model_validate_json(p.read_text(encoding="utf-8"))
+    except FileNotFoundError as e:
+        raise PipelineError(f"{store.rel(p)} not found - resume the job first") from e
+    except (ValueError, UnicodeDecodeError) as e:
+        raise PipelineError(f"{store.rel(p)} is unreadable: {_error_text(e).splitlines()[0]}") from e
+
+
+def _captions_current(out_dir: Path, settings: Settings) -> bool:
+    from .stages.captions import captions_voiceover
+
+    return (output_exists(out_dir / "captions.ass") and output_exists(out_dir / "words.json")
+            and captions_voiceover(out_dir) == settings.voiceover)
+
+
 def _run_captions(store: JobStore, rep: _Reporter, settings: Settings, deps: _LazyDeps, clip: ClipState,
-                  lang: str, script: ClipScript) -> Path:
+                  lang: str, script: ClipScript, transcript: Transcript | None = None) -> Path:
     from .stages.captions import make_captions
 
     out_dir = store.clip_dir(clip.index, lang)
     _unlink_outputs(out_dir, "final.mp4", "render.json")
     _invalidate(store, clip, lang, ("render",))
+    if not settings.voiceover:
+        from . import ffmpeg
+        from .stages.original_captions import make_original_captions, same_language
+
+        if transcript is None:
+            transcript = _load_transcript(store)
+        how = ("from the original speech" if same_language(transcript.language, lang)
+               else f"translated from {transcript.language}")
+        rep.start("captions", clip.index, lang, how)
+        ass = make_original_captions(transcript=transcript, moment=clip.moment,
+                                     clip_duration=ffmpeg.duration(store.clip_dir(clip.index) / "cut.mp4"),
+                                     lang=lang, settings=settings, out_dir=out_dir, translate=_translate_fn(deps))
+        rep.done("captions", clip.index, lang, f"{ass.name} ({how})")
+        return ass
     rep.start("captions", clip.index, lang)
     ass = make_captions(narration=script.narration, voice_wav=out_dir / "voice.wav", lang=lang,
                         transcriber=deps.transcriber, settings=settings, out_dir=out_dir)
@@ -617,7 +690,10 @@ def _run_render(store: JobStore, rep: _Reporter, settings: Settings, clip: ClipS
     _unlink_outputs(out_dir, "final.mp4", "render.json")
     _invalidate(store, clip, lang, ("render",))
     engine = settings.captions.engine
-    rep.start("render", clip.index, lang, "captions: HyperFrames" if engine == "hyperframes" else "")
+    notes = ["captions: HyperFrames"] if engine == "hyperframes" else []
+    if not settings.voiceover:
+        notes.append("original audio, no voice-over")
+    rep.start("render", clip.index, lang, "; ".join(notes))
     outcome = render_clip(cut=store.clip_dir(clip.index) / "cut.mp4", out_dir=out_dir, settings=settings,
                           on_progress=rep.progress("render", clip.index, lang), hf_env_cache=hf_env_cache)
     write_render_stamp(out_dir, settings, outcome)
@@ -630,37 +706,66 @@ def _run_render(store: JobStore, rep: _Reporter, settings: Settings, clip: ClipS
         message = f"{final.name} (ASS fallback: {outcome.reason or outcome.warning})"
     elif outcome.engine_used == "hyperframes":
         message = f"{store.rel(final)} (HyperFrames {settings.hyperframes.style} captions)"
+    if not settings.voiceover:
+        message += " - voice-over off"
     rep.done("render", clip.index, lang, message)
     return final
+
+
+def _add_narration(store: JobStore, rep: _Reporter, settings: Settings, deps: _LazyDeps,
+                   transcript: Transcript, clip: ClipState, lang: str, script: ClipScript,
+                   script_path: Path) -> ClipScript:
+    """Voice-over is on but script.json has no narration (it was written with the voice-over off): write
+    one, keeping the title, description and hashtags."""
+    from .stages.script import add_narration
+
+    rep.start("script", clip.index, lang, "writing the narration (voice-over turned on)")
+    script = add_narration(llm=deps.llm, transcript=transcript, moment=clip.moment, lang=lang, script=script,
+                           out_json=script_path, script_settings=settings.script)
+    rep.done("script", clip.index, lang, "narration written; title kept")
+    return script
 
 
 def _process_clip_lang(store: JobStore, rep: _Reporter, settings: Settings, deps: _LazyDeps,
                        transcript: Transcript, clip: ClipState, lang: str,
                        hf_env_cache: dict | None = None) -> None:
     from .stages.render import render_is_current, write_metadata
-    from .stages.script import load_script, write_script
+    from .stages.script import load_script, write_metadata_script, write_script
 
     state = clip.langs[lang]
     state.error = None
     out_dir = store.clip_dir(clip.index, lang)
     script_path = out_dir / "script.json"
+    vo = settings.voiceover
     stage = "script"
     try:
         # script
         regenerated = False
         if output_exists(script_path):
             script = load_script(script_path)
-            rep.skip("script", clip.index, lang, "script.json")
-        else:
+            if vo and not script.narration.strip():
+                script = _add_narration(store, rep, settings, deps, transcript, clip, lang, script, script_path)
+                regenerated = True
+            else:
+                rep.skip("script", clip.index, lang, "script.json")
+        elif vo:
             rep.start("script", clip.index, lang, f"{clip.moment.duration:.1f}s clip")
             script = write_script(llm=deps.llm, transcript=transcript, moment=clip.moment, lang=lang,
                                   out_json=script_path, script_settings=settings.script)
             regenerated = True
             rep.done("script", clip.index, lang, script.title)
+        else:
+            rep.start("script", clip.index, lang, "title, description, hashtags (voice-over off)")
+            script = write_metadata_script(llm=deps.llm, transcript=transcript, moment=clip.moment, lang=lang,
+                                           out_json=script_path)
+            regenerated = True
+            rep.done("script", clip.index, lang, script.title)
 
-        # voice (skipped only when voice.json matches the current narration)
+        # voice (skipped only when voice.json matches the current narration, or the voice-over is off)
         stage = "voice"
-        if not regenerated and _voice_is_current(out_dir, script):
+        if not vo:
+            _skip_voice(store, rep, clip, lang)
+        elif not regenerated and _voice_is_current(out_dir, script):
             rep.skip("voice", clip.index, lang, "voice.wav matches script")
         else:
             # Lengthen only a narration the LLM wrote, never one the user edited before a resume:
@@ -670,13 +775,12 @@ def _process_clip_lang(store: JobStore, rep: _Reporter, settings: Settings, deps
                                 allow_lengthen=allow_lengthen)
             regenerated = True
 
-        # captions
+        # captions (redone when they were made for the other voice-over mode)
         stage = "captions"
-        if (not regenerated and output_exists(out_dir / "captions.ass")
-                and output_exists(out_dir / "words.json")):
+        if not regenerated and _captions_current(out_dir, settings):
             rep.skip("captions", clip.index, lang, "captions.ass")
         else:
-            _run_captions(store, rep, settings, deps, clip, lang, script)
+            _run_captions(store, rep, settings, deps, clip, lang, script, transcript)
             regenerated = True
 
         # render (+ metadata, always refreshed because it is cheap and follows script.json edits)
@@ -706,15 +810,19 @@ def _process_clip_lang(store: JobStore, rep: _Reporter, settings: Settings, deps
 def run_job(source: str, *, settings: Settings | None = None, deps: Deps | None = None,
             langs: list[str] | None = None, count: int | None = None, min_seconds: float | None = None,
             max_seconds: float | None = None, job_id: str | None = None, log: LogFn = print,
-            debug: bool = False) -> JobStore:
+            debug: bool = False, voiceover: bool | None = None) -> JobStore:
     """Run (or resume, with job_id) a whole job. Returns the JobStore with the final job state.
+
+    ``voiceover`` (run --no-voiceover / --voiceover, web options.voiceover) is stored in job.json as the
+    job's mode. None keeps the job's stored mode; a new job stores the `voiceover` setting, so later
+    Settings changes do not switch it (a job without a stored mode predates the option: on).
 
     Raises PipelineError when a job-level stage fails. Per clip-language failures are recorded in
     job.json (ClipLangState.error) and do not raise.
     """
     base = settings if settings is not None else load_settings()
-    s = effective_settings(base, langs=langs, count=count, min_seconds=min_seconds, max_seconds=max_seconds)
-    lazy = _LazyDeps(s, deps)
+    s = effective_settings(base, langs=langs, count=count, min_seconds=min_seconds, max_seconds=max_seconds,
+                           voiceover=voiceover)
 
     if job_id:
         try:
@@ -724,13 +832,19 @@ def run_job(source: str, *, settings: Settings | None = None, deps: Deps | None 
     else:
         if not source:
             raise PipelineError("no source given: pass a video file path or a URL")
-        store = JobStore.create(source)
+        store = JobStore.create(source, voiceover=s.voiceover)  # fixed: later Settings changes don't switch it
     rep = _Reporter(store, log, debug)
     job = store.job
+    if voiceover is not None:
+        job.voiceover = bool(voiceover)
+    s = settings_for_job(job, s)
+    lazy = _LazyDeps(s, deps)
     job.status = "running"
     job.error = None
     store.save()
     log(f"[{job.id}] job dir {store.dir}")
+    if not s.voiceover:
+        log(f"[{job.id}] voice-over off: captions from the original speech, original audio kept")
 
     stage = "ingest"
     try:
@@ -816,19 +930,27 @@ def rerender(job_id: str, clip: int, lang: str, *, settings: Settings | None = N
     out_dir = store.clip_dir(clip, lang)
 
     rep = _Reporter(store, log, debug)
+    s = settings_for_job(job, s)
     lazy = _LazyDeps(s, deps)
     state.error = None
     stage = "script"
     try:
         script = load_script(script_path)
-        rep.done("script", clip, lang, "loaded script.json")
+        transcript: Transcript | None = None
+        if s.voiceover and not script.narration.strip():
+            transcript = _load_transcript(store)
+            script = _add_narration(store, rep, s, lazy, transcript, cs, lang, script, script_path)
+        else:
+            rep.done("script", clip, lang, "loaded script.json")
         stage = "voice"
-        if _voice_is_current(out_dir, script):
+        if not s.voiceover:
+            _skip_voice(store, rep, cs, lang)
+        elif _voice_is_current(out_dir, script):
             rep.skip("voice", clip, lang, "narration unchanged")
         else:
             script = _run_voice(store, rep, s, lazy, cs, lang, script, script_path, allow_lengthen=False)
         stage = "captions"
-        _run_captions(store, rep, s, lazy, cs, lang, script)
+        _run_captions(store, rep, s, lazy, cs, lang, script, transcript)
         stage = "render"
         final = _run_render(store, rep, s, cs, lang, script, {})
     except Exception as e:

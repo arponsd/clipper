@@ -161,6 +161,9 @@ class WebSettings(BaseModel):
 
 class Settings(BaseModel):
     languages: list[Literal["en", "hi"]] = ["en", "hi"]
+    # Voice-over narration. False = captions only: no narration script, no Voicebox; the clip keeps its
+    # original audio and the captions are made from the original speech (translated for other languages).
+    voiceover: bool = True
     llm: LLMSettings = Field(default_factory=LLMSettings)
     whisper: WhisperSettings = Field(default_factory=WhisperSettings)
     voicebox: VoiceboxSettings = Field(default_factory=VoiceboxSettings)

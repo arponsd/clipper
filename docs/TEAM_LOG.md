@@ -1288,3 +1288,150 @@ The manual run used port 8767 with `AUTOCLIPPER_DATA_DIR=~/.cache/ac-step4/data-
 - **Notes:**
   - DELETE on a YouTube account revokes at Google by default (`revoke=true`), so a disconnect makes a network call. Use `?revoke=false` or `--no-revoke` for tests with fake tokens.
   - The README's `icacls ... "%USERNAME%"` is cmd syntax. In PowerShell it is `$env:USERNAME`, so it should say "run in cmd".
+
+## Builder (voice-over on/off, "captions only"), 2026-11-23
+
+Worktree `auto-clipper-novo`, branch `feat-no-voiceover`. Nothing committed, nothing published, the user's
+server on :8765 and its data dir were not touched (sample job copied read-only).
+
+### What I built
+- **Setting** `voiceover: bool = true` (top level, Settings > General "Voice-over narration" with a hint;
+  the Voicebox and Narration-script fieldsets grey out with a note while it is off). CLI `settings set voiceover=false`.
+- **Per-job override:** `run --no-voiceover` / `--voiceover` (mutually exclusive), web New-job checkbox
+  (starts at the setting; `options.voiceover` sent only when changed). Stored as `Job.voiceover` in job.json, so
+  resume and rerender keep the job's mode; None follows the setting.
+- **Pipeline (off):** script = title/description/hashtags only (`LLM.write_publish_metadata`, narration "");
+  voice stage `skipped` "voice-over off" with no Voicebox client built; captions from the original speech
+  (new `stages/original_captions.py`): same language -> Whisper words re-based to clip time (edge words
+  clamped); other language -> one `LLM.translate_segments` call per clip-lang with segment ids, each line
+  timed over its original span by character length, cached in `caption_translation.json`; render with no
+  voice input (original at `original_volume_after`, loudnorm + limiter). Both caption engines use the same words.json.
+- **Staleness:** `captions.json` stamp (written only when off; removed by voice-mode captions) and
+  `render.json "voiceover": false` (absent = on, so existing renders stay current). Mode switch -> captions +
+  render redone. Turning it on for an empty narration -> `add_narration` (title etc. kept) + voice. voice.wav is
+  kept across switches, so on->off->on reuses the voice.
+- **Web:** detail adds `voiceover`, `voiceover_override`, per clip-lang `voiceover`, `rendered_voiceover`;
+  clip page hides the narration (info note), shows "Voice-over: off", Save accepts an empty narration only when
+  off; stale hint "Voice-over turned on/off - re-render to apply". Publish `voice_stale` ignores finals rendered
+  without voice. Doctor: one OK row "not needed: voice-over is off".
+- Optional LLM capabilities are a separate protocol (`interfaces.CaptionsOnlyLLM`), used via getattr like
+  `lengthen`; an LLM without `write_publish_metadata` falls back to `write_script` and drops the narration.
+- Docs: README (Settings row, "Captions only (no voice-over)" section, CLI usage, data layout, doctor) and
+  CONTRACT_WEB section 11.
+
+### Tests
+- New `tests/test_voiceover_off.py` (27) and `tests/test_voiceover_llm.py` (8); `tests/fakes.py` FakeLLM gained
+  `write_publish_metadata` and `translate_segments` (additive).
+- Changed one existing test: `test_web_jobs.py::test_job_detail_structure` pins the exact detail keys; I added
+  the new additive keys there (contract extension, not a behaviour change).
+- Full suite: `TMPDIR=~/.cache/ac-novo uv run pytest -q -p no:cacheprovider --basetemp ~/.cache/ac-novo/bt-builder`
+  -> **1241 passed**, 2 deselected (re-run after the final docs/JS changes: same).
+
+### Real render (data copy `~/.cache/ac-novo/data-builder`, settings `voiceover=false`)
+- Real Claude wrote captions-only metadata for clip 01 en/hi (en title from the copied job's moment, hi in
+  Devanagari); the copied narration scripts were kept aside as `script.voiceover.json`.
+- `autoclipper rerender <job> 1 en|hi`: voice `skipped (voice-over off)`, no Voicebox; en captions from
+  Whisper (71 words), hi from one translation call (7 lines -> 82 words). Render 3.9 s (en) / 9.9 s (hi incl. the LLM call).
+- Audio: cut -25.1 LUFS -> final -14.2 LUFS; the 0.5 s level envelope follows the cut at a constant +11.0 dB
+  (p10..p90 +10.5..+11.2) = original only, no ducking. The old voice-over final varied -16.5..+12.6 dB.
+- Frames: English words match the speech, Hindi Devanagari shaped correctly (e.g. छूने), highlight works.
+- Web on :8771 (stopped after): clip page hides narration, Save with empty narration -> 200 and metadata.json
+  updated; job page shows "Voice-over: off - captions only (from Settings)" and the re-render hint on clip 00;
+  Settings greys Voicebox/script. No console errors.
+
+### Notes for the lead
+- Publish disclosure flags (`contains_synthetic_media`, FB `is_ai_generated`) stay true by default even for
+  captions-only clips (no AI voice). Not changed: it is a publishing-policy decision.
+- Pre-existing nit seen in the real run: `_clean_title` strips a leading `"` but not an inner closing one
+  (`Slipped the Surly Bonds of Earth" – ...`). Not touched.
+- The web job page has no per-job voice-over toggle for existing jobs (CLI `run --job X --no-voiceover` does it);
+  with no override a job follows Settings, and a clip re-render applies it.
+
+## Reviewer (UX + output, voice-over on/off), 2026-11-23
+
+Data copy `~/.cache/ac-novo/data-reviewer`, server on :8772 (stopped). Full suite: 1241 passed.
+- **Main issue:** a job without its own override follows the *current* setting. The user's existing job (made with
+  the voice-over) reports `voiceover: false` and every clip "Voice-over turned off - re-render to apply" as soon as
+  Settings is switched off; a later re-render (e.g. to fix a title) silently drops the voice-over. The New-job form
+  sends `options.voiceover` only when it differs from the setting, so new jobs have no pinned mode either.
+  Suggest: pin the effective mode in job.json at creation (web + CLI), and treat legacy `None` jobs as `true`.
+- Job page: the skipped voice stage reads "Voice 100%"; "voice-over off" is only in the tooltip.
+- Settings: Audio mix still shows under-voice / duck / voice-volume fields as active while off; the label
+  "Original volume without voice / Level before and after the narration" is what applies in captions-only mode.
+- Clip page, voice-over ON with an empty narration (script written while off): Save is blocked by "Narration cannot
+  be empty", so a title edit can't be saved without writing a narration.
+- Output OK: final audio aligned with source (30 ms), -25.1 -> -14.2 LUFS, no voice; en captions match speech;
+  hi translation (cached) is good and shaped correctly in both ass and HyperFrames (rendered hi with HF here);
+  web Save (title, hidden narration preserved) and web Re-render work; 401/403/404/422 checked.
+
+## Reviewer (correctness, voice-over on/off), 2026-11-23
+
+Full suite: 1241 passed. Probed `original_captions` directly (boundary words, partial/mismatched
+translations, zero-length words) and `settings set voiceover=...` on a data copy. Findings:
+
+- MEDIUM: a job's mode is not frozen unless explicitly overridden. `run_job` only writes `job.voiceover`
+  when a flag/option is given; a CLI run without a flag or a web job left at the default keeps
+  `voiceover=None`, so resuming after a Settings change silently switches mode (clip-langs
+  already rendered are re-rendered in the other mode, any half-done ones come out mixed).
+- LOW-MED: partial translations are cached as-is (`caption_translation.json` keyed only on source lines);
+  later renders hit the cache and never retry the missing lines, which stay uncaptioned.
+- LOW: `translate_lines` does `int(k)` on the result keys without a guard, so a non-numeric id raises a
+  bare ValueError instead of CaptionsError (AnthropicLLM itself normalises the ids).
+- LOW: a clip with no speech plus caption engine hyperframes gets `words.json has no words`, which is
+  shown as "HyperFrames captions failed ... used ASS captions" (a false failure warning).
+- LOW: translated lines take their source segment's span. A one-word or zero-length Whisper segment
+  makes the translated sentence flash for about 10 ms. A segment with a long pause spreads its
+  captions over the silence.
+- LOW: on the New job form, `voiceover` is sent only when it differs from the setting as it was when
+  the form loaded. A Settings change made in another tab before submitting flips the job's mode.
+Clip-boundary trimming, same-language re-basing, staleness on toggle (captions stamp + render stamp),
+rerender in both directions, render graph with no voice input, CLI flag precedence and doctor are correct.
+
+## Lead triage + sign-off (voice-over on/off), 2026-11-23
+
+**Triage of review findings:**
+- **C1 / UX1 (job mode not fixed): ACCEPTED (blocker).** The mode is now fixed when the job is created.
+  - `JobStore.create(source, voiceover=...)` writes it in the first save.
+  - CLI `run`: for a new job, the setting or the flag.
+  - Web `POST /api/jobs`: `options.voiceover`, or the current setting when it is null. The resolved bool goes to options.json and job.json.
+  - `pipeline.job_voiceover`: `None` (legacy job) = **on**, whatever the setting.
+  - The worker no longer passes the mode from options.json, so job.json is the only source and `run --job ID --no-voiceover` still switches a job.
+  - Job page text: "(fixed for this job; the Settings switch applies to new jobs)". The CLI job view always shows the mode. README and CONTRACT_WEB section 11 are updated.
+- **C6 (form sends only when changed): ACCEPTED.** app.js always sends `options.voiceover`.
+- **C2 (partial translation cached for good): ACCEPTED.** A cache entry missing ids makes the next render ask again; the lines it already had are kept (merged).
+- **C3 (`int(k)` unguarded): ACCEPTED.** `_parse_translation` ignores non-numeric ids and non-dict results. Nothing usable gives a CaptionsError.
+- **C4 (no-speech clip + hyperframes = false fallback warning): ACCEPTED.** `render_clip` renders with no captions when words.json is a valid empty list. `engine_used` is hyperframes, there is no warning, and no probe or overlay runs.
+- **C5 (zero-length / long-pause timing): ACCEPTED.**
+  - Translated words go over the spoken parts of the line only: word runs merged across pauses up to 0.6 s. Each word sits in the span that holds its middle, so nothing is shown across a pause.
+  - A line shorter than max(0.8 s, 0.25 s/word) is held into the following silence, but never into the next line or past the clip end.
+- **UX2 ("Voice 100%" for skipped): ACCEPTED.** Stage boxes and mini stages show "off" (voice-over off) or "skipped".
+- **UX3 (Audio mix fields active while off): ACCEPTED.** The under-voice, duck, voice-volume and max-speed-up fields grey out with a tooltip. The `original_volume_after` hint says it is the whole-clip level when the voice-over is off.
+- **UX4 (empty narration blocks a title save with voice-over on): ACCEPTED.**
+  - An empty narration is accepted, client and server, only when the saved script has none yet; Re-render then writes one.
+  - Emptying an existing narration is still 422.
+- **UX5 (line grouping before the next sentence): REJECTED for this change.** It is pre-existing behaviour in both modes, not part of this feature.
+- **Builder notes (synthetic-media flags, `_clean_title` quote): left as is.** They are out of scope and need a policy decision.
+
+**Tests:**
+- New file `tests/test_voiceover_lead.py` with 8 tests:
+  - fixed mode in both directions through resume and rerender
+  - legacy job = on over the web after the setting is turned off
+  - partial cache completed
+  - non-numeric ids
+  - zero-length hold and clip-end clamp
+  - long-pause skip
+  - no-speech + hyperframes
+  - empty narration save with the voice-over on
+- Updated tests that encoded the old "follows the setting" behaviour:
+  - `test_voiceover_off`: toggle via the `voiceover=` kwarg, plus checks that a Settings change does not switch an existing job.
+  - `test_web_jobs`: options.json now always has `voiceover`.
+- **Full suite: 1249 passed, 2 deselected** (`--basetemp ~/.cache/ac-novo/bt-lead`).
+
+**Real check:**
+- Setup: data copy `~/.cache/ac-novo/data-lead`, legacy job set to `voiceover:false`, the builder's cached translation copied in.
+- `rerender <job> 1 hi`: voice skipped, no LLM call (complete cache), ass engine.
+  - Final -14.2 LUFS vs cut -25.1; one AAC 48 kHz stereo stream; render.json `voiceover:false`.
+  - Frames show shaped Devanagari with the highlight.
+  - 82 words. The pauses at 3.1-3.9, 6.8-8.0, 12.3-13.2 and 26.6-28.0 s now have no caption shown over them.
+- Not checked: the web UI was not opened in a browser after these JS changes (`node --check` passes).
+- No server was started, nothing was committed, nothing was published.

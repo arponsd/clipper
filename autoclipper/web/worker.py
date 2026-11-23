@@ -69,10 +69,14 @@ class JobOptions:
     min_seconds: float | None = None
     max_seconds: float | None = None
     langs: list[str] | None = None
+    voiceover: bool | None = None  # the job's mode (the API fills in the setting); None = keep job.json's
 
     def to_dict(self) -> dict:
-        return {"clips": self.clips, "min_seconds": self.min_seconds, "max_seconds": self.max_seconds,
-                "langs": list(self.langs) if self.langs is not None else None}
+        d = {"clips": self.clips, "min_seconds": self.min_seconds, "max_seconds": self.max_seconds,
+             "langs": list(self.langs) if self.langs is not None else None}
+        if self.voiceover is not None:
+            d["voiceover"] = self.voiceover
+        return d
 
 
 class TaskCancelled(BaseException):
@@ -101,9 +105,11 @@ def read_options(job_id: str) -> JobOptions | None:
     if not isinstance(data, dict):
         return None
     langs = data.get("langs")
+    vo = data.get("voiceover")
     return JobOptions(clips=data.get("clips"), min_seconds=data.get("min_seconds"),
                       max_seconds=data.get("max_seconds"),
-                      langs=list(langs) if isinstance(langs, list) else None)
+                      langs=list(langs) if isinstance(langs, list) else None,
+                      voiceover=vo if isinstance(vo, bool) else None)
 
 
 def read_job(job_id: str) -> Job | None:
@@ -300,8 +306,13 @@ class Worker:
         self._queue.append(task)
         self._cond.notify_all()
 
-    def submit_job(self, source: str, *, options: JobOptions, upload: Path | None = None) -> Task:
-        store = JobStore.create(source)  # the one request-thread write: a brand-new job (CONTRACT 1a)
+    def submit_job(self, source: str, *, options: JobOptions, upload: Path | None = None,
+                   voiceover_default: bool = True) -> Task:
+        """``voiceover_default`` (the `voiceover` setting) is stored as the job's mode when the options
+        have none, so a later Settings change never switches this job."""
+        vo = options.voiceover if options.voiceover is not None else bool(voiceover_default)
+        # the one request-thread write: a brand-new job (CONTRACT 1a), its voice-over mode fixed in it
+        store = JobStore.create(source, voiceover=vo)
         job_id = store.job.id
         try:
             if upload is not None:
@@ -611,6 +622,8 @@ class Worker:
                         if langs is None and job is not None and job.clips and \
                                 not options_path(task.job_id).exists():
                             langs = sorted({lang for c in job.clips for lang in c.langs}) or None
+                        # the voice-over mode is not passed: job.json holds it (fixed at creation, or
+                        # switched with `run --job ID --no-voiceover`), and run_job keeps it.
                         self._run_job(job.source if job is not None else "", settings=settings, deps=deps,
                                       langs=langs, count=o.clips, min_seconds=o.min_seconds,
                                       max_seconds=o.max_seconds, job_id=task.job_id, log=log_line)

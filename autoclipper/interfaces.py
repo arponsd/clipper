@@ -79,3 +79,18 @@ class Transcriber(Protocol):
                    on_progress: ProgressFn | None = None) -> Transcript:
         """Word-timestamped transcript. language=None -> auto-detect."""
         ...
+
+
+@runtime_checkable
+class CaptionsOnlyLLM(Protocol):
+    """Optional LLM capabilities for voice-over off (captions only). Not part of LLM so older fakes and
+    clients stay valid; callers use getattr(llm, ..., None) and fall back when they are missing."""
+
+    def write_publish_metadata(self, *, lang: str, clip_transcript: str, moment: Moment,
+                               duration: float) -> ClipScript:
+        """Title/description/hashtags in `lang` for a clip posted with its original audio (narration "")."""
+        ...
+
+    def translate_segments(self, *, lang: str, source_lang: str, segments: list[dict]) -> dict[int, str]:
+        """Translate caption lines [{"id": int, "text": str}] into `lang`; returns {id: translated text}."""
+        ...

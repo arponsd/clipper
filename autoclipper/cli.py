@@ -121,7 +121,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         job_id = JobStore.create(source).job.id
     with hold_job_lock(job_id) if job_id else contextlib.nullcontext():
         store = run_job(source, settings=settings, langs=args.langs, count=args.clips,
-                        min_seconds=args.min, max_seconds=args.max, job_id=job_id, log=_out, debug=args.debug)
+                        min_seconds=args.min, max_seconds=args.max, job_id=job_id, log=_out, debug=args.debug,
+                        voiceover=args.voiceover)
     _out()
     _print_status(store.job, store.dir)
     return 0 if store.job.status == "done" else 1
@@ -155,6 +156,10 @@ def _print_status(job: Any, job_dir: Path) -> None:
     _out(f"  dir:    {job_dir}")
     if job.error:
         _out(f"  error:  {job.error}")
+    if getattr(job, "voiceover", None) is False:
+        _out("  voice-over: off (captions only)")
+    else:
+        _out("  voice-over: on")
     _out("  stages: " + "  ".join(f"{name}={st.status}" for name, st in job.stages.items()))
     if not job.clips:
         return
@@ -410,6 +415,8 @@ def check_fonts(run: Runner = _run_cmd, which: Callable[[str], str | None] = shu
 
 
 def check_voicebox(settings: Settings, client_factory: Callable[[Settings], Any] | None = None) -> list[Check]:
+    if not settings.voiceover:  # captions only: Voicebox is never called
+        return [Check("voicebox", "ok", "not needed: voice-over is off (captions only)")]
     out = []
     try:
         if client_factory is None:
@@ -689,6 +696,13 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--max", type=_positive_float, help="max clip length in seconds")
     r.add_argument("--langs", type=_langs_arg, help="comma separated languages, e.g. en,hi")
     r.add_argument("--job", help="resume an existing job id instead of creating a new one")
+    vo = r.add_mutually_exclusive_group()
+    vo.add_argument("--no-voiceover", dest="voiceover", action="store_false", default=None,
+                    help="captions only: no narration or Voicebox; keep the original audio and caption the "
+                         "original speech (default for a new job: the `voiceover` setting; stored with the job, "
+                         "so with --job it switches an existing job)")
+    vo.add_argument("--voiceover", dest="voiceover", action="store_true", default=None,
+                    help="add the narration voice-over for this job even if the `voiceover` setting is off")
     r.set_defaults(func=cmd_run)
 
     rr = sub.add_parser("rerender", parents=[common], help="re-render one clip from its edited script.json")

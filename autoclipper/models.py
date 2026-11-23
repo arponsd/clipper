@@ -74,5 +74,8 @@ class Job(BaseModel):
     status: Literal["queued", "running", "done", "failed"] = "queued"
     error: str | None = None
     created_at: float
+    # Per-job voice-over override (run --no-voiceover / web "options.voiceover"). None = follow the
+    # `voiceover` setting.
+    voiceover: bool | None = None
     stages: dict[str, StageState] = Field(default_factory=dict)
     clips: list[ClipState] = Field(default_factory=list)

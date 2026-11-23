@@ -102,13 +102,8 @@ def load_script(path: Path) -> ClipScript:
         raise ScriptError(f"could not read {path}: {e}; fix the JSON or delete it to regenerate") from e
 
 
-def write_script(*, llm: LLM, transcript: Transcript, moment: Moment, lang: str,
-                 out_json: Path, script_settings: ScriptSettings | None = None) -> ClipScript:
-    """Ask the LLM for the script, shorten once if far too long, normalize and write out_json.
-
-    With ``script_settings`` the word target uses its per-language words/s and fill_ratio, and the
-    LLM is also told the spoken duration to fill (target_seconds). Without it, step-1 constants.
-    """
+def _generate_script(*, llm: LLM, transcript: Transcript, moment: Moment, lang: str,
+                     script_settings: ScriptSettings | None = None) -> ClipScript:
     duration = moment.end - moment.start
     clip_transcript = format_transcript(transcript, moment.start, moment.end)
     if script_settings is None:
@@ -127,9 +122,53 @@ def write_script(*, llm: LLM, transcript: Transcript, moment: Moment, lang: str,
         shorter = llm.shorten(lang=lang, narration=script.narration, max_words=target)
         if shorter.strip():
             script = script.model_copy(update={"narration": shorter})
-    script = normalize_script(script)
+    return normalize_script(script)
+
+
+def write_script(*, llm: LLM, transcript: Transcript, moment: Moment, lang: str,
+                 out_json: Path, script_settings: ScriptSettings | None = None) -> ClipScript:
+    """Ask the LLM for the script, shorten once if far too long, normalize and write out_json.
+
+    With ``script_settings`` the word target uses its per-language words/s and fill_ratio, and the
+    LLM is also told the spoken duration to fill (target_seconds). Without it, step-1 constants.
+    """
+    script = _generate_script(llm=llm, transcript=transcript, moment=moment, lang=lang,
+                              script_settings=script_settings)
     save_script(script, out_json)
     return script
+
+
+def write_metadata_script(*, llm: LLM, transcript: Transcript, moment: Moment, lang: str,
+                          out_json: Path) -> ClipScript:
+    """Voice-over off: script.json with title/description/hashtags in ``lang`` and an empty narration.
+
+    Uses the LLM's optional ``write_publish_metadata``; an LLM without it writes a normal script, whose
+    narration is then dropped (it would never be spoken).
+    """
+    duration = moment.end - moment.start
+    clip_transcript = format_transcript(transcript, moment.start, moment.end)
+    fn = getattr(llm, "write_publish_metadata", None)
+    if callable(fn):
+        script = fn(lang=lang, clip_transcript=clip_transcript, moment=moment, duration=duration)
+    else:
+        script = llm.write_script(lang=lang, clip_transcript=clip_transcript, moment=moment,
+                                  duration=duration, target_words=target_words(duration, lang))
+    script = normalize_script(script.model_copy(update={"narration": ""}))
+    if not script.title:
+        raise ScriptError(f"the LLM returned an empty {lang} title")
+    save_script(script, out_json)
+    return script
+
+
+def add_narration(*, llm: LLM, transcript: Transcript, moment: Moment, lang: str, script: ClipScript,
+                  out_json: Path, script_settings: ScriptSettings | None = None) -> ClipScript:
+    """Voice-over turned on for a script written without narration: ask the LLM for a narration and keep
+    the existing (possibly user-edited) title, description and hashtags."""
+    fresh = _generate_script(llm=llm, transcript=transcript, moment=moment, lang=lang,
+                             script_settings=script_settings)
+    merged = script.model_copy(update={"narration": fresh.narration})
+    save_script(merged, out_json)
+    return merged
 
 
 def make_shorten_fn(llm: LLM, lang: str) -> ShortenFn:
