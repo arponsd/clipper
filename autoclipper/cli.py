@@ -476,6 +476,122 @@ def check_node(run: Runner = _run_cmd, which: Callable[[str], str | None] = shut
     return Check("node", "ok", version)
 
 
+def check_hyperframes(settings: Settings, run: Callable[..., Any] | None = None,
+                      which: Callable[[str], str | None] = shutil.which) -> list[Check]:
+    """node / hyperframes / chrome / vp9 alpha / caption engine rows. Always warn, never fail
+    (HyperFrames is optional and falls back to ASS). Local commands only, 30 s timeout each."""
+    from .stages import hyperframes as hf
+
+    h = settings.hyperframes
+    engine = settings.captions.engine
+    install = (f"PATH=<node22>/bin:$PATH npm --prefix {h.package_dir} install --save-exact "
+               f"{hf.HF_PACKAGE}@{hf.HF_VERSION_PIN}")
+
+    def call(args: list[str], cwd: Path | None) -> "subprocess.CompletedProcess[str]":
+        if run is not None:
+            return run(args)
+        return hf._run(args, cwd=cwd, env=hf.child_env(h, None, api_key_env=settings.llm.api_key_env,
+                                                       node=node), timeout=30)
+
+    checks: list[Check] = []
+    problems = False
+    node = hf.resolve_node(h, which)
+    node_ok = False
+    if node is None:
+        where = f"in {h.node_bin_dir}" if h.node_bin_dir.strip() else "on PATH"
+        checks.append(Check("node", "warn", f"not found {where} - HyperFrames captions need Node "
+                                            f"{hf.MIN_NODE_MAJOR}+ (set hyperframes.node_bin_dir)"))
+    else:
+        version: str | None
+        try:
+            version = (call([str(node), "--version"], None).stdout or "").strip()
+        except (OSError, subprocess.SubprocessError) as e:
+            version = None
+            checks.append(Check("node", "warn", f"cannot run {node}: {e}"))
+        if version is not None:
+            major = hf.parse_major(version)
+            if major is None:
+                checks.append(Check("node", "warn", f"cannot read the version of {node}"))
+            elif major < hf.MIN_NODE_MAJOR:
+                checks.append(Check("node", "warn", f"{version} ({node}) is older than {hf.MIN_NODE_MAJOR} - "
+                                                    "HyperFrames captions need Node 22+"))
+            else:
+                node_ok = True
+                checks.append(Check("node", "ok", f"{version} ({node})"))
+    problems |= not node_ok
+
+    cli = hf.resolve_cli(h)
+    hf_ok = False
+    if cli is None:
+        checks.append(Check("hyperframes", "warn", f"not installed at {hf.cli_path(h)} - install with: {install}"))
+    elif not node_ok:
+        checks.append(Check("hyperframes", "warn", f"installed at {h.package_dir} but needs Node "
+                                                   f"{hf.MIN_NODE_MAJOR}+ to run"))
+    else:
+        try:
+            proc = call([str(node), str(cli), "--version"], cli.parent)
+            out = (proc.stdout or "").strip().splitlines()
+            version = out[-1].strip() if proc.returncode == 0 and out else ""
+        except (OSError, subprocess.SubprocessError) as e:
+            version = ""
+            out = [str(e)]
+        if not version:
+            checks.append(Check("hyperframes", "warn", f"the CLI at {cli} does not run ({' '.join(out)[:200]})"))
+        elif hf.find_gsap(cli) is None:
+            checks.append(Check("hyperframes", "warn", f"{version} ({h.package_dir}) has no vendored GSAP - "
+                                                       f"reinstall {hf.HF_PACKAGE}@{hf.HF_VERSION_PIN}"))
+        elif version != hf.HF_VERSION_PIN:
+            hf_ok = True
+            checks.append(Check("hyperframes", "warn", f"{version} ({h.package_dir}); tested with "
+                                                       f"{hf.HF_VERSION_PIN} (still usable)"))
+        else:
+            hf_ok = True
+            checks.append(Check("hyperframes", "ok", f"{version} ({h.package_dir})"))
+    problems |= not hf_ok
+
+    chrome_ok = False
+    if hf_ok and node is not None and cli is not None:
+        try:
+            proc = call([str(node), str(cli), "browser", "path"], cli.parent)
+            lines = [ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()]
+            path = lines[-1] if proc.returncode == 0 and lines else ""
+        except (OSError, subprocess.SubprocessError):
+            path = ""
+        if path:
+            chrome_ok = True
+            checks.append(Check("hyperframes chrome", "ok", path))
+        else:
+            checks.append(Check("hyperframes chrome", "warn", f"not found - run once: {node} {cli} browser ensure "
+                                                              "(downloads about 100 MB)"))
+    else:
+        checks.append(Check("hyperframes chrome", "warn", "not checked (node or hyperframes missing)"))
+    problems |= not chrome_ok
+
+    if h.format == "webm":
+        ffmpeg_exe = which("ffmpeg")
+        vp9 = False
+        if ffmpeg_exe:
+            try:
+                proc = call([ffmpeg_exe, "-hide_banner", "-decoders"], None)
+                vp9 = bool(re.search(r"^\s*\S+\s+libvpx-vp9\s", proc.stdout or "", re.M))
+            except (OSError, subprocess.SubprocessError):
+                vp9 = False
+        if vp9:
+            checks.append(Check("ffmpeg vp9 alpha", "ok", "libvpx-vp9 decoder"))
+        else:
+            problems = True
+            checks.append(Check("ffmpeg vp9 alpha", "warn", "no libvpx-vp9 decoder (WebM alpha would be lost) - "
+                                                            "set hyperframes.format=mov"))
+    if engine != "hyperframes":
+        checks.append(Check("caption engine", "ok", "ass (set captions.engine=hyperframes for animated captions)"))
+    elif problems:
+        checks.append(Check("caption engine", "warn", "hyperframes, but a prerequisite is missing - "
+                                                      "clips will fall back to ASS captions"))
+    else:
+        checks.append(Check("caption engine", "ok", f"hyperframes ({h.style}, {h.format})"))
+    return checks
+
+
 def run_doctor(settings: Settings) -> list[Check]:
     checks = [Check("python", "ok", sys.version.split()[0]), Check("data dir", "ok", str(data_dir()))]
     checks += check_binaries()
@@ -483,7 +599,7 @@ def run_doctor(settings: Settings) -> list[Check]:
     checks.append(check_fonts())
     checks += check_voicebox(settings)
     checks.append(check_api_key(settings))
-    checks.append(check_node())
+    checks += check_hyperframes(settings)
     return checks
 
 
@@ -595,7 +711,7 @@ def build_parser() -> argparse.ArgumentParser:
     ss.add_argument("assignments", nargs="+", metavar="key.path=value")
     ss.set_defaults(func=cmd_settings_set)
 
-    sub.add_parser("doctor", parents=[common], help="check ffmpeg, fonts, Voicebox, API key, node").set_defaults(func=cmd_doctor)
+    sub.add_parser("doctor", parents=[common], help="check ffmpeg, fonts, Voicebox, API key, node + HyperFrames").set_defaults(func=cmd_doctor)
 
     sv = sub.add_parser("serve", parents=[common], help="start the local web UI (http://127.0.0.1:8765/)")
     sv.add_argument("--host", default="127.0.0.1", help="address to bind (default 127.0.0.1, loopback only)")

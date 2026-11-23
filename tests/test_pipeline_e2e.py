@@ -493,6 +493,8 @@ def _patch_doctor_all_ok(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli, "check_fonts", lambda *a, **k: ok("fonts"))
     monkeypatch.setattr(cli, "check_voicebox", lambda *a, **k: [ok("voicebox")])
     monkeypatch.setattr(cli, "check_node", lambda *a, **k: ok("node"))
+    # step 3: run_doctor uses check_hyperframes (node + HyperFrames rows) instead of check_node
+    monkeypatch.setattr(cli, "check_hyperframes", lambda *a, **k: [ok("node"), ok("hyperframes")])
 
 
 def test_doctor_command_runs(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
@@ -511,7 +513,7 @@ def test_doctor_command_runs(monkeypatch: pytest.MonkeyPatch, capsys: pytest.Cap
 
     # only a warning (node) -> still exit 0
     monkeypatch.setattr(cli, "check_fonts", lambda *a, **k: cli.Check("fonts", "ok", "fake"))
-    monkeypatch.setattr(cli, "check_node", lambda *a, **k: cli.Check("node", "warn", "v16"))
+    monkeypatch.setattr(cli, "check_hyperframes", lambda *a, **k: [cli.Check("node", "warn", "v16")])
     assert cli.main(["doctor"]) == 0
     out = capsys.readouterr().out
     assert "[WARN] node" in out and "0 problem(s), 1 warning(s)" in out

@@ -576,3 +576,7 @@ td.detail { overflow-wrap: anywhere; word-break: break-word; font-size: .88rem; 
   h1 { font-size: 1.25rem; }
   .fields { grid-template-columns: minmax(0, 1fr); }
 }
+
+/* step 3: HyperFrames settings greyed while the caption engine is "ass" (still editable) */
+fieldset.is-inactive > .fields, fieldset.is-inactive > p.muted { opacity: 0.55; }
+.caption-engine { margin: 0; }

@@ -106,6 +106,34 @@ class CaptionSettings(BaseModel):
     # None -> legacy bottom-anchored placement with margin_v.
     position_pct: float | None = Field(72.0, ge=5, le=95)
     margin_v: int = 520  # distance from bottom in px (1920 tall); used only when position_pct is None
+    # "ass" = libass burn-in (always available); "hyperframes" = animated HTML captions rendered by the
+    # optional HyperFrames CLI (Node 22+), falling back to ASS per clip when it is missing or fails.
+    engine: Literal["ass", "hyperframes"] = "ass"
+
+
+_PATH_MAX = 500
+
+
+class HyperFramesSettings(BaseModel):
+    """Optional HyperFrames caption engine (captions.engine = "hyperframes"). See CONTRACT_STEP3."""
+    # Folder that holds node / node.exe ("" = use the `node` on PATH). Also accepts <dir>/bin/node.
+    node_bin_dir: str = "~/tools/node22/bin"
+    # Folder given to `npm --prefix ... install hyperframes`.
+    package_dir: str = "~/tools/hyperframes"
+    style: Literal["pop", "karaoke"] = "pop"
+    fps: int | None = Field(None, ge=12, le=60)  # None = the cut clip's frame rate
+    format: Literal["webm", "mov"] = "webm"  # overlay codec: VP9+alpha (small) or ProRes 4444 (big)
+    workers: int = Field(0, ge=0, le=8)  # 0 = HyperFrames "auto"
+    timeout_seconds: float = Field(300.0, ge=30, le=3600)  # one clip-language overlay render
+
+    @field_validator("node_bin_dir", "package_dir")
+    @classmethod
+    def _path_text(cls, v: str) -> str:
+        if len(v) > _PATH_MAX:
+            raise ValueError(f"must be at most {_PATH_MAX} characters")
+        if any(ch in v for ch in ("\x00", "\n", "\r")):
+            raise ValueError("must not contain NUL or line breaks")
+        return v
 
 
 _EXT_RE = re.compile(r"^\.[a-z0-9]{1,9}\Z")  # \Z: "$" would accept ".mp4\n"
@@ -139,9 +167,15 @@ class Settings(BaseModel):
     captions: CaptionSettings = Field(default_factory=CaptionSettings)
     script: ScriptSettings = Field(default_factory=ScriptSettings)
     web: WebSettings = Field(default_factory=WebSettings)
+    hyperframes: HyperFramesSettings = Field(default_factory=HyperFramesSettings)
 
     def voice_for(self, lang: str) -> VoiceProfile:
         return self.voicebox.hindi if lang == "hi" else self.voicebox.english
+
+
+def expand_path(value: str) -> Path:
+    """User path setting -> Path: environment variables, then ``~`` (``%USERPROFILE%`` on Windows)."""
+    return Path(os.path.expandvars(value)).expanduser()
 
 
 def settings_path() -> Path:

@@ -892,6 +892,16 @@
     return 'pending';
   }
 
+  function captionsText(cl) {
+    if (!cl || !cl.caption_engine) return '';
+    if (cl.caption_engine === 'hyperframes') return `Captions: HyperFrames${cl.caption_style ? ' (' + cl.caption_style + ')' : ''}`;
+    return 'Captions: ASS';
+  }
+  function captionsLabel(cl) {
+    const t = captionsText(cl);
+    return t ? el('p', { class: 'small muted caption-engine', text: t }) : null;
+  }
+
   function viewJob(ctx, id) {
     let lastJson = '';
     let job = null;
@@ -1025,6 +1035,9 @@
         el('div', { class: 'mini-stages' }, CLIP_STAGES.map((k) => miniStage(k, cl.stages && cl.stages[k]))),
         cl.error ? el('p', { class: 'small field-error', role: 'alert', text: cl.error }) : null,
         cl.voice_stale ? el('p', { class: 'small notice notice-warn', text: 'Narration changed - re-render to regenerate the voice.' }) : null,
+        cl.warning ? el('p', { class: 'small notice notice-warn', role: 'status', text: cl.warning }) : null,
+        cl.render_stale ? el('p', { class: 'small notice notice-info', text: 'Caption engine/style changed - re-render to apply.' }) : null,
+        captionsLabel(cl),
         el('div', { class: 'row' },
           (cl.script || cl.final) ? el('a', { class: 'btn btn-small', href: reviewHref, 'data-fk': `rv-${c.index}-${lang}`, text: 'Review & edit' }) : null,
           cl.final && cl.download_url ? el('a', { class: 'btn btn-small', href: cl.download_url + '?token=' + encodeURIComponent(TOKEN),
@@ -1261,6 +1274,9 @@
     function renderSide() {
       swap(stagesBox, CLIP_STAGES.map((k) => miniStage(k, entry.stages && entry.stages[k])));
       swap(clipErr, entry.error ? el('p', { class: 'notice notice-error', role: 'alert', text: entry.error }) : null,
+        entry.warning ? el('p', { class: 'notice notice-warn', role: 'status', text: entry.warning }) : null,
+        entry.render_stale ? el('p', { class: 'notice notice-info', text: 'Caption engine/style changed - re-render to apply.' }) : null,
+        captionsLabel(entry),
         jobBusy() ? el('p', { class: 'notice notice-info', text: 'The whole job is being processed; editing is locked until it finishes.' }) : null);
       const v = entry.voice;
       const dur = clipDuration();
@@ -1387,6 +1403,7 @@
     captions: ['Captions', 'Burned-in word-by-word captions.'],
     script: ['Narration script', 'Speaking rate used to size the narration to the clip.'],
     web: ['Web uploads', 'Limits for files uploaded through this page.'],
+    hyperframes: ['HyperFrames captions (optional)', 'Animated captions rendered with the HyperFrames CLI (Node 22+). Used only when the caption engine is "hyperframes"; a clip falls back to ASS captions if HyperFrames is missing or fails. Run Doctor to check the install.'],
   };
   const FIELD_LABELS = {
     languages: ['Output languages', 'Each clip is narrated in every selected language.'],
@@ -1430,6 +1447,14 @@
     'captions.highlight_color': ['Highlight colour', 'ASS colour of the spoken word.'],
     'captions.position_pct': ['Vertical position', 'Centre of the caption line, % from the top.'],
     'captions.margin_v': ['Bottom margin (px)', 'Only used with the legacy bottom position.'],
+    'captions.engine': ['Caption engine', 'ass = burned-in libass captions (always available). hyperframes = animated HyperFrames captions (optional install, see README); falls back to ass per clip.'],
+    'hyperframes.node_bin_dir': ['Node folder', 'Folder with node (Node 22+), e.g. ~/tools/node22/bin or %USERPROFILE%\\tools\\node22. Empty = the node on PATH.'],
+    'hyperframes.package_dir': ['HyperFrames folder', 'Folder where `npm --prefix` installed hyperframes, e.g. ~/tools/hyperframes.'],
+    'hyperframes.style': ['Animation style', 'pop = the spoken word pops and turns the highlight colour; karaoke = words stay highlighted once spoken.'],
+    'hyperframes.fps': ['Frame rate', 'Empty = same as the clip.'],
+    'hyperframes.format': ['Overlay format', 'webm = small VP9 with alpha (needs FFmpeg with libvpx); mov = ProRes 4444 (large).'],
+    'hyperframes.workers': ['Render workers', '0 = auto. Each worker is a Chrome process (~256 MB).'],
+    'hyperframes.timeout_seconds': ['Timeout per clip (s)', 'A longer render falls back to ASS captions.'],
     'script.wps_en': ['English words per second', 'Measured speaking rate of the English voice.'],
     'script.wps_hi': ['Hindi words per second', 'Measured speaking rate of the Hindi voice.'],
     'script.fill_ratio': ['Fill ratio', 'Narration target = clip length × this.'],
@@ -1579,6 +1604,26 @@
         }
       });
       swap(content, form);
+      syncEngine(form);
+      form.addEventListener('change', () => syncEngine(form));
+    }
+
+    // HyperFrames fields stay editable but are greyed while the caption engine is "ass".
+    function syncEngine(form) {
+      const fs = form.querySelector('fieldset[data-path="hyperframes"]');
+      const sel = form.querySelector('#set-captions-engine');
+      if (!fs || !sel) return;
+      const f = fields.find((x) => x.path.join('.') === 'captions.engine');
+      let engine = null;
+      try { engine = f ? f.get() : null; } catch (e) { engine = null; }
+      const off = engine !== 'hyperframes';
+      fs.classList.toggle('is-inactive', off);
+      let note = fs.querySelector('.engine-note');
+      if (off && !note) {
+        note = el('p', { class: 'small notice notice-info engine-note', text: 'Not used: the caption engine is "ass". Set Captions › Caption engine to "hyperframes" to use these.' });
+        const legend = fs.querySelector('legend');
+        if (legend && legend.nextSibling) fs.insertBefore(note, legend.nextSibling.nextSibling || null); else fs.appendChild(note);
+      } else if (!off && note) note.remove();
     }
 
     function buildGroup(path, node, errs, depth) {

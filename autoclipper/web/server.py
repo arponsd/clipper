@@ -204,6 +204,19 @@ def _voice_stale(out_dir: Path, narration: str | None) -> bool:
     return voice["narration_hash"] != narration_hash(narration)
 
 
+def _render_info(out_dir: Path, final: bool, settings: Settings | None) -> tuple[str | None, str | None, bool]:
+    """(caption_engine actually used, its style, render_stale) of a clip-lang final.mp4 (CONTRACT_STEP3 7)."""
+    from ..stages.render import read_render_stamp, render_settings_changed
+
+    if not final:
+        return None, None, False
+    stamp = read_render_stamp(out_dir)
+    engine = stamp.get("engine_used") if stamp.get("engine_used") in ("ass", "hyperframes") else "ass"
+    style = stamp.get("style") if engine == "hyperframes" and isinstance(stamp.get("style"), str) else None
+    stale = settings is not None and render_settings_changed(out_dir, settings)
+    return engine, style, bool(stale)
+
+
 def _read_script(path: Path) -> ClipScript | None:
     try:
         return ClipScript.model_validate_json(path.read_text(encoding="utf-8"))
@@ -271,6 +284,10 @@ class App:
         d["stages"] = _stage_dict(job.stages, list(JOB_STAGES))
         opts = read_options(job.id)
         d["options"] = opts.to_dict() if opts is not None else None
+        try:
+            settings: Settings | None = self.settings_loader()
+        except (ValidationError, ValueError, OSError):
+            settings = None  # a broken settings.json must not break the job page
         clips = []
         for c in job.clips:
             cdir = _clip_dir(job.id, c.index)
@@ -294,6 +311,7 @@ class App:
                 else:
                     voice = None
                 base = f"/api/jobs/{job.id}/clips/{c.index}/{lang}"
+                caption_engine, caption_style, render_stale = _render_info(out, final, settings)
                 langs[lang] = {
                     "stages": _stage_dict(st.stages, list(CLIP_STAGES)),
                     "error": st.error,
@@ -304,6 +322,10 @@ class App:
                     "metadata": meta,
                     "voice": voice,
                     "voice_stale": _voice_stale(out, script.narration if script is not None else None),
+                    "warning": st.warning,
+                    "caption_engine": caption_engine,
+                    "caption_style": caption_style,
+                    "render_stale": render_stale,
                     "task": self.worker.task_dict(self.worker.active_task_for(job.id, c.index, lang)),
                 }
             m = c.moment

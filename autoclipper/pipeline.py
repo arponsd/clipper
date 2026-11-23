@@ -182,7 +182,8 @@ def _unlink_outputs(out_dir: Path, *names: str) -> None:
 
 
 # Per clip-lang files that depend on cut.mp4 (script.json does not: it comes from the transcript).
-_CUT_DEPENDENT_OUTPUTS = ("voice.wav", "voice.json", "words.json", "captions.ass", "final.mp4")
+_CUT_DEPENDENT_OUTPUTS = ("voice.wav", "voice.json", "words.json", "captions.ass", "final.mp4", "render.json",
+                          "captions_overlay.webm", "captions_overlay.mov")
 
 
 def _invalidate(store: JobStore, clip: ClipState, lang: str, stages: Sequence[str]) -> None:
@@ -557,7 +558,7 @@ def _run_voice(store: JobStore, rep: _Reporter, settings: Settings, deps: _LazyD
 
     out_dir = store.clip_dir(clip.index, lang)
     cut = store.clip_dir(clip.index) / "cut.mp4"
-    _unlink_outputs(out_dir, "words.json", "captions.ass", "final.mp4")
+    _unlink_outputs(out_dir, "words.json", "captions.ass", "final.mp4", "render.json")
     _invalidate(store, clip, lang, ("captions", "render"))
     rep.start("voice", clip.index, lang, f"engine {_engine_label(settings, lang)}")
     result = make_voice(client=deps.voicebox, narration=script.narration, lang=lang,
@@ -593,7 +594,7 @@ def _run_captions(store: JobStore, rep: _Reporter, settings: Settings, deps: _La
     from .stages.captions import make_captions
 
     out_dir = store.clip_dir(clip.index, lang)
-    _unlink_outputs(out_dir, "final.mp4")
+    _unlink_outputs(out_dir, "final.mp4", "render.json")
     _invalidate(store, clip, lang, ("render",))
     rep.start("captions", clip.index, lang)
     ass = make_captions(narration=script.narration, voice_wav=out_dir / "voice.wav", lang=lang,
@@ -603,23 +604,40 @@ def _run_captions(store: JobStore, rep: _Reporter, settings: Settings, deps: _La
 
 
 def _run_render(store: JobStore, rep: _Reporter, settings: Settings, clip: ClipState, lang: str,
-                script: ClipScript) -> Path:
-    from .stages.render import render_final, write_metadata
+                script: ClipScript, hf_env_cache: dict | None = None) -> Path:
+    from .stages.render import render_clip, write_metadata, write_render_stamp
 
     out_dir = store.clip_dir(clip.index, lang)
     final = out_dir / "final.mp4"
-    rep.start("render", clip.index, lang)
-    render_final(cut=store.clip_dir(clip.index) / "cut.mp4", voice=out_dir / "voice.wav",
-                 ass=out_dir / "captions.ass", dst=final, audio=settings.audio,
-                 on_progress=rep.progress("render", clip.index, lang))
+    state = clip.langs.get(lang)
+    if state is not None:
+        state.warning = None
+    # Drop the old final together with its stamp: a failed or cancelled render must not leave a stamp-less
+    # final behind, which read_render_stamp would take for a current legacy ASS render.
+    _unlink_outputs(out_dir, "final.mp4", "render.json")
+    _invalidate(store, clip, lang, ("render",))
+    engine = settings.captions.engine
+    rep.start("render", clip.index, lang, "captions: HyperFrames" if engine == "hyperframes" else "")
+    outcome = render_clip(cut=store.clip_dir(clip.index) / "cut.mp4", out_dir=out_dir, settings=settings,
+                          on_progress=rep.progress("render", clip.index, lang), hf_env_cache=hf_env_cache)
+    write_render_stamp(out_dir, settings, outcome)
     write_metadata(script, lang, out_dir / "metadata.json")
-    rep.done("render", clip.index, lang, store.rel(final))
+    message = store.rel(final)
+    if outcome.warning:
+        if state is not None:
+            state.warning = outcome.warning
+        rep.line("render", 1.0, "WARNING " + outcome.warning, clip.index, lang)
+        message = f"{final.name} (ASS fallback: {outcome.reason or outcome.warning})"
+    elif outcome.engine_used == "hyperframes":
+        message = f"{store.rel(final)} (HyperFrames {settings.hyperframes.style} captions)"
+    rep.done("render", clip.index, lang, message)
     return final
 
 
 def _process_clip_lang(store: JobStore, rep: _Reporter, settings: Settings, deps: _LazyDeps,
-                       transcript: Transcript, clip: ClipState, lang: str) -> None:
-    from .stages.render import write_metadata
+                       transcript: Transcript, clip: ClipState, lang: str,
+                       hf_env_cache: dict | None = None) -> None:
+    from .stages.render import render_is_current, write_metadata
     from .stages.script import load_script, write_script
 
     state = clip.langs[lang]
@@ -664,11 +682,11 @@ def _process_clip_lang(store: JobStore, rep: _Reporter, settings: Settings, deps
         # render (+ metadata, always refreshed because it is cheap and follows script.json edits)
         stage = "render"
         final = out_dir / "final.mp4"
-        if not regenerated and output_exists(final):
+        if not regenerated and render_is_current(out_dir, settings):
             write_metadata(script, lang, out_dir / "metadata.json")
             rep.skip("render", clip.index, lang, "final.mp4")
         else:
-            _run_render(store, rep, settings, clip, lang, script)
+            _run_render(store, rep, settings, clip, lang, script, hf_env_cache)
         state.final = store.rel(final)
         store.save()
     except Exception as e:  # recorded per clip-language; other clips keep going
@@ -740,11 +758,12 @@ def run_job(source: str, *, settings: Settings | None = None, deps: Deps | None 
         _mark_job_interrupted(store, log)
         raise
 
+    hf_env_cache: dict = {}  # probe_env runs once per run_job, not once per clip
     try:
         for idx in cut_ok:
             clip = job.clips[idx]
             for lang in s.languages:
-                _process_clip_lang(store, rep, s, lazy, transcript, clip, lang)
+                _process_clip_lang(store, rep, s, lazy, transcript, clip, lang, hf_env_cache)
     except BaseException:
         _mark_job_interrupted(store, log)
         raise
@@ -811,7 +830,7 @@ def rerender(job_id: str, clip: int, lang: str, *, settings: Settings | None = N
         stage = "captions"
         _run_captions(store, rep, s, lazy, cs, lang, script)
         stage = "render"
-        final = _run_render(store, rep, s, cs, lang, script)
+        final = _run_render(store, rep, s, cs, lang, script, {})
     except Exception as e:
         state.error = f"{stage}: {_error_text(e)}"
         rep.fail(stage, e, clip, lang)

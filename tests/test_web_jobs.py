@@ -327,6 +327,8 @@ def test_job_detail_structure(api):
     assert_keys(en, {"stages": dict, "error": (str, type(None)), "final": bool, "video_url": (str, type(None)),
                      "download_url": (str, type(None)), "script": (dict, type(None)),
                      "metadata": (dict, type(None)), "voice": (dict, type(None)), "voice_stale": bool,
+                     "warning": (str, type(None)), "caption_engine": (str, type(None)),
+                     "caption_style": (str, type(None)), "render_stale": bool,
                      "task": (dict, type(None))})
     assert set(en["stages"]) == {"script", "voice", "captions", "render"}
     assert en["final"] is True and en["video_url"] == f"/api/jobs/{store.job.id}/clips/0/en/video"

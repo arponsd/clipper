@@ -57,6 +57,8 @@ class ClipLangState(BaseModel):
     stages: dict[str, StageState] = Field(default_factory=dict)
     final: str | None = None  # relative path to final mp4
     error: str | None = None
+    # Non-fatal problem of the last render, e.g. the HyperFrames captions fell back to ASS.
+    warning: str | None = None
 
 
 class ClipState(BaseModel):

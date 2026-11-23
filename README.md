@@ -113,9 +113,53 @@ cp .env.example .env          # Windows: copy .env.example .env
 
 The key is read from the environment variable named by `llm.api_key_env` (default `ANTHROPIC_API_KEY`). A `.env` file in the project root is loaded automatically. If the key is set, it wins over the `ant` login.
 
-### 6. Node 22+ (only for step 3, later)
+### 6. HyperFrames animated captions (optional)
 
-The current CLI does not need Node. The HyperFrames animated captions planned for step 3 will need **Node.js 22 or newer**. `doctor` warns if your Node is older; on this dev machine it is v16.
+By default captions are burned in with libass (`captions.engine=ass`), which needs nothing beyond FFmpeg. The optional **HyperFrames** engine (`captions.engine=hyperframes`) draws animated word-by-word captions (the spoken word pops, or karaoke-style highlighting) as an HTML page, renders it with the [HyperFrames](https://github.com/heygen-com/hyperframes) CLI to a transparent overlay video, and composites that over the clip. The audio mix (ducking, ramp-back, loudnorm, limiter) is exactly the same for both engines. It needs **Node.js 22 or newer**, the `hyperframes` npm package and a headless Chrome, all installed per user (nothing global; your system `node` can stay as it is).
+
+**Default engine (team lead sign-off, 2026-11-23): `ass`.** HyperFrames passed the speed and quality gate: on this CPU a 28.8 s clip takes about 44 s for the whole render stage in English and Hindi (overlay at 25 fps plus composite; about 10-16 s when the overlay is cached), the captions are correct (timing, pop, Devanagari conjuncts, position), and the audio is bit-identical to the ASS render. It still stays opt-in because (1) it needs an optional install (Node 22, the npm package, Chrome); as the default, every install without it would get a fallback warning on every clip, (2) it is about 5x slower than ASS per clip, and (3) existing renders count as ASS renders, so switching the default would make every existing final stale. Turn it on with `uv run autoclipper settings set captions.engine=hyperframes` or in **Settings**.
+
+**Linux**
+```bash
+# 1. Node 22 LTS: download the linux-x64 tarball from https://nodejs.org/en/download and extract it
+mkdir -p ~/tools && tar -xJf node-v22.*-linux-x64.tar.xz -C ~/tools && mv ~/tools/node-v22.*-linux-x64 ~/tools/node22
+~/tools/node22/bin/node --version            # v22.x
+# 2. HyperFrames (pinned), into ~/tools/hyperframes - PATH is changed for this one command only
+PATH=$HOME/tools/node22/bin:$PATH npm --prefix ~/tools/hyperframes install --save-exact hyperframes@0.9.52
+# 3. one-time headless Chrome download (about 100 MB, into ~/.cache/hyperframes)
+~/tools/node22/bin/node ~/tools/hyperframes/node_modules/hyperframes/bin/hyperframes.mjs browser ensure
+```
+
+**Windows (PowerShell)**
+```powershell
+# 1. Node 22: extract the win-x64 zip from https://nodejs.org/en/download to %USERPROFILE%\tools\node22
+#    (node.exe at the top level of that folder), or: winget install OpenJS.NodeJS.LTS
+& "$env:USERPROFILE\tools\node22\node.exe" --version
+# 2. HyperFrames (pinned)
+& "$env:USERPROFILE\tools\node22\npm.cmd" --prefix "$env:USERPROFILE\tools\hyperframes" install --save-exact hyperframes@0.9.52
+# 3. one-time headless Chrome download
+& "$env:USERPROFILE\tools\node22\node.exe" "$env:USERPROFILE\tools\hyperframes\node_modules\hyperframes\bin\hyperframes.mjs" browser ensure
+# 4. tell Auto Clipper where node is (the zip has no bin\ folder; both layouts are accepted)
+uv run autoclipper settings set "hyperframes.node_bin_dir=%USERPROFILE%\tools\node22"
+```
+With `winget`, Node is on PATH: set `hyperframes.node_bin_dir=""` (empty = use the `node` on PATH) instead.
+
+**Enable it**
+```bash
+uv run autoclipper settings set captions.engine=hyperframes        # optional: hyperframes.style=karaoke
+uv run autoclipper doctor                                          # node, hyperframes, chrome, ffmpeg vp9 alpha
+uv run autoclipper rerender <job> <clip> <lang>                    # or resume a job: stale renders are redone
+```
+Or use the web UI: **Settings > Captions > Caption engine**, the **HyperFrames captions** section, then **Doctor**.
+
+Notes:
+- **Fallback.** If Node or HyperFrames is missing, too old, fails or times out (`hyperframes.timeout_seconds`) for a clip, that clip is rendered with the ASS captions instead. The job never fails because of it; the warning is shown in the job log (`WARNING ...`), in the render stage message (`final.mp4 (ASS fallback: ...)`) and as a yellow banner on the clip's review page. A resume (`run --job`) retries HyperFrames for those clips.
+- **WebM alpha needs the libvpx decoder.** The overlay is VP9 WebM with alpha by default; FFmpeg must have the `libvpx-vp9` decoder (Linux distro builds and the gyan.dev full build on Windows do; `doctor` checks it). Otherwise set `hyperframes.format=mov` (ProRes 4444, much bigger files).
+- **Speed.** About 35-45 s of HyperFrames rendering per 30 s clip on an 8-core CPU (software GL), plus the normal render. An unchanged composition is cached (`hf/overlay.json`), so a re-render that only changed the narration audio or title is fast.
+- **Offline.** The page uses the GSAP copy bundled inside the hyperframes package and local font files; it never loads anything from the network. The renderer serves the page on `localhost`, so loopback must work.
+- **Fonts.** The `.ttf` files of `captions.font_en` / `captions.font_hi` are copied next to the page (from `assets/fonts`, then `fc-match`, then the Windows font folders); Devanagari is shaped by Chrome. `captions.font_size`, the colours, `words_per_line` and `position_pct` mean the same as for ASS: the text is drawn at the same visual size as the libass captions (the CSS size is scaled by the font's em/line-height ratio, as libass does) with the same 5 px outline.
+- The composition stays in `clips/NN/<lang>/hf/index.html`; you can open that folder in the HyperFrames desktop app to tweak it.
+- The HyperFrames CLI runs with its working directory in that `hf/` folder and with every `ANTHROPIC_*` variable removed from its environment, so it never sees your `.env`.
 
 ### 7. Check everything
 
@@ -129,9 +173,9 @@ uv run autoclipper doctor
 - the fonts are installed, either in assets/fonts or found by `fc-list`,
 - Voicebox is reachable and the profile ids are set,
 - the API key is present,
-- the Node version.
+- HyperFrames (optional, warnings only): the Node version in `hyperframes.node_bin_dir`, the installed `hyperframes` version, its headless Chrome, FFmpeg's `libvpx-vp9` decoder (WebM alpha) and whether the caption engine will work or fall back to ASS.
 
-It exits with code 1 if anything required is missing.
+It exits with code 1 if anything required is missing. HyperFrames rows are only warnings.
 
 ---
 
@@ -195,10 +239,10 @@ The page lets you start a job from an uploaded file or a URL, follow its progres
 
 The server binds to loopback only by default. The page gets an access token (stored in `data/web/token`) when it is loaded from the same machine; API calls without it get 401, and with a wrong one 403. Stop the server with Ctrl-C, or `kill -INT <pid>` when it runs in the background.
 
-**Currently running (started by the team lead on 2026-11-22):** `autoclipper serve --host 127.0.0.1 --port 8765 --no-browser`, PID `1796838` (also in `/tmp/claude-1000/ac_serve.pid`), log in `/tmp/claude-1000/ac_serve.log`. Stop it with:
+**Currently running (restarted by the team lead on 2026-11-23 for step 3):** `uv run autoclipper serve --host 127.0.0.1 --port 8765 --no-browser`, PID `3180498` (the Python server process; its `uv run` parent is 3180489; also in `/tmp/claude-1000/ac_serve.pid`), log in `~/.cache/ac-step3/serve.log`. Stop it with:
 
 ```bash
-kill -INT 1796838      # or: pkill -INT -f "autoclipper serve --host 127.0.0.1 --port 8765"
+kill -INT 3180498      # or: pkill -INT -f "autoclipper serve --host 127.0.0.1 --port 8765"
 ```
 
 ---
@@ -224,8 +268,11 @@ data/
         voice.wav                   fitted voice (<= clip length)
         voice.json                  durations, tempo, narration_hash
         words.json                  timed caption words
-        captions.ass                word-by-word ASS subtitles
+        captions.ass                word-by-word ASS subtitles (also the HyperFrames fallback)
+        hf/                         HyperFrames composition (captions.engine=hyperframes): index.html, assets/, overlay.json
+        captions_overlay.webm       transparent caption overlay rendered by HyperFrames (.mov with hyperframes.format=mov)
         final.mp4                   the short
+        render.json                 how final.mp4 was rendered: caption engine/style/format/fps, fallback warning
         metadata.json               {"language","title","description","hashtags"}
       hi/ ...
     clips/01/ ...
@@ -276,10 +323,20 @@ Change settings with `autoclipper settings set key.path=value`. The value is par
 | `captions.primary_color` / `captions.highlight_color` | white / yellow | ASS `&HAABBGGRR` colors (`&H` + 8 hex digits) |
 | `captions.position_pct` | `72` | Vertical centre of the caption line, in % of the height from the top (5-95). `null` = use `captions.margin_v` |
 | `captions.margin_v` | `520` | Distance of the captions from the bottom, in px, 0 to `clips.height` (only when `captions.position_pct` is `null`) |
+| `captions.engine` | `ass` | `ass` = libass burn-in; `hyperframes` = animated HyperFrames captions (optional install, see [6](#6-hyperframes-animated-captions-optional)); falls back to `ass` per clip |
+| `hyperframes.node_bin_dir` | `~/tools/node22/bin` | Folder with `node` / `node.exe` (Node 22+); `<dir>/bin/node` is also accepted; `""` = the `node` on PATH. `~` and `%VAR%`/`$VAR` are expanded |
+| `hyperframes.package_dir` | `~/tools/hyperframes` | Folder given to `npm --prefix` when installing `hyperframes` |
+| `hyperframes.style` | `pop` | `pop` (the spoken word pops in the highlight colour) or `karaoke` (spoken words stay highlighted) |
+| `hyperframes.fps` | `null` | Overlay frame rate (12-60); `null` = the clip's frame rate |
+| `hyperframes.format` | `webm` | Overlay codec: `webm` (VP9 + alpha, small, needs FFmpeg's libvpx decoder) or `mov` (ProRes 4444) |
+| `hyperframes.workers` | `0` | Parallel Chrome workers (0 = auto, max 8) |
+| `hyperframes.timeout_seconds` | `300` | Max HyperFrames render time per clip-language (30-3600 s); longer falls back to ASS |
 | `web.max_upload_mb` | `4096` | Largest upload the web UI accepts, in MB (1-102400) |
 | `web.allowed_extensions` | `[".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".ogv"]` | Video file types the web UI accepts (lower-case, with the dot) |
 
 `--clips`, `--min`, `--max` and `--langs` on `run` override these settings for that run only.
+
+Changing `captions.engine` or `hyperframes.style` / `format` / `fps` makes existing renders stale: a resume (`run --job`) or a re-render redoes only the render stage of the affected clips (no new voice or captions). Renders from before step 3 count as ASS renders, so they stay current with the default engine.
 
 ---
 
@@ -288,7 +345,10 @@ Change settings with `autoclipper settings set key.path=value`. The value is par
 ```bash
 uv run pytest -q        # fast suite; tests marked slow are skipped by default
 uv run pytest -m slow   # only the slow tests (real models or network)
+uv run pytest -m "hyperframes"   # the real HyperFrames render test (skipped when Node 22 / hyperframes is missing)
 ```
+
+The default suite never needs Node: the HyperFrames subprocess is faked (`tests/fakes.py: FakeHFRunner`).
 
 Tests never call the real Anthropic API, a real Voicebox server, or download whisper models or videos. They use the fakes in `tests/fakes.py` and a synthetic video made by ffmpeg. Each test gets its own data dir through `AUTOCLIPPER_DATA_DIR`, set in `tests/conftest.py`. The same conftest also guards the whole suite. It removes `ANTHROPIC_*` variables and points `HOME` at a temp dir. It makes `pipeline._make_llm/_make_voicebox/_make_transcriber` raise unless a test has `@pytest.mark.real_clients`, and it blocks socket connections to anything but loopback. Network or model tests must be marked `@pytest.mark.slow`.
 
@@ -300,5 +360,5 @@ The pipeline gets its LLM, Voicebox client and transcriber injected (`autoclippe
 
 - **Step 1 (done): CLI pipeline end to end.**
 - **Step 2 (done): web UI.** A FastAPI app with one background worker thread (no Redis) that runs `pipeline.run_job`. The UI reads progress from `job.json` and lets you edit `script.json` and settings in the browser, then re-render.
-- **Step 3: HyperFrames animated captions.** These will reuse `words.json` and need Node 22+.
+- **Step 3 (done): HyperFrames animated captions.** An optional caption engine (`captions.engine=hyperframes`) built from the same `words.json`, with a per-clip fallback to ASS. The default stays `ass` (lead sign-off 2026-11-23; see [6](#6-hyperframes-animated-captions-optional)).
 - **Step 4: auto-publish.** English clips go to one channel and Hindi clips to another, on YouTube, Facebook and Instagram Reels, using `metadata.json`.

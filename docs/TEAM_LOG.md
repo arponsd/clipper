@@ -838,3 +838,257 @@ Voicebox is untouched and still running.
 - QA's non-atomic `hold_job_lock`.
 - The /tmp cleanup decision, which is the user's.
 - A native-speaker check of the Hindi pronunciation.
+
+## Team Lead (step 3 plan: HyperFrames animated captions)
+
+**The contract is `docs/CONTRACT_STEP3.md`.** Read section 0 before you write any code.
+
+### Install (done; nothing global, no PATH or profile edits)
+- I installed `hyperframes@0.9.52` (pinned, `--save-exact`) from the official npm package into
+  `~/tools/hyperframes`, using Node 22 through a prefixed PATH:
+  `PATH=$HOME/tools/node22/bin:$PATH npm --prefix ~/tools/hyperframes install --save-exact hyperframes@0.9.52`.
+- CLI entry: `~/tools/node22/bin/node ~/tools/hyperframes/node_modules/hyperframes/bin/hyperframes.mjs`.
+- chrome-headless-shell was already cached in `~/.cache/hyperframes/chrome/...`, so nothing was downloaded.
+
+### Smoke render results
+I made a 2 s, 1080x1920 composition with one animated word plus one Devanagari word, transparent
+background. The scratch files are in `~/.cache/ac-step3/smoke` and `~/.cache/ac-step3/proto`.
+
+- **Alpha formats.** `--format webm` gives VP9 with the `ALPHA_MODE=1` tag. `--format mov` gives ProRes
+  4444 (`yuva444p12le`). `--format png-sequence` gives RGBA PNGs. All three composite correctly over
+  footage.
+- **WebM must be decoded with `-c:v libvpx-vp9`.** FFmpeg's native vp9 decoder drops the alpha, and the
+  result is a black box (checked).
+- **Real 28.84 s clip** (sample job clip 01/hi, 60 words, read-only input):
+  - the HyperFrames webm render took 34-45 s;
+  - mov took 37-41 s;
+  - png-sequence took 23 s;
+  - the FFmpeg composite took 4.4 s.
+  
+  That is well under the 3 min budget.
+- **It renders offline.** I tested in a no-network namespace with loopback up. This works because GSAP is
+  copied from the package's own `dist/vendor/npm/gsap@3.15.0` and the fonts are copied TTFs. The CLI's
+  templates use a CDN, and we must not.
+- **Devanagari shaping in Chrome is correct:** नमस्ते, तिहत्तर, छियासी, चैलेंजर.
+- **Gotchas** (the details are in contract section 0):
+  - a caption group with `height:0` renders nothing;
+  - whitespace and flex `gap` between words vanish in the render, so use a margin on each word;
+  - never set `visibility` on a `.clip`;
+  - the CLI loads `.env` from its cwd, so run it with cwd = the composition dir and strip `ANTHROPIC_*`
+    from the child env;
+  - Chrome profiles are left in `$TMPDIR`, so use a per-render tmp dir and delete it.
+- **Progress** comes on stdout as `@hf-progress {json}` lines, and `--quiet` suppresses them.
+
+### Decisions
+- **The default stays `captions.engine="ass"`.** HyperFrames is an optional install, so with it as the
+  default, users without it would get a fallback warning on every clip. I will re-check this at sign-off
+  after a real end-to-end run.
+- **The overlay is WebM VP9 with alpha** (small, about 100 KB per clip). `hyperframes.format=mov` is the
+  escape hatch for an FFmpeg without libvpx.
+- **The overlay is made in the render stage, not the captions stage.** The captions stage still always
+  writes words.json and captions.ass, because ASS is the fallback.
+- **Staleness** is a `render.json` stamp holding the engine, style, format and fps. A fallback render is
+  stale, so it is retried on resume. A legacy final without a stamp counts as ASS, so step-2 jobs are not
+  re-rendered.
+- **HyperFrames never fails a job.** The fallback warning goes to the job log (`WARNING`), the stage
+  message, and the new `ClipLangState.warning` field.
+
+### Assignments (no file overlaps; see contract section 1)
+- **engine:** `stages/hyperframes.py`, `stages/hf_template.py`, the fakes additions, `tests/test_hyperframes.py`.
+- **integration:** `config.py`, `models.py` (warning), `render.py`, `pipeline.py`, the doctor in `cli.py`,
+  `tests/test_step3_integration.py`.
+- **web_docs:** the clip-detail fields in `web/server.py`, the static UI, README,
+  `tests/test_web_step3.py`.
+- Run pytest only as `TMPDIR=~/.cache/ac-step3 uv run pytest -q -p no:cacheprovider --basetemp
+  ~/.cache/ac-step3/bt-<role>`. Put scratch renders under `~/.cache/ac-step3/`.
+
+## HyperFrames builder (step 3 implementation, 2026-11-23)
+
+I picked up the partial work left by the previous builder attempt (cut off by a network error) and finished it.
+The engine, integration and web/docs parts from the contract are all in place; nothing was committed.
+
+### State of the code
+- `stages/hyperframes.py` + `stages/hf_template.py`: settings resolution, `probe_env`, `child_env`
+  (no `ANTHROPIC_*`, private TMP, no telemetry), composition build (escaped word text only in HTML, ids and
+  numbers only in the script, no URLs, local GSAP + fonts), `_popen_runner` with process-tree kill on
+  timeout/cancel, `verify_overlay` (size, duration, alpha), cached `make_overlay` (`hf/overlay.json`).
+- `render.py`: `render_final(overlay=...)` (overlay last input, `-c:v libvpx-vp9` only for webm, audio
+  graph unchanged), `render_clip` with per-clip ASS fallback, `render.json` stamp, `render_is_current`.
+- `pipeline.py`: stamp + `ClipLangState.warning` + `WARNING` log line + "ASS fallback" stage message;
+  resume re-renders only when the stamp is stale; `probe_env` memoised per run/rerender.
+- `cli.py`: `check_hyperframes` (node, hyperframes, chrome, ffmpeg vp9 alpha, caption engine; warn only),
+  used by CLI `doctor` and web `/api/doctor`.
+- Web: clip detail `warning` / `caption_engine` / `caption_style` / `render_stale`; banner, stale hint and
+  "Captions: ..." label; Settings labels/help for `captions.engine` and `hyperframes.*` (greyed while ass).
+- README: section 6 "HyperFrames animated captions (optional)" (Linux + Windows install, enable, notes),
+  settings rows, data layout, roadmap.
+
+### Change I made beyond the partial work (please review, lead)
+- **Caption size now matches ASS.** The contract's `font_size * 1.08` px made the HyperFrames text about
+  1.4x bigger than the ASS text at the same `captions.font_size`. libass sizes a font so that
+  `usWinAscent + usWinDescent` equals Fontsize, not the em box. So the CSS size is now
+  `font_size * unitsPerEm / (winAscent + winDescent)` of the language's font: 60 px for Noto Sans Devanagari
+  Bold at 78, 57 px for Noto Sans Bold. It falls back to 0.75 if the file cannot be read. The old code also
+  scaled by height/1920, which ASS does not do (PlayResY = the video height), so I removed that.
+  This is `hyperframes.ass_em_ratio`.
+- **Outline matches ASS.** `-webkit-text-stroke` is 10 px (2 x the ASS Outline of 5), because only half of it
+  shows with `paint-order: stroke fill`. The old value was 7 px, which showed about 3.5 px.
+- Word margin stays at 0.24em, not the contract's 0.16em, so the 1.18 pop does not touch its neighbours.
+
+### Real render (copy of the sample job; the original's md5s are unchanged)
+- Copy: `~/.cache/ac-step3/hfb3/jobs/20261122-185849-65a6bd-hf3`, with paths in voice.json rewritten.
+  Run with `AUTOCLIPPER_DATA_DIR=~/.cache/ac-step3/hfb3` through `pipeline._run_render` for clip 01/hi
+  (script: `~/.cache/ac-step3/hfb3/run.py`).
+- Clip 01/hi (28.84 s, 60 words): **44-45 s** for the whole render stage (HyperFrames webm at 25 fps plus
+  composite). A second run with the same composition hits the overlay cache: **5.2 s**.
+- Frames I looked at (`~/.cache/ac-step3/hfb3/frames/`, checked at 0.2, 1.0, 4.6, 8.4, 12 and 17.5 s):
+  - captions sit at 72 % with no box and no black background;
+  - the spoken word is yellow and popped;
+  - the conjuncts are correct: तिहत्तर, अट्ठाईस, उन्नीस, राष्ट्रपति;
+  - the size and outline now match the ASS render;
+  - there are no captions after the narration ends (18.7 s), same as ASS.
+- Audio: the HyperFrames final and an ASS final rendered with the current code are both **-14.8 LUFS /
+  -1.4 dBFS**, which is identical. The job's old final.mp4 (-17.7 LUFS) came from older code, so it is not a
+  fair comparison.
+- Fallback for real: with `hyperframes.package_dir=/nonexistent/hf`, the job finishes with
+  `engine_used: ass` and the warning shows in `render.json`, the WARNING log line, the stage message and
+  `ClipLangState.warning`.
+- Web: I checked this on a scratch server on port 8799 (since stopped; 8765 was not touched):
+  - the Settings page shows Caption engine and the HyperFrames section;
+  - Doctor shows all five new rows as ok;
+  - the job page shows "Captions: HyperFrames (pop)" and the stale hint after the engine was set back to ass.
+
+### Tests
+- Full suite: **859 passed**, 1 deselected (step 2 had 754). `-m hyperframes` (real 2 s render plus
+  composite): **1 passed**. The default suite never needs Node, because `FakeHFRunner` fakes the subprocess.
+- New tests in this round: `ass_em_ratio` (OS/2, the hhea fallback, garbage, missing file) and font size per
+  language.
+
+## Reviewer (correctness + robustness), step 3, 2026-11-23
+
+Checked and fine: process-tree kill on timeout (real 12 s timeout on Linux left no Chrome behind), paths
+with spaces and Devanagari in the job dir (a real render works), HTML/JS escaping (`</span><script>` and
+`&amp;"'` show as literal text), Devanagari conjuncts, VP9 alpha decode + overlay, fallback paths,
+settings bounds. The step-3 tests pass (105). Findings:
+1. `_run_render` deletes render.json but keeps the old final.mp4. If the render then fails or is cancelled,
+   the stamp-less old final counts as a current ASS render. Example: an HF final, engine switched to ass,
+   render cancelled: the next resume skips it and the UI says "Captions: ASS".
+2. There is a fully blank caption frame at each line change that falls on a frame time. The old group
+   ends at the new group's start, and the new group fades in from opacity 0 at that same time. Seen at
+   t=1.000 s in a real 25 fps render. ASS switches lines with no gap.
+3. UI: the fallback banner repeats its own text ("HyperFrames captions failed - ASS captions were used:
+   HyperFrames captions failed (...); used ASS captions"). Fallback clips also show "Caption
+   engine/style changed - re-render to apply", although nothing was changed.
+4. Low/plausible: puppeteer starts Chrome with `detached: true` (its own session on POSIX), so
+   `killpg(node)` does not reach it. Cleanup depends on node's SIGTERM handler running within 5 s.
+   If node is wedged, the SIGKILL leaves Chrome orphaned.
+
+## Reviewer (visual + UX), step 3 (2026-11-23)
+
+My own copy: `~/.cache/ac-step3/rv/jobs/rv-job`. Frames are in `~/.cache/ac-step3/rv/frames`, and the long-word test is in `~/.cache/ac-step3/rv/long`.
+- **Renders.** Clip 01 en and hi, pop: 43.8 s and 42.8 s for the whole render stage. Clip 01 en, karaoke at fps 30, started with Re-render in the web UI: ok.
+- **Settings and Doctor.** I used a scratch server on :8766 (now stopped; :8765 was not touched).
+  - The Settings page shows and saves `captions.engine` and every `hyperframes.*` field, and they show up in `/api/settings`.
+  - fps 3030 is rejected inline ("<= 60").
+  - Doctor has 5 ok rows.
+  - Every clip shows `render_stale` after the style changes.
+
+**What is OK:**
+- The position is the same as ASS (`\pos(540,1382)`).
+- The highlight timing matches words.json (I checked at 0.15, 3.2 and 13.8 s for en, and at 1.0, 4.6, 8.4, 12.0 and 17.5 s for hi).
+- Devanagari conjuncts are correct: तिहत्तर, अट्ठाईस, उन्नीस, राष्ट्रपति, रोंगटे, and the synthetic अंतर्राष्ट्रीयकरण and उत्तरदायित्वपूर्ण.
+- No captions show after the narration ends.
+
+**Findings:**
+1. **[medium] The pop scale makes the spoken word collide with its neighbours.** The cause is `POP_SCALE` 1.18, scaled around the centre, while the margin is a fixed 0.24em.
+   - A 430 px word grows by about 39 px on each side, but the margin is only about 14 px.
+   - en: "line.**Speechwriter**Peggy" covers the period, and "after**Challenger**" and "**January**28th" touch.
+   - hi: "शाम**राष्ट्रपति**" touches; अंतर्राष्ट्रीयकरण runs into प्रतिस्पर्धात्मकता.
+   - ASS has no such problem.
+   - Suggested fix: limit each word's scale in the script to `min(1.18, 1 + 2*gap/offsetWidth)`, or use a smaller pop together with transform-origin.
+2. **[low-medium] A long word at the frame edge is clipped when it pops.** "Supercalifragilisticexpialidocious" fits the 90 % box when it is not popped. At 1.18 its first and last letters fall outside 1080 px. The scale should also be clamped to `972/offsetWidth`.
+3. **[low] Word spacing is about twice a normal space.** The 0.24em margin on both sides gives a 0.48em gap. It shows in karaoke ("Hours  after  Challenger") and in pop next to the active word ("28th,  1986."). Finding 1's fix would allow the normal 0.12-0.13em per side.
+
+## Team lead (triage + fixes), step 3, 2026-11-23
+
+I accepted all 7 findings; none were rejected. Each fix has a regression test. Nothing is committed.
+
+**Correctness reviewer**
+- **C-R1 (medium): accepted, fixed.**
+  - `_run_render` now unlinks `final.mp4` together with `render.json` and calls `_invalidate(("render",))`, which clears `state.final`. A failed or cancelled render can no longer leave a stamp-less final that `read_render_stamp` takes for a current legacy ASS render.
+  - Test: `test_failed_or_cancelled_render_does_not_leave_a_stampless_final` (RenderError and KeyboardInterrupt). It fails on the old code. Resume re-renders afterwards.
+- **C-R2 (low): accepted, fixed.**
+  - `G` now carries a `fade` flag. A group fades in only when no group was on screen right before it, so in practice only the first group fades. A line that replaces another switches at once, like ASS.
+  - Real 25 fps render: t=1.000 has 6142 opaque px (before: 0), and t=0.52 is fully opaque.
+  - Tests: `test_contiguous_groups_switch_without_a_blank_frame` and the real `test_real_render_line_switch_and_long_word_pop` (`-m hyperframes`).
+- **C-R3 (low): accepted, fixed.**
+  - `app.js` shows `warning` as it is, with no second prefix.
+  - The server's `render_stale` now uses the new `render.render_settings_changed`, which compares only the render_key. A fallback made with unchanged settings shows just its warning, not "re-render to apply". `render_is_current` is unchanged, so resume still retries the fallback.
+  - CONTRACT_STEP3 section 7 is updated. Tests: `test_web_step3` (updated case 3 and `test_fallback_warning_is_shown_verbatim_in_the_ui`).
+- **C-R4 (low): accepted, fixed.**
+  - On POSIX, `_kill_tree` now takes a snapshot of node's descendants from `/proc`, by ppid, before signalling. It then sends SIGTERM and later SIGKILL to node's group, to every descendant's own group (Chrome is detached into its own session) and to each descendant pid. It never signals our own group.
+  - The 5 s grace is `_TERM_GRACE`.
+  - Tests: `test_popen_runner_kills_detached_grandchild_of_a_wedged_parent` (the parent ignores SIGTERM and the grandchild has `start_new_session`) and `test_descendants_finds_detached_children`.
+  - On non-Linux POSIX there is no `/proc`, so the behaviour is the old one.
+
+**Visual reviewer**
+- **V-R1 (medium): accepted, fixed.**
+  - Each word's pop is now `k = max(1, min(1.18, 1 + 2*margin/offsetWidth, 972/offsetWidth))`, computed in `popScale`. The popped word uses at most its own side margin, never its neighbour's.
+  - The widths are measured only after `document.fonts.load(...)` for each caption family plus `fonts.ready`. The timeline is built and registered in that callback, which the skill's runtimes.md allows: "register at the end of it".
+  - Real render of "line. Speechwriter Peggy": the ink runs stay separate when popped (gaps of 3 and 4 px; before, they merged). Frame: `~/.cache/ac-step3/lead/c08.png`.
+  - Trade-off: long words get a smaller pop (about 1.04 for a 400 px word). The colour change still marks them.
+- **V-R2 (low): accepted, fixed.** The same cap at 972/width (the 90 % box). "Supercalifragilisticexpialidocious" popped spans ink x=61..1021, with nothing in the 30 px at either frame edge. Real test as above; frame: `~/.cache/ac-step3/lead/b12.png`.
+- **V-R3 (low): accepted, fixed.** The word margin is now 0.13em per side, a 0.26em gap (about one space), replacing 0.24em. This was possible once V-R1 capped the pop. The contract (gotcha 2 and section 3.2) is updated from 0.16em.
+
+Note: the hf/ overlay cache key is the composition hash, so the template change re-renders HyperFrames overlays once. The sample job was not touched.
+- Full suite: **866 passed**, 2 deselected (before: 859). `-m hyperframes`: **2 passed** (real renders, about 24 s).
+
+## Team lead (sign-off), step 3, 2026-11-23
+
+**Verdict: approved.** Nothing is committed.
+
+- **Tests:** full suite **866 passed, 2 deselected** (5 min 10 s), run with
+  `--basetemp ~/.cache/ac-step3/bt-leadsignoff`.
+- **Real end-to-end on a copy:** `data/jobs/20261122-185849-65a6bd-step3`. Paths and ids in the json files
+  were rewritten. The sample job's md5s are unchanged.
+  - Clip 01 en and hi, with `captions.engine=hyperframes` set only for that run (data/settings.json not changed).
+  - `voice.json` was moved aside (kept as `voice.json.step2`), so the real Voicebox regenerated both voices.
+  - Script: `~/.cache/ac-step3/signoff/rr.py`.
+  - Wall times for the whole rerender: en 260 s, hi 161 s. Most of that is Voicebox plus captions.
+    The **render stage alone was 44 s (en) and 45 s (hi)** for a 28.84 s clip:
+    HyperFrames compile, capture and encode of the webm at 25 fps, then the composite.
+    A re-render with the overlay cached takes 10.5 s (en) and 15.6 s (hi). ASS takes 3-5 s.
+  - `render.json`: `engine_used: hyperframes`, no warning, hf 0.9.52.
+  - Output: h264 1080x1920 at 25 fps, 28.84 s.
+- **Frames** (`~/.cache/ac-step3/signoff/frames/`): en at 0.15, 3.3, 8.0, 14.65 and 26.0 s;
+  hi at 1.0, 4.6, 8.7, 11.2 and 25.0 s.
+  - The spoken word is yellow and popped, matching words.json:
+    January, Challenger, grieving, "line."; तिहत्तर, उन्नीस, राष्ट्रपति, फ्रांसिस.
+  - The conjuncts shape correctly.
+  - Captions sit at 72 %, with no box and a transparent background.
+  - Neighbour words are separated, but tightly: the outlines nearly touch next to a popped word.
+  - No captions show after the narration ends.
+- **Audio:** the decoded PCM is **bit-identical** (same md5) across the HyperFrames final, the ASS final made
+  with the current code, and an ASS final made with the step-2 code (HEAD 6288baf, exported to
+  `~/.cache/ac-step3/signoff/head`).
+  - Levels: en -14.0 LUFS / -1.4 dBFS peak; hi -14.8 LUFS / -1.4 dBFS.
+  - The sample job's own finals (-17.6 LUFS) predate the step-2 commit.
+  - The audio mix is unchanged.
+- **Default engine: `ass` (kept).** HyperFrames meets the gate (about 45 s per 30 s clip, well under 3 min), and
+  its output is correct. It stays opt-in for three reasons:
+  - it needs an optional install, and without that install every clip would show a fallback warning;
+  - it is about 5x slower per clip;
+  - legacy finals count as ASS, so a default switch would make every existing render stale.
+  This is recorded in the README (section 6) and CONTRACT_STEP3.
+- **Web server restarted:** old PID 1796838 stopped with SIGINT. The new server was started with
+  `nohup uv run autoclipper serve --host 127.0.0.1 --port 8765 --no-browser`.
+  - Python PID **3180498** (its uv parent is 3180489); also written to `/tmp/claude-1000/ac_serve.pid`.
+  - Log: `~/.cache/ac-step3/serve.log`.
+  - `GET /` returns 200. `/api/doctor` shows node v22.23.5, hyperframes 0.9.52, chrome, vp9 alpha and caption
+    engine, all ok.
+  - The copy's clip 01 shows `caption_engine: hyperframes` with `render_stale: true`, which is expected
+    because the global engine is ass.
+- **Remaining (low):**
+  - Gaps next to a popped word are tight. This is acceptable.
+  - Only 25 fps was checked end to end.
+  - Windows install instructions are documented but were not run on Windows.

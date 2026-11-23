@@ -134,3 +134,77 @@ class FakeTranscriber:
         segs = [Segment(start=words[0].start, end=words[-1].end,
                         text=" ".join(w.text for w in words), words=words)] if words else []
         return Transcript(language=language or "en", duration=words[-1].end if words else 0.0, segments=segs)
+
+
+# --------------------------------------------------------------------------------------------- step 3
+def make_alpha_overlay(dst: Path, seconds: float, width: int = 1080, height: int = 1920, fmt: str = "webm",
+                       alpha: bool = True) -> Path:
+    """Transparent overlay with an opaque yellow box in the middle (stands in for a HyperFrames render).
+    webm: VP9 + alpha (tag alpha_mode=1); mov: ProRes 4444. alpha=False writes an opaque yuv420p webm."""
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    bw, bh = max(2, width // 3), max(2, height // 8)
+    box = f"drawbox=x={(width - bw) // 2}:y={(height - bh) // 2}:w={bw}:h={bh}:t=fill"
+    base = f"color=c=black:s={width}x{height}:r=25:d={seconds}"
+    # drawbox does not write the alpha plane, so the alpha comes from a separate mask (alphamerge)
+    graph = (f"{base},{box}:color=yellow,format=yuv420p[c];{base},{box}:color=white,format=gray[m];"
+             f"[c][m]alphamerge,format=yuva420p[v]")
+    if fmt == "webm" and alpha:
+        codec = ["-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", "-auto-alt-ref", "0", "-deadline", "realtime",
+                 "-cpu-used", "8", "-b:v", "200k"]
+    elif fmt == "webm":
+        codec = ["-c:v", "libvpx-vp9", "-pix_fmt", "yuv420p", "-deadline", "realtime", "-cpu-used", "8",
+                 "-b:v", "200k"]
+    else:
+        codec = ["-c:v", "prores_ks", "-profile:v", "4444", "-pix_fmt", "yuva444p10le"]
+    if alpha or fmt == "webm":
+        _ffmpeg("-filter_complex", graph, "-map", "[v]", *codec, "-t", str(seconds), str(dst))
+    else:
+        _ffmpeg("-f", "lavfi", "-i", f"{base},{box}:color=yellow", *codec, "-t", str(seconds), str(dst))
+    return dst
+
+
+class FakeHFRunner:
+    """Stands in for hyperframes._popen_runner: records (args, cwd, env, timeout), feeds ``lines`` to
+    on_line, and (write=True) writes an alpha overlay at the `-o` path sized from cwd/index.html.
+
+    ``exc`` is raised after the lines (e.g. HyperFramesTimeout); ``rc`` is returned otherwise."""
+
+    def __init__(self, rc: int = 0, lines: list[str] | None = None, write: bool = True, delay: float = 0.0,
+                 exc: BaseException | None = None, alpha: bool = True, seconds: float | None = None):
+        self.rc = rc
+        self.lines = lines if lines is not None else [
+            '@hf-progress {"code":"compile","done":0,"total":1,"pct":5}',
+            "some log line",
+            '@hf-progress {"code":"capture","done":10,"total":20,"pct":40}',
+            '@hf-progress {"code":"capture","done":20,"total":20,"pct":80}',
+            '@hf-progress {"code":"encode","done":20,"total":20,"pct":95}',
+        ]
+        self.write = write
+        self.delay = delay
+        self.exc = exc
+        self.alpha = alpha
+        self.seconds = seconds
+        self.calls: list[dict] = []
+
+    def __call__(self, args, cwd, env, timeout, on_line):
+        import re
+        import time
+
+        self.calls.append(dict(args=list(args), cwd=Path(cwd), env=dict(env), timeout=timeout,
+                               tmp_existed=Path(env.get("TMPDIR", "/nonexistent")).is_dir()))
+        for line in self.lines:
+            if self.delay:
+                time.sleep(self.delay)
+            on_line(line)
+        if self.exc is not None:
+            raise self.exc
+        if self.write and self.rc == 0:
+            out = Path(args[args.index("-o") + 1])
+            fmt = args[args.index("--format") + 1]
+            html = (Path(cwd) / "index.html").read_text(encoding="utf-8")
+            dur = float(re.search(r'id="root"[^>]*data-duration="([0-9.]+)"', html).group(1))
+            w = int(re.search(r'id="root"[^>]*data-width="(\d+)"', html).group(1))
+            h = int(re.search(r'id="root"[^>]*data-height="(\d+)"', html).group(1))
+            make_alpha_overlay(out, self.seconds if self.seconds is not None else dur, w, h, fmt, alpha=self.alpha)
+        return self.rc

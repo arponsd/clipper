@@ -6,11 +6,13 @@ import logging
 import math
 import re
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from .. import config, ffmpeg
 from ..ffmpeg import _AAC, _LIMITER, _MONO_TO_STEREO, _SILENCE, _X264, _AtomicOutput
-from ..config import AudioSettings
+from ..config import AudioSettings, Settings
 from ..interfaces import ProgressFn
 from ..models import ClipScript
 from ._atomic import write_text_atomic
@@ -152,13 +154,19 @@ def build_audio_graph(*, orig: str, orig_stereo: str, voice_label: str | None, a
 
 def render_final(*, cut: Path, voice: Path | None, ass: Path | None, dst: Path,
                  audio: AudioSettings, on_progress: ProgressFn | None = None,
-                 words_json: Path | None = None) -> Path:
+                 words_json: Path | None = None, overlay: Path | None = None) -> Path:
     """Burn captions and mix: the original is ducked to audio.original_volume only while the voice
-    speaks and ramps back to audio.original_volume_after outside it; then loudnorm + limiter."""
+    speaks and ramps back to audio.original_volume_after outside it; then loudnorm + limiter.
+
+    Captions come either from ``ass`` (libass burn-in) or from ``overlay`` (a transparent HyperFrames
+    video composited on top); the two are mutually exclusive. The audio graph is the same either way.
+    """
     cut = Path(cut)
+    if ass is not None and overlay is not None:
+        raise RenderError("render_final: pass either ass or overlay captions, not both")
     if not cut.is_file():
         raise RenderError(f"cut clip not found: {cut} (run the cut stage first)")
-    for label, p in (("voice", voice), ("captions", ass)):
+    for label, p in (("voice", voice), ("captions", ass), ("caption overlay", overlay)):
         if p is not None and not Path(p).is_file():
             raise RenderError(f"{label} file not found: {p}")
     dst = Path(dst)
@@ -185,11 +193,21 @@ def render_final(*, cut: Path, voice: Path | None, ass: Path | None, dst: Path,
         orig = f"[{inputs}:a]"
         orig_stereo = "aformat=channel_layouts=stereo"
         inputs += 1
+    overlay_index = None
+    if overlay is not None:
+        if Path(overlay).suffix.lower() == ".webm":
+            args += ["-c:v", "libvpx-vp9"]  # input option: FFmpeg's native vp9 decoder drops the alpha
+        args += ["-i", str(overlay)]
+        overlay_index = inputs
+        inputs += 1
 
     parts: list[str] = []
     if ass is not None:
         fonts = resolve_fonts_dir()
         parts.append(f"[0:v]{ffmpeg.ass_filter(Path(ass), fonts)}[v]")
+        video_map = "[v]"
+    elif overlay_index is not None:
+        parts.append(f"[0:v][{overlay_index}:v]overlay=0:0:format=auto:eof_action=pass,format=yuv420p[v]")
         video_map = "[v]"
     else:
         video_map = "0:v:0"
@@ -211,3 +229,152 @@ def write_metadata(script: ClipScript, lang: str, dst: Path) -> Path:
     data = {"language": lang, "title": script.title, "description": script.description,
             "hashtags": list(script.hashtags)}
     return write_text_atomic(dst, json.dumps(data, indent=2, ensure_ascii=False))
+
+
+# --------------------------------------------------------------------------------------------- engines
+RENDER_STAMP = "render.json"
+_WARN_REASON_MAX = 200
+
+
+@dataclass
+class RenderOutcome:
+    path: Path
+    engine_used: Literal["ass", "hyperframes"]
+    warning: str | None
+    reason: str | None = None  # short fallback reason (for the stage message)
+    hf_version: str | None = None
+    fps: int | None = None
+
+
+def short_reason(e: BaseException) -> str:
+    """One line, <= 200 chars, of an exception for the fallback warning."""
+    text = " ".join(str(e).split()) or type(e).__name__
+    return text if len(text) <= _WARN_REASON_MAX else text[: _WARN_REASON_MAX - 3] + "..."
+
+
+def fallback_warning(reason: str) -> str:
+    return f"HyperFrames captions failed ({reason}); used ASS captions"
+
+
+def _sub_progress(on_progress: ProgressFn | None, lo: float, hi: float) -> ProgressFn | None:
+    if on_progress is None:
+        return None
+
+    def f(fraction: float, message: str = "") -> None:
+        on_progress(lo + (hi - lo) * min(1.0, max(0.0, float(fraction))), message)
+
+    return f
+
+
+def render_clip(*, cut: Path, out_dir: Path, settings: Settings, on_progress: ProgressFn | None = None,
+                hf_env_cache: dict | None = None, runner=None) -> RenderOutcome:
+    """final.mp4 for one clip-language with the configured caption engine.
+
+    engine "ass": exactly the step-2 render. engine "hyperframes": the HyperFrames overlay (progress
+    0..0.7) composited by render_final (0.7..1). Any HyperFrames failure (or any unexpected Exception in
+    it) falls back to the ASS render with a warning; KeyboardInterrupt / cancel propagate.
+    ``hf_env_cache`` memoises probe_env per pipeline call (key "env" -> HFEnv or the exception).
+    """
+    out_dir = Path(out_dir)
+    final = out_dir / "final.mp4"
+    voice = out_dir / "voice.wav"
+    words = out_dir / "words.json"
+    ass = out_dir / "captions.ass"
+    common = dict(cut=Path(cut), voice=voice, dst=final, audio=settings.audio, words_json=words)
+    if settings.captions.engine != "hyperframes":
+        render_final(ass=ass, on_progress=on_progress, **common)
+        return RenderOutcome(path=final, engine_used="ass", warning=None)
+
+    from . import hyperframes as hf
+
+    try:
+        env = _cached_env(settings, hf_env_cache)
+        overlay = hf.make_overlay(words_json=words, cut=Path(cut), lang=out_dir.name, settings=settings,
+                                  out_dir=out_dir, on_progress=_sub_progress(on_progress, 0.0, 0.7),
+                                  runner=runner, env=env)
+    except Exception as e:  # noqa: BLE001 - HyperFramesError or anything unexpected: ASS fallback
+        return _fallback(e, out_dir, on_progress, ass, common)
+    try:
+        render_final(ass=None, overlay=overlay, on_progress=_sub_progress(on_progress, 0.7, 1.0), **common)
+    except ffmpeg.FFmpegError as e:  # the composite itself failed (e.g. an undecodable overlay)
+        return _fallback(RuntimeError(f"overlay composite failed: {e}"), out_dir, on_progress, ass, common)
+    fps = None
+    try:
+        fps = json.loads((out_dir / "hf" / "overlay.json").read_text(encoding="utf-8")).get("fps")
+    except (OSError, ValueError, AttributeError):
+        pass
+    return RenderOutcome(path=final, engine_used="hyperframes", warning=None, hf_version=env.hf_version, fps=fps)
+
+
+def _fallback(e: BaseException, out_dir: Path, on_progress: ProgressFn | None, ass: Path,
+              common: dict) -> RenderOutcome:
+    reason = short_reason(e)
+    log.warning("HyperFrames captions failed for %s (%s); using ASS captions", out_dir, reason)
+    render_final(ass=ass, on_progress=_sub_progress(on_progress, 0.7, 1.0), **common)
+    return RenderOutcome(path=Path(common["dst"]), engine_used="ass", warning=fallback_warning(reason),
+                         reason=reason)
+
+
+def _cached_env(settings: Settings, cache: dict | None):
+    from . import hyperframes as hf
+
+    if cache is None:
+        return hf.probe_env(settings.hyperframes)
+    key = ("env", settings.hyperframes.node_bin_dir, settings.hyperframes.package_dir)
+    if key not in cache:
+        try:
+            cache[key] = hf.probe_env(settings.hyperframes)
+        except hf.HyperFramesError as e:
+            cache[key] = e
+    value = cache[key]
+    if isinstance(value, BaseException):
+        raise value
+    return value
+
+
+def render_key(settings: Settings) -> dict:
+    """The settings a final.mp4 depends on beyond its inputs (CONTRACT_STEP3 5.1)."""
+    if settings.captions.engine != "hyperframes":
+        return {"caption_engine": "ass"}
+    h = settings.hyperframes
+    return {"caption_engine": "hyperframes", "style": h.style, "format": h.format, "fps": h.fps}
+
+
+def write_render_stamp(out_dir: Path, settings: Settings, outcome: RenderOutcome) -> Path:
+    data = dict(render_key(settings))
+    data.update({"engine_used": outcome.engine_used, "warning": outcome.warning})
+    if outcome.engine_used == "hyperframes":
+        data["hf_version"] = outcome.hf_version
+        data["resolved_fps"] = outcome.fps
+    return write_text_atomic(Path(out_dir) / RENDER_STAMP, json.dumps(data, indent=2, ensure_ascii=False))
+
+
+def read_render_stamp(out_dir: Path) -> dict:
+    """render.json, or the legacy default {"caption_engine": "ass", "engine_used": "ass"} when missing
+    or unreadable (step-2 renders were ASS)."""
+    try:
+        data = json.loads((Path(out_dir) / RENDER_STAMP).read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+    except (OSError, ValueError):
+        pass
+    return {"caption_engine": "ass", "engine_used": "ass"}
+
+
+def render_settings_changed(out_dir: Path, settings: Settings) -> bool:
+    """True when the render settings (render_key) differ from the ones final.mp4 was made with. Unlike
+    render_is_current this ignores an ASS fallback: the user changed nothing, so the UI shows the fallback
+    warning instead of a "re-render to apply" hint (resume still retries the fallback)."""
+    stamp = read_render_stamp(out_dir)
+    return any(stamp.get(k) != v for k, v in render_key(settings).items())
+
+
+def render_is_current(out_dir: Path, settings: Settings) -> bool:
+    final = Path(out_dir) / "final.mp4"
+    if not (final.is_file() and final.stat().st_size > 0):
+        return False
+    stamp = read_render_stamp(out_dir)
+    key = render_key(settings)
+    if any(stamp.get(k) != v for k, v in key.items()):
+        return False
+    return stamp.get("engine_used") == stamp.get("caption_engine")
