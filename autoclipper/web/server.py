@@ -103,12 +103,54 @@ class NewJobRequest(BaseModel):
     options: JobOptionsIn | None = None
 
 
+class KeywordIn(BaseModel):
+    """G5: one key word of a clip (PUT .../script "keywords")."""
+    model_config = ConfigDict(extra="forbid", strict=True)
+    word: str = Field(max_length=200)
+    emoji: str = Field("", max_length=64)
+
+    @field_validator("word")
+    @classmethod
+    def _word(cls, v: str) -> str:
+        from ..stages.caption_style import keyword_error
+
+        err = keyword_error(v)
+        if err:
+            raise ValueError(err)
+        return v
+
+    @field_validator("emoji")
+    @classmethod
+    def _emoji(cls, v: str) -> str:
+        from ..stages.caption_style import emoji_error
+
+        err = emoji_error(v.strip())
+        if err:
+            raise ValueError(err)
+        return v.strip()
+
+
 class ClipScriptIn(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     narration: str = Field(max_length=20000)
     title: str = Field(max_length=2000)
     description: str = Field("", max_length=5000)
     hashtags: list[Annotated[str, Field(min_length=1, max_length=100)]] = Field(default_factory=list, max_length=MAX_HASHTAGS)
+    # G4 hook line ("" = no hook) and G5 keywords; left out (null) = keep what script.json has.
+    hook: str | None = Field(None, max_length=1000)
+    keywords: list[KeywordIn] | None = Field(None, max_length=8)
+
+    @field_validator("hook")
+    @classmethod
+    def _hook(cls, v: str | None) -> str | None:
+        from ..stages.caption_style import hook_error
+
+        if v is None:
+            return v
+        err = hook_error(v)
+        if err:
+            raise ValueError(err)
+        return v
 
     @field_validator("narration")
     @classmethod
@@ -246,6 +288,15 @@ def _render_info(out_dir: Path, final: bool, settings: Settings | None) -> tuple
     style = stamp.get("style") if engine == "hyperframes" and isinstance(stamp.get("style"), str) else None
     stale = settings is not None and render_settings_changed(out_dir, settings)
     return engine, style, bool(stale)
+
+
+def _style_stale(out_dir: Path, final: bool, settings: Settings | None) -> bool:
+    """G4/G5: the caption style, hook or keywords changed since final.mp4 was rendered."""
+    from ..stages.render import read_render_stamp, style_changed
+
+    if not final or settings is None:
+        return False
+    return bool(style_changed(read_render_stamp(out_dir), out_dir, settings))
 
 
 def _rendered_voiceover(out_dir: Path) -> bool:
@@ -396,6 +447,7 @@ class App:
                     "rendered_voiceover": rendered_vo,
                     "audio": _render_audio(out) if final else None,
                     "audio_stale": bool(final and settings is not None and _audio_stale(out, settings)),
+                    "style_stale": _style_stale(out, final, settings),
                     "task": self.worker.task_dict(self.worker.active_task_for(job.id, c.index, lang)),
                 }
             m = c.moment
@@ -520,6 +572,7 @@ def _settings_value_errors(s: Settings) -> dict[str, list[str]]:
     for name in ("primary_color", "highlight_color"):
         if not ASS_COLOR_RE.match(getattr(c, name)):
             errors[f"captions.{name}"] = ["must be an ASS colour like &H00FFFFFF (&H + 8 hex digits, AABBGGRR)"]
+    errors.update(s.cross_field_errors())  # G4: the hook stays above the captions
     strings = {
         "llm.model": s.llm.model, "llm.api_key_env": s.llm.api_key_env,
         "captions.font_en": c.font_en, "captions.font_hi": c.font_hi,
@@ -876,17 +929,28 @@ def create_app(*, worker: Worker | None = None, settings_loader: Callable[[], Se
             if vo and _saved_narration(_clip_dir(job_id, clip, lang)).strip():
                 raise APIError(422, VALIDATION_FAILED, {"narration": ["narration must not be empty"]})
         out = _clip_dir(job_id, clip, lang)
-        script = normalize_script(ClipScript(narration=body.narration, title=body.title,
-                                             description=body.description, hashtags=list(body.hashtags)))
         try:
             with state.worker.exclusive(job_id, clip, lang):
+                # hook / keywords left out of the body keep the saved ones (older clients send neither)
+                old = _read_script(out / "script.json")
+                hook = body.hook if body.hook is not None else (old.hook if old is not None else "")
+                keywords = ([k.model_dump() for k in body.keywords] if body.keywords is not None
+                            else ([k.model_dump() for k in old.keywords] if old is not None else []))
+                script = normalize_script(ClipScript(narration=body.narration, title=body.title,
+                                                     description=body.description, hashtags=list(body.hashtags),
+                                                     hook=hook, keywords=keywords))
                 out.mkdir(parents=True, exist_ok=True)
                 save_script(script, out / "script.json")
                 if _nonempty_file(out / "final.mp4"):
                     write_metadata(script, lang, out / "metadata.json")
         except WorkerConflict:
             raise APIError(409, "clip is being rendered; try again when it finishes")
-        return {"script": script.model_dump(), "voice_stale": _voice_stale(out, script.narration)}
+        try:
+            js = _job_settings(job, state.settings_loader())
+        except (ValidationError, ValueError, OSError):
+            js = None
+        return {"script": script.model_dump(), "voice_stale": _voice_stale(out, script.narration),
+                "style_stale": _style_stale(out, _nonempty_file(out / "final.mp4"), js)}
 
     @app.post("/api/jobs/{job_id}/clips/{clip}/{lang}/rerender")
     def post_rerender(job_id: JobId, clip: ClipNo, lang: Lang) -> JSONResponse:
@@ -942,6 +1006,13 @@ def create_app(*, worker: Worker | None = None, settings_loader: Callable[[], Se
         if outcome == "finished":
             raise APIError(409, f"task is already {task.state}")
         return JSONResponse(state.worker.task_dict(task), status_code=200 if outcome == "removed" else 202)
+
+    # ---- caption presets (G5) ---------------------------------------------------------------
+    @app.get("/api/caption-presets")
+    def caption_presets() -> dict:
+        from ..caption_presets import presets_payload
+
+        return {"presets": presets_payload()}
 
     # ---- settings ---------------------------------------------------------------------------
     @app.get("/api/settings")

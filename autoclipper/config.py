@@ -120,6 +120,9 @@ class ScriptSettings(BaseModel):
 
 
 class CaptionSettings(BaseModel):
+    # G5 style preset last applied ("custom" = none; see caption_presets.py). Informational: the render uses
+    # the style fields themselves, so every field can still be changed by hand after a preset.
+    preset: Literal["custom", "clean", "bold_pop", "karaoke", "boxed", "gaming_neon"] = "custom"
     font_en: str = "Noto Sans"
     font_hi: str = "Noto Sans Devanagari"
     font_size: int = Field(78, ge=20, le=200)
@@ -133,6 +136,66 @@ class CaptionSettings(BaseModel):
     # "ass" = libass burn-in (always available); "hyperframes" = animated HTML captions rendered by the
     # optional HyperFrames CLI (Node 22+), falling back to ASS per clip when it is missing or fails.
     engine: Literal["ass", "hyperframes"] = "ass"
+    # ---- style (G5): a preset fills the fields below; each one can still be changed by hand. The defaults
+    # are the step 1-4 look, so older settings files render exactly as before.
+    bold: bool = True
+    uppercase: bool = False  # Latin/other cased scripts only; Devanagari has no case
+    outline_color: str = "&H00000000"  # ASS &HAABBGGRR
+    outline_px: int = Field(5, ge=0, le=20)
+    shadow_px: int = Field(2, ge=0, le=20)
+    box: bool = False  # a filled box behind each caption line (box_color); the outline is not drawn then
+    box_color: str = "&H40000000"
+    # How the spoken word is shown: color = it turns the highlight colour; pop = colour + it grows;
+    # karaoke = spoken words stay highlighted; none = no highlight. None = the engine default
+    # (ASS: color, HyperFrames: hyperframes.style).
+    highlight_style: Literal["color", "pop", "karaoke", "none"] | None = None
+    # Keyword emphasis: the 1-3 key words per line the LLM marks in script.json "keywords" are drawn in
+    # emphasis_color, emphasis_scale times bigger (both engines).
+    emphasis: bool = True
+    emphasis_color: str = "&H0000A5FF"  # ASS BGR: orange
+    emphasis_scale: float = Field(1.2, ge=1.0, le=2.0)
+    emphasis_max_per_line: int = Field(2, ge=1, le=3)
+    # The emoji the LLM may give a keyword is drawn after it - HyperFrames engine only (libass has no colour
+    # emoji), with Noto Color Emoji (assets/fonts or the system font).
+    emoji: bool = True
+
+    @field_validator("outline_color", "box_color", "emphasis_color")
+    @classmethod
+    def _ass_color(cls, v: str) -> str:
+        if not isinstance(v, str) or not ASS_COLOR_RE.match(v):
+            raise ValueError("must be an ASS colour like &H00FFFFFF (&H + 8 hex digits, AABBGGRR)")
+        return v
+
+
+ASS_COLOR_RE = re.compile(r"^&H[0-9A-Fa-f]{8}\Z")  # \Z: "$" would accept a trailing newline
+
+
+class HookSettings(BaseModel):
+    """Hook text overlay (G4): the short hook line from script.json "hook", shown big over the first seconds
+    of every clip, separate from the captions. An empty hook shows nothing. See README "Hook text"."""
+    enabled: bool = True
+    duration: float = Field(2.5, ge=1.0, le=5.0)  # seconds from the start of the clip
+    # TOP EDGE of the hook (its box) in % of the height from the top; the hook grows downwards from here,
+    # so it never leaves the frame. At render time a hook that would reach the captions is drawn smaller
+    # (caption_style.hook_layout); on save the top must lie above the captions (cross_field_errors).
+    top_pct: float = Field(8.0, ge=2, le=40)
+    style: Literal["box", "plain"] = "box"  # box = filled box behind the text; plain = outlined text
+    # ASS font size (like captions.font_size): the largest size; a long hook is drawn smaller to fit.
+    font_size: int = Field(112, ge=30, le=200)
+    uppercase: bool = False
+    text_color: str = "&H00FFFFFF"  # ASS &HAABBGGRR: white
+    box_color: str = "&H002A1AE8"  # box style: red (ASS BGR)
+    outline_color: str = "&H00000000"  # plain style: text outline
+    # HyperFrames engine only (ASS always fades in and out): pop = scales in, slide = slides down in,
+    # fade = fades in.
+    animation: Literal["pop", "slide", "fade"] = "pop"
+
+    @field_validator("text_color", "box_color", "outline_color")
+    @classmethod
+    def _ass_color(cls, v: str) -> str:
+        if not isinstance(v, str) or not ASS_COLOR_RE.match(v):
+            raise ValueError("must be an ASS colour like &H00FFFFFF (&H + 8 hex digits, AABBGGRR)")
+        return v
 
 
 _PATH_MAX = 500
@@ -233,6 +296,7 @@ class Settings(BaseModel):
     clips: ClipSettings = Field(default_factory=ClipSettings)
     audio: AudioSettings = Field(default_factory=AudioSettings)
     captions: CaptionSettings = Field(default_factory=CaptionSettings)
+    hook: HookSettings = Field(default_factory=HookSettings)
     script: ScriptSettings = Field(default_factory=ScriptSettings)
     web: WebSettings = Field(default_factory=WebSettings)
     hyperframes: HyperFramesSettings = Field(default_factory=HyperFramesSettings)
@@ -241,6 +305,27 @@ class Settings(BaseModel):
 
     def voice_for(self, lang: str) -> VoiceProfile:
         return self.voicebox.hindi if lang == "hi" else self.voicebox.english
+
+    def cross_field_errors(self) -> dict[str, list[str]]:
+        """Checks across sections, run when settings are saved (web 422, CLI error). Not run on load, so an
+        older settings file never stops loading. Only a hook that is turned on is checked, and only for
+        starting above the captions: a hook too big for the space left is drawn smaller at render time."""
+        errors: dict[str, list[str]] = {}
+        if self.hook.enabled:
+            from .stages.caption_style import caption_top_px
+
+            cap_top = caption_top_px(self.captions, self.clips.height) / self.clips.height * 100
+            limit = cap_top - HOOK_MIN_SPACE_PCT
+            if self.hook.top_pct > limit:
+                where = (f"captions.position_pct {self.captions.position_pct:g}"
+                         if self.captions.position_pct is not None else f"captions.margin_v {self.captions.margin_v}")
+                errors["hook.top_pct"] = [
+                    f"must be at most {max(0.0, limit):.0f} so the hook starts above the captions ({where}); "
+                    f"move the hook up, the captions down, or turn the hook off"]
+        return errors
+
+
+HOOK_MIN_SPACE_PCT = 6.0  # % of the height: the least room between the hook top and the caption top
 
 
 def expand_path(value: str) -> Path:

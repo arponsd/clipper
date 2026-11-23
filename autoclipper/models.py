@@ -39,12 +39,23 @@ class Moment(BaseModel):
         return self.end - self.start
 
 
+class Keyword(BaseModel):
+    """A key word of a clip (G5 keyword emphasis): shown in the emphasis colour in the captions; ``emoji``
+    (optional, HyperFrames engine only) is drawn after it."""
+    word: str
+    emoji: str = ""
+
+
 class ClipScript(BaseModel):
     """What the LLM writes per clip per language. Editable by the user, then re-rendered."""
     narration: str
     title: str
     description: str
     hashtags: list[str] = Field(default_factory=list)
+    # G4: the short hook line shown big over the first seconds ("" = no hook). Scripts from before G4 have none.
+    hook: str = ""
+    # G5: key words emphasised in the captions (in the clip language, as they appear in the captions).
+    keywords: list[Keyword] = Field(default_factory=list)
 
 
 class StageState(BaseModel):

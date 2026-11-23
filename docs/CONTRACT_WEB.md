@@ -639,3 +639,26 @@ These are part of the contract now. Tests: `tests/test_web_review_fixes.py` plus
     409 (as resume).
   - The job page shows a Mode select ("Voice-over + captions" / "Original audio + captions") with
     "Apply & re-render" (confirm dialog); the clip page shows Background / Mix / Final length rows.
+
+## 13. Hook text (G4) and caption style presets + keyword emphasis (G5), additive (builder, 2026-11-23)
+
+- **script.json / ClipScript:** two new fields, `hook: str = ""` (one line, at most 100 characters / 12 words) and
+  `keywords: [{"word": str, "emoji": str}]` (at most 8; `word` 1-3 words, at most 40 characters; `emoji` one emoji or
+  `""`). Scripts without them load with the defaults.
+- **GET `.../clips/{n}/{lang}/script`** returns the two fields too.
+- **PUT `.../clips/{n}/{lang}/script`** accepts optional `hook` (string) and `keywords` (list of
+  `{"word", "emoji"?}`, strict, no extra keys). Left out or `null` = keep the saved value (older clients send
+  neither). Bad values: 422 with `errors.hook` / `errors.keywords.<i>.<field>`; nothing is written. The response adds
+  `style_stale: bool` (the hook/keywords now differ from the rendered final.mp4).
+- **GET `/api/caption-presets`** (token as every `/api/*`): `{"presets": [{"id", "name", "description", "values"}]}`;
+  `values` are `captions.*` fields. The Settings page fills the fields from it; the server never applies a preset on
+  PUT /api/settings (`captions.preset` is informational there). The CLI `settings set captions.preset=<id>` applies it.
+- **Settings:** new `captions.*` style fields and a new `hook` section (see README). PUT /api/settings: 422 for an
+  invalid ASS colour, out-of-range number, unknown enum value, unknown key, or - only while `hook.enabled` - a
+  `hook.top_pct` at which the hook would start at or below the caption line (`errors["hook.top_pct"]`; checked on save
+  only, an older file still loads). A hook too big for the space left is drawn smaller at render time, not refused.
+- **Job detail** per clip-lang adds `style_stale: bool`; `render_stale` is also true then (staleText: "Caption style,
+  hook or keywords changed").
+- **render.json** adds `style_key` (the caption style fields that matter for that clip-language: its own font only,
+  the emphasis fields and keywords only while emphasis is active, `emoji` only for HyperFrames with an emoji; hook
+  text + settings when a hook is drawn). A stamp without it is current only for the step 1-4 look.

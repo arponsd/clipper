@@ -505,8 +505,9 @@ def test_web_put_script_empty_narration_only_when_off(vo_api):
     body = {"narration": "", "title": "Captions only", "description": "d", "hashtags": ["#a"]}
     r = client.put(f"/api/jobs/{off.job.id}/clips/0/hi/script", json=body)
     assert r.status_code == 200, r.text
-    assert r.json() == {"script": {"narration": "", "title": "Captions only", "description": "d", "hashtags": ["#a"]},
-                        "voice_stale": False}
+    assert r.json() == {"script": {"narration": "", "title": "Captions only", "description": "d", "hashtags": ["#a"],
+                                   "hook": "", "keywords": []},  # G4/G5 (additive)
+                        "voice_stale": False, "style_stale": False}
     meta = json.loads((off.clip_dir(0, "hi") / "metadata.json").read_text(encoding="utf-8"))
     assert meta["title"] == "Captions only"  # publish metadata follows the edit
     on = make_job_on_disk(clips=1, langs=("en",))

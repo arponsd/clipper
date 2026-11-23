@@ -1699,3 +1699,225 @@ Remaining issues, none blocking:
 3. **Resume re-renders old finals.** Every voice-over final made before this build is now "re-render to apply" (old mix), and a resume re-renders it once (render only, about 10-45 s per clip-language). This is intended and documented.
 4. **The Mode/stale UI changes were not clicked through in a browser this round.** `node --check` passes; the API is covered by tests.
 5. **Truncation can be misjudged.** It is judged from `script.wps_*`. An unusually fast speaker (over 2x the configured rate) would be treated as cut short: one extra generation, and prefix captions.
+
+## Builder (G4 hook text overlay + G5 caption style presets and keyword emphasis), 2026-11-23
+
+Worktree `auto-clipper-captions`, branch `feat/caption-styles` (from feat/audio-modes 497e3e9). Nothing committed,
+pushed or published. The user's server on :8765, its data dir and Voicebox were not touched (Voicebox was not called:
+every real render reused the saved voice). Data copy `~/.cache/ac-capt/data-builder` (gaming job 20261123-123539-320812
+clip 00 + Reagan job 20261122-185849-65a6bd clip 01 + the user's settings.json, copied read-only). Test server :8791
+(UI copy `~/.cache/ac-capt/data-builder-ui`), stopped afterwards. Publish files (team B) not edited.
+
+### What I built
+- **script.json:** `hook` ("" = none) and `keywords` [{word, emoji}] (models.ClipScript, defaults keep old scripts
+  loading). Cleaned in `normalize_script` (one line, wrapping quotes dropped, <= 12 words / 100 chars; keywords deduped,
+  max 8, an emoji kept only if it is one emoji). New module `stages/caption_style.py` (clean-up, matching, style key).
+- **LLM:** SCRIPT_SCHEMA and METADATA_SCHEMA require `hook` + `keywords`; one shared prompt part
+  (`llm.hook_keywords_instruction`): <= 8 words in the clip language (Devanagari for hi), from the moment's hook,
+  2-5 keywords copied exactly from the narration (voice-over) / what is said (original audio), optional emoji.
+  `add_narration` (voice-over turned on later) takes the fresh keywords and keeps an existing hook.
+- **Settings:** `captions.*` style fields (preset, bold, uppercase, outline_color/px, shadow_px, box/box_color,
+  highlight_style color|pop|karaoke|none|null, emphasis, emphasis_color/scale/max_per_line, emoji); new section
+  `hook.*` (enabled, duration 2.5, position_pct 14, style box|plain, font_size 84, uppercase, text/box/outline colour,
+  animation pop|slide|fade). Defaults = the step 1-4 look (ASS output byte-identical, checked against HEAD).
+  Colour fields validated in the model (CLI + web 422); `Settings.cross_field_errors()` (hook >= 20 points above the
+  captions) runs on save only (web 422 `errors["hook.position_pct"]`, CLI error), so an old settings file still loads.
+- **Presets** (`autoclipper/caption_presets.py`): clean, bold_pop, karaoke, boxed, gaming_neon; validated at import.
+  CLI `settings set captions.preset=<id>` fills the fields (later pairs override), `settings presets` lists them and
+  says "(changed by hand)". Web: GET /api/caption-presets; Settings fills the form client-side.
+- **ASS engine** (`captions.build_ass`): style line from the new fields (BorderStyle 3 box), highlight styles
+  (pop = \fscx115, karaoke, none = one event per line), keyword emphasis (`\c` + `\fscx`), Hook style + one layer-1
+  event `\an5\pos + \fad(150,250)` clamped to the clip length, escaped like captions. `rebuild_ass` rewrites
+  captions.ass from words.json on **every render**, so style/hook/keyword edits need no captions stage.
+- **HyperFrames:** template gets HookSpec (pop/slide/fade in, fade out, box or outlined, `text-wrap: balance`),
+  `.w.em` (emphasis colour, bigger font-size so neighbours reflow), emoji `<span class="emo">` with an "AC Emoji"
+  @font-face (Noto Color Emoji copied from assets/fonts or the system into the clip's hf/assets, offline; SIL OFL 1.1),
+  `.cap.box`, bold/regular face, outline colour, shadow, highlight styles color/none. Default params give the step-3
+  page. make_overlay reads script.json itself; a clip with no words but a hook still gets an overlay.
+- **Staleness:** render.json `style_key` (all caption style fields, hook text+settings only when a hook is drawn,
+  keywords only with emphasis on). Missing key (older renders) = current only while the G4/G5 features change nothing
+  (`legacy_look`), so the user's existing renders do not all go stale. `render_key` style = highlight_style or
+  hyperframes.style. Web detail adds `style_stale` (also folds into `render_stale`).
+- **Web:** clip editor fields Hook text (word/char counter) and Keywords ("clutch 🔥, insane"), client validation,
+  "Hook or keywords changed - re-render to apply"; PUT script accepts optional `hook`/`keywords` (null/absent = keep;
+  strict; 422 per field), response adds `style_stale`. Settings: Style preset select (applies values, marks unsaved,
+  "Changed by hand" note), live CSS preview of one 9:16 frame (EN/हिन्दी toggle, hook + caption line + keyword),
+  labels for all new fields. README sections "Hook text" and "Caption style presets and keyword emphasis" + settings
+  rows; CONTRACT_WEB section 13.
+
+### Tests
+- New `tests/test_caption_styles.py` (71): emoji/hook/keyword clean-up and errors, matching (case, punctuation,
+  inflection, phrases, line cap, Devanagari nukta/anusvara folding), ASS (default = step 4, style fields, 4 highlight
+  styles, emphasis, hook position/fade/clip clamp/escaping/no words, rebuild_ass), HF page (default = step 3, hook
+  markup/animations/escaping incl. `</script>`, emphasis/emoji/box/max-content, build_composition en+hi), overlay with
+  hook and no words, staleness matrix (legacy stamp, style_key changes, hook settings without hook), presets + CLI,
+  settings validation, LLM schema/prompt with a fake client, pipeline e2e both audio modes (hook in captions.ass,
+  edit -> stale -> rerender), API: presets contract + 401/403, PUT script happy path/keep/clear/Hindi, 14 x 422 cases
+  with no write, 404/401/403, settings 422 matrix + cross-field, detail `style_stale`.
+- Updated on purpose (additive contract keys): test_web_jobs (detail `style_stale`, script `hook`/`keywords`),
+  test_web_clips (GET script keys, PUT `style_stale`), test_voiceover_off (PUT response), test_step3_integration
+  (render.json `style_key`).
+- **Full suite: 1403 passed, 3 deselected** (`--basetemp ~/.cache/ac-capt/bt-builder`), re-run after the last CSS/preset
+  tweaks too (1403 passed again).
+
+### Real hooks/keywords from Claude
+- One real `complete_json` per clip-lang with the new prompt part over the EXISTING narration (so the voices are
+  reused), plus a real `write_script` for gaming en/hi (both returned hook + keywords, no error). Saved into the copies:
+  - gaming en "Steal a car in GTA, Dad gets it" [steals 🚗, dad 👨, twenty 💵, chicken 🍗, garage 🏠]
+  - gaming hi "गेम में चोरी, असली में पापा को गाड़ी" [गाड़ी 🚗, ट्रक 🚚, डॉलर 💵, तिजोरी 💰, पापा 👨]
+  - Reagan en "The speech that consoled a grieving nation" [Challenger 🚀, Drake ⛵, poem 📜, forgotten 🕯️]
+  - Reagan hi "ड्रेक जैसा पूरा समर्पण, सात हीरो" [चैलेंजर 🚀, रीगन 🎤, ड्रेक ⛵, कविता 📜, रोंगटे 😢]
+
+### Real renders (`uv run autoclipper rerender` on the data copy; voices reused, no Voicebox)
+- Pass 1, 16 renders, all ok, no ASS fallback: {gaming 00, Reagan 01} x {en, hi} x {bold_pop, boxed} x {ass,
+  hyperframes}. Finals/ass/index.html/render.json in `~/.cache/ac-capt/renders-builder/`, frames in `.../frames/`
+  (contact sheets `sheet1.png`, `sheet_hf_gaming.png`, `sheet_hf_reagan.png`, `sheet_boxed_ass.png`,
+  `sheet_boxed_hf_reagan.png`). Wall time ASS 10-75 s, HyperFrames 47-175 s (machine shared with team B).
+- Pass 2 after two fixes (below), 7 renders, all ok: gaming 00 en/hi boxed ass + hyperframes, en bold_pop
+  hyperframes, and **original-audio mode** (job copy set to voiceover=false, Whisper-word captions) en bold_pop
+  hyperframes + ass. `~/.cache/ac-capt/renders-builder/pass2/`, sheet `pass2/frames/sheet_pass2.png`.
+- Looked at: hook box top-centre in both engines and languages (Devanagari shaped, wraps to 2 lines in hi ASS),
+  fades out by 2.5 s; keyword emphasis in colour + bigger in both engines (en "DAD.", "DRAKE,", hi "पापा",
+  "चैलेंजर", "गाड़ी"); colour emoji after the keyword in HyperFrames only (👨 ⛵ 🚀 🚗), none in ASS; boxed lines;
+  uppercase in bold_pop (Hindi unchanged); original-audio mode marks "STEALS 🚗" in the streamer's own words.
+  Durations unchanged (gaming en 38.25 s, hi 11.13 s trimmed, Reagan 28.84 s).
+- Fixes found by looking at frames (pass 1 -> pass 2):
+  1. HyperFrames `.cap.box` at `left: 50%; width: auto` shrink-wrapped to half the frame, so a 3-word line wrapped
+     ("Drake, ⛵ who / died"). Now `width: max-content; max-width: 90%` (regression assert in the tests).
+  2. HyperFrames hook wrapped with a one-word last line ("... Dad gets / it"): `text-wrap: balance`.
+  3. libass draws BorderStyle-3 boxes per text run, so a scaled keyword got a taller box: the boxed preset now has
+     `emphasis_scale` 1.0 (colour only).
+
+### Web check (:8791, Chrome pane)
+- Settings: Style preset select lists the 5 presets; picking Gaming neon fills size 88/uppercase/outline/pop,
+  marks the form unsaved and the preview updates (EN and हिन्दी); editing font size shows "Changed by hand";
+  hook 65 -> field error "<= 45"; hook 40 with captions 55 -> "must be at most 35 ..."; a valid save persists
+  `captions.preset=gaming_neon`.
+- Clip page: Hook text + Keywords fields filled from script.json; saving "Reagan's most {famous} goodbye" and
+  "Challenger 🚀, Drake ⛵, God" stores [{Challenger,🚀},{Drake,⛵},{God,""}], shows "Hook or keywords changed -
+  re-render to apply", detail `style_stale` true; a 14-word hook is refused client-side. No console errors other than
+  the two intentional 422s.
+
+### Notes for the lead
+- Pre-existing (step 3), visible more with big presets: the HyperFrames pop lets the active word use up its own side
+  margin, so it can touch its neighbour ("JANUARY28TH,", "NOLANSTEALS"). Not changed here.
+- Keywords are per clip, not per line (the roadmap allowed either): a translated original-audio caption may not
+  contain the Hindi keyword verbatim; prefix/variant matching helps, a miss just shows no emphasis.
+- Hook at 14 % sits on the hair line of a close-up (Reagan); 10-12 % is also fine if the lead prefers.
+- Older scripts have no hook/keywords: the user's existing clips look unchanged (and stay current) until a hook is
+  typed or the script is regenerated; there is no "suggest a hook" button for old clips.
+- Emoji font: Linux uses the system Noto Color Emoji (10 MB, copied into each clip-language hf/assets only when an
+  emoji is drawn); Windows needs NotoColorEmoji.ttf in assets/fonts (README), else the page falls back to local().
+
+## Reviewer (visual + UX) - G4 hook + G5 presets/emphasis, 2026-11-23
+
+Looked at: builder renders (pass 1 + pass 2), my own frame sheets at full res (hook window 0-3.2 s, emphasis frames),
+two new real renders on my data copy (`~/.cache/ac-capt/data-reviewer`, gaming clip 00 hi: karaoke/ASS and
+gaming_neon/HyperFrames, both ok, no fallback), synthetic ASS frames for edge cases
+(`~/.cache/ac-capt/review/ass/`), and the web UI on :8796 (now stopped) at 1280 px and 375 px.
+
+OK: Devanagari shaping in hook and emphasis (both engines); hook fades out by 2.5 s and never meets the captions at
+default positions; emoji only in HyperFrames; Boxed boxes stay even; long single words (16-letter EN, 24-char HI)
+are not clipped at gaming_neon size; clip editor hook/keywords save + "re-render to apply"; no horizontal scroll
+at 375 px; 422 for a bad preset / hook.duration 0.
+
+Findings (most important first):
+1. The hook is not "big". The default hook.font_size 84 is smaller than the bold_pop (92) and gaming_neon (88)
+   captions and about the same as the others. In HyperFrames it becomes 64 px, so the Hindi hook is a thin one-line strip.
+   Suggest a default of about 110-120, or let presets set the hook size too.
+2. The hook can go off the top of the frame. position_pct is the centre of the block and there is no clamp on the line count. At
+   position 5 (allowed) the 2-line Hindi hook touches y=0, and at font 160-200 / 14 % the first line is cut off.
+   Both PUTs returned 200. Clamp the top (for example `\an8` with a top margin, or compute the lines) or check it on save.
+3. Hook/caption overlap check is skipped when captions.position_pct is null (legacy margin_v): hook 45 % saved
+   with 200. It is also centre-to-centre only, so it ignores the hook font size and line count.
+4. The Settings preview has the same shrink-wrap bug that fix #1 removed from HyperFrames. `.cp-cap` and `.cp-hook` are
+   `left:50%` with no width, so they are 107 px wide in a 216 px frame. "total madness in" (3 words/line) and
+   "TOTAL MADNESS" (gaming_neon, 2 words/line) wrap to 2 lines in the preview but are 1 line in the render. The
+   Hindi preview hook leaves an orphan "देखो" (no text-wrap: balance). Needs `width:max-content; max-width:..`.
+5. A keyword overrides the spoken-word highlight. When the active word is a keyword it keeps the emphasis
+   colour (only the scale changes), so in Karaoke the gold fill skips keywords and in pop the "current word"
+   cue disappears on the most important word.
+6. The clip page shows two different "Hook"s. The side panel "Hook: Whatever car Nolan steals..." (the moment's
+   English hook, also on the Hindi page) sits next to the empty "Hook text" field. Rename one (for example "Moment" vs
+   "On-screen hook"). Existing clips have no way to suggest a hook.
+7. The hook settings are about 1400 px below the only preview, so the user cannot see hook size/position
+   changes as they edit. Six more raw ASS BGR colour strings (`&H002A1AE8` = red) with no swatch.
+8. The engines wrap the same hook differently (EN: ASS 1 line / HF 2 lines, HI: the opposite). This is cosmetic, but the
+   preview matches neither.
+9. Known/pre-existing: the HF pop makes the active word touch its neighbour (worse with large presets and in Hindi:
+   "सातहीरो"). The hook at 14 % covers the hairline in the Reagan close-up. Only bold_pop/boxed were rendered by the
+   builder; I added karaoke (ASS) and gaming_neon (HF). clean, karaoke-HF and gaming_neon-ASS have not been rendered for real.
+
+## Lead triage + fixes + sign-off (G4 hook text + G5 caption presets / keyword emphasis), 2026-11-23
+
+Worktree `auto-clipper-captions`, branch `feat/caption-styles`. Data copy `~/.cache/ac-capt/data-lead` (gaming job
+20261123-123539-320812 clip 00 copied from the builder's copy, which holds Claude's real hook/keywords; the user's
+settings.json copied read-only). No server started, Voicebox and Claude not called, :8765 and team B files untouched.
+
+### Triage: code review
+- **1 (cross-field check blocks every save): ACCEPTED.** The check runs only while `hook.enabled`, and only refuses a
+  hook that would *start* at or below the caption line (`hook.top_pct` > caption top - 6 %), using the real caption top
+  (position_pct or margin_v, font size, pop/emphasis scale, box). Captions at 20 % with the default hook now save.
+- **2 (centre-only overlap, margin_v mode unchecked): ACCEPTED.** New shared `caption_style.hook_layout`: the hook is
+  anchored by its **top edge** (`hook.position_pct` -> `hook.top_pct`, 2-40, default 8; ASS `\an8\pos`, HF no
+  translateY) and grows downwards; an estimated line count (per-character widths, Devanagari marks zero-width) is used
+  to shrink the font (down to 55 %) and, if still too tall, to move it up (not above 2 %), so it stays above the
+  captions in both caption modes. Both engines use the same size, padding and wrap width (900 of 1080 px).
+- **3 (LLM keywords/hook not checked): ACCEPTED.** `check_llm_extras` in the script stage: with a voice-over, keywords
+  must occur in the FINAL (post-`shorten`) narration; a Hindi hook without Devanagari is dropped; voice-over off, Hindi
+  keywords must contain Devanagari. User-typed text is not filtered.
+- **4 (prefix matches unrelated words): ACCEPTED.** Only known endings (en: s/es/ed/d/ing/er/ers/est, doubled consonant
+  + ed/ing/er; hi: a short list of matra/case/plural endings). "pain" != "paint", "star" != "start".
+- **5 (over-staleness): ACCEPTED.** `style_key(settings, script, lang)`: only the clip language's font; emphasis fields
+  and `emphasis` only while emphasis is active; `emoji` only for HyperFrames with an emoji keyword.
+- **6 (uneven ASS boxes with scale): ACCEPTED.** With `captions.box` the ASS engine never scales words (emphasis or pop);
+  colour only. The preview mirrors it.
+- **7 (emoji font copied per clip, not bundled): PARTLY.** Accepted: the font is hard-linked when possible (copy across
+  file systems or when protected_hardlinks refuses a root-owned system file). Rejected: shipping the 10.8 MB font in git;
+  README documents the install/OFL licence and assets/fonts for Windows.
+- **8 (single emoji not enforced): ACCEPTED.** `is_emoji` counts emoji units (ZWJ sequences, skin tones, flag pairs = 1);
+  "🔥🔥" is now 422.
+- **9 (two hook-end functions): ACCEPTED.** `captions.hook_end_seconds` removed; both engines use `caption_style.hook_end`.
+- **10 (HF hook faux bold): ACCEPTED.** The hook weight follows `captions.bold` in both engines.
+
+### Triage: visual + UX review
+- **1 (hook not big): ACCEPTED.** `hook.font_size` default 84 -> 112 (bigger than every preset's captions; test).
+- **2 (hook off the top): ACCEPTED**, top-edge anchoring (code 2).
+- **3 (overlap gaps): ACCEPTED**, code 1 + 2.
+- **4 (preview shrink-wrap / orphan): ACCEPTED.** `.cp-cap` / `.cp-hook` get `width: max-content` + max-width (the hook's
+  is the render's wrap width), the hook `text-wrap: balance`, top-edge placement, the render's box padding and weight.
+- **5 (keyword hides the spoken-word highlight): ACCEPTED.** Both engines: a keyword rests in the emphasis colour and
+  takes the highlight colour while spoken (karaoke: once spoken); its scale stays.
+- **6 (two "Hook"s on the clip page): ACCEPTED** (side panel "Moment", editor "On-screen hook"). "Suggest a hook" for
+  old clips: DEFERRED (needs a new LLM endpoint; follow-up).
+- **7 (no preview near the hook settings, raw BGR colours): ACCEPTED.** A second preview frame in the Hook section (both
+  frames repaint together); every `captions.*color` / `hook.*color` field gets a colour swatch that writes BGR and keeps
+  the alpha byte.
+- **8 (engines wrap differently): PARTLY.** Same wrap width and size now; ASS smart-wrap vs CSS balance still can break
+  a line differently. Cosmetic, left.
+- **9 (pre-existing / coverage): REJECTED here** (HF pop touching neighbours and captions over the facecam are step-3
+  behaviour; follow-up). Hairline overlap reduced by the top-edge default. Coverage: see renders below.
+
+### Tests
+- 16 new regression tests in `tests/test_caption_styles.py` (inflection endings, LLM checks incl. shorten path,
+  cross-field only when enabled + margin_v mode, layout shrink/move/top anchor, default size, style_key narrowing,
+  box no-scale, karaoke keyword fill, hook weight, emoji link, multi-emoji). Existing tests updated for the renamed
+  field, top anchor and highlight rule.
+- **Full suite: 1419 passed, 3 deselected** (`--basetemp ~/.cache/ac-capt/bt-lead`).
+
+### Real renders (gaming clip 00, `uv run autoclipper rerender` on the data copy; voices reused)
+- 8 renders, all rc 0, no ASS fallback: {default look, karaoke preset} x {ass, hyperframes} x {en, hi}
+  (ASS 10-23 s, HyperFrames 117-142 s). Finals in `~/.cache/ac-capt/renders-lead/`, sheets in
+  `~/.cache/ac-capt/showcase/` (`default_hook_ass-hf_en-hi.png`, `default_keyword_rest-vs-spoken.png`,
+  `karaoke_hook_ass-hf_en-hi.png`, `karaoke_keywords.png`, `summary.txt`).
+- Looked at: the hook is now clearly bigger than the captions, top-anchored at 8 %, two balanced-ish lines in both
+  engines and languages, Devanagari shaped; far above the captions. Keyword "steals"/"पापा" rests in the emphasis colour
+  and turns to the highlight colour while spoken (ASS and HF, en and hi); karaoke fills "steals" gold once spoken;
+  emoji only in HyperFrames.
+- Visible, not fixed: the HF box is a bit wider than the ASS box (HF horizontal padding); HF pop still lets the
+  spoken word touch its neighbour ("carNolan", pre-existing step-3 behaviour).
+
+### Sign-off
+Approved for the branch. Remaining (follow-ups): "suggest a hook" for older clips; HF pop word spacing; the ASS/HF
+wrap algorithms can still differ by a line; emoji font not shipped for Windows (documented); Reagan clip and Clean /
+Gaming-neon presets not re-rendered after these fixes (the layout/colour changes are engine-shared and unit-tested).

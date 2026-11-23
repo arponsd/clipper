@@ -137,12 +137,17 @@ def _clean_hashtags(tags: list[str]) -> list[str]:
 
 
 def normalize_script(s: ClipScript) -> ClipScript:
-    """Title <= 70 chars; hashtags "#x", no spaces, deduped, at most 8; whitespace tidied."""
+    """Title <= 70 chars; hashtags "#x", no spaces, deduped, at most 8; whitespace tidied; the hook one clean
+    line (G4); keywords cleaned and deduplicated, an emoji kept only when it is one emoji (G5)."""
+    from .caption_style import clean_hook, clean_keywords
+
     return ClipScript(
         narration=" ".join(s.narration.split()),
         title=_clean_title(s.title),
         description=s.description.strip(),
         hashtags=_clean_hashtags(s.hashtags),
+        hook=clean_hook(s.hook),
+        keywords=clean_keywords(s.keywords),
     )
 
 
@@ -180,7 +185,10 @@ def _generate_script(*, llm: LLM, transcript: Transcript, moment: Moment, lang: 
         shorter = llm.shorten(lang=lang, narration=script.narration, max_words=target)
         if shorter.strip():
             script = script.model_copy(update={"narration": shorter})
-    return normalize_script(script)
+    from .caption_style import check_llm_extras
+
+    # keywords are checked against the FINAL narration (after any shortening), the hook against the language
+    return check_llm_extras(normalize_script(script), lang, voiceover=True)
 
 
 def write_script(*, llm: LLM, transcript: Transcript, moment: Moment, lang: str,
@@ -211,7 +219,9 @@ def write_metadata_script(*, llm: LLM, transcript: Transcript, moment: Moment, l
     else:
         script = llm.write_script(lang=lang, clip_transcript=clip_transcript, moment=moment,
                                   duration=duration, target_words=target_words(duration, lang))
-    script = normalize_script(script.model_copy(update={"narration": ""}))
+    from .caption_style import check_llm_extras
+
+    script = check_llm_extras(normalize_script(script.model_copy(update={"narration": ""})), lang, voiceover=False)
     if not script.title:
         raise ScriptError(f"the LLM returned an empty {lang} title")
     save_script(script, out_json)
@@ -224,7 +234,9 @@ def add_narration(*, llm: LLM, transcript: Transcript, moment: Moment, lang: str
     the existing (possibly user-edited) title, description and hashtags."""
     fresh = _generate_script(llm=llm, transcript=transcript, moment=moment, lang=lang,
                              script_settings=script_settings)
-    merged = script.model_copy(update={"narration": fresh.narration})
+    # the keywords must come from the new narration (the captions now show it); a hook already there is kept
+    merged = script.model_copy(update={"narration": fresh.narration, "keywords": fresh.keywords,
+                                       "hook": script.hook or fresh.hook})
     save_script(merged, out_json)
     return merged
 

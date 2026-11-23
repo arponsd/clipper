@@ -7,6 +7,7 @@ The subprocess goes through a `Runner` seam so tests never need Node.
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import logging
@@ -27,8 +28,8 @@ from typing import Callable, Mapping
 from .. import config, ffmpeg
 from ..config import HyperFramesSettings, Settings, expand_path
 from ..interfaces import ProgressFn
-from ..models import Word
-from . import hf_template
+from ..models import ClipScript, Word
+from . import caption_style, hf_template
 from ._atomic import write_text_atomic
 
 log = logging.getLogger(__name__)
@@ -207,6 +208,12 @@ def child_env(s: HyperFramesSettings, tmp_dir: Path | None, base: Mapping[str, s
 
 
 # --------------------------------------------------------------------------------------------- composition
+def _css_or_black(color: str) -> str:
+    """The outline colour as CSS; the default opaque black stays "#000" (the step-3 page, byte for byte)."""
+    css = ass_color_to_css(color)
+    return "#000" if css == "rgba(0,0,0,1)" else css
+
+
 def ass_color_to_css(color: str) -> str:
     """ASS &HAABBGGRR (AA 00 = opaque) -> CSS rgba()."""
     h = color.strip().upper().removeprefix("&H").rstrip("&")
@@ -318,6 +325,24 @@ def ass_em_ratio(font_file: Path | None) -> float:
     return ratio if 0.3 <= ratio <= 1.5 else DEFAULT_ASS_EM_RATIO
 
 
+EMOJI_FAMILY = "Noto Color Emoji"
+EMOJI_ALIAS = "AC Emoji"
+
+
+def _copy_font(f: Path, fonts_dir: Path) -> str:
+    """Put font file ``f`` into the composition's assets/fonts (a hard link when possible: the 10 MB emoji
+    font is then not duplicated per clip-language). Returns the file name used in the page."""
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", f.name)
+    dst = fonts_dir / name
+    if not (dst.is_file() and dst.stat().st_size == f.stat().st_size):
+        dst.unlink(missing_ok=True)
+        try:
+            os.link(f, dst)
+        except OSError:  # another file system, or links not allowed
+            shutil.copyfile(f, dst)
+    return name
+
+
 def _font_faces(settings: Settings, lang: str, fonts_dir: Path
                 ) -> tuple[tuple[hf_template.FontFace, ...], str, float]:
     c = settings.captions
@@ -325,7 +350,7 @@ def _font_faces(settings: Settings, lang: str, fonts_dir: Path
     faces = []
     primary_file: Path | None = None
     for alias, family in specs:
-        f = find_font_file(family, bold=True)
+        f = find_font_file(family, bold=c.bold)
         if (alias == "AC Caption HI") == (lang == "hi"):
             primary_file = f
         name = None
@@ -342,9 +367,10 @@ def _font_faces(settings: Settings, lang: str, fonts_dir: Path
 
 
 def build_composition(words: list[Word], *, lang: str, duration: float, settings: Settings, out_dir: Path,
-                      gsap: Path, fps: int, width: int = 1080, height: int = 1920) -> Path:
+                      gsap: Path, fps: int, width: int = 1080, height: int = 1920,
+                      script: ClipScript | None = None) -> Path:
     """Write out_dir/index.html + out_dir/assets/{fonts,vendor}; return index.html. No subprocess
-    (except an fc-match font lookup)."""
+    (except an fc-match font lookup). ``script`` (script.json) gives the hook line and the keywords (G4/G5)."""
     out_dir = Path(out_dir)
     fonts_dir = out_dir / "assets" / "fonts"
     vendor = out_dir / "assets" / "vendor"
@@ -355,25 +381,68 @@ def build_composition(words: list[Word], *, lang: str, duration: float, settings
         shutil.copyfile(gsap, gsap_dst)
     faces, stack, em_ratio = _font_faces(settings, lang, fonts_dir)
     keep = {f.file for f in faces if f.file}
+    c = settings.captions
+    per_line = max(1, int(c.words_per_line))
+    marks = (caption_style.emphasis_marks(list(words), script.keywords, per_line=per_line,
+                                          max_per_line=c.emphasis_max_per_line)
+             if script is not None and caption_style.emphasis_active(settings, script) else {})
+    if not c.emoji:
+        marks = {k: "" for k in marks}
+    emoji_file = None
+    if any(marks.values()):
+        ef = find_font_file(EMOJI_FAMILY, bold=False)
+        if ef is not None:
+            emoji_file = _copy_font(ef, fonts_dir)
+            keep.add(emoji_file)
+        else:
+            log.warning("font %r not found as a file; emojis use local(%r)", EMOJI_FAMILY, EMOJI_FAMILY)
     for old in fonts_dir.iterdir():  # stale fonts of an earlier font setting would change the hash
         if old.name not in keep:
             old.unlink(missing_ok=True)
 
-    c = settings.captions
     pct = c.position_pct
+    hook = None
+    text = caption_style.hook_text(script, settings)
+    if text:
+        h = settings.hook
+        lay = caption_style.hook_layout(text, settings, width=int(width), height=int(height))
+        hook = hf_template.HookSpec(
+            text=text, end=caption_style.hook_end(settings, duration), top_px=lay.top_px,
+            font_px=max(1, int(round(lay.font_size * em_ratio))), pad_px=lay.pad_px if h.style == "box" else 0,
+            wrap_px=lay.wrap_px, color=ass_color_to_css(h.text_color),
+            box=ass_color_to_css(h.box_color) if h.style == "box" else None,
+            outline=ass_color_to_css(h.outline_color), stroke_px=2 * lay.pad_px, animation=h.animation)
     params = hf_template.TemplateParams(
         lang=lang, width=int(width), height=int(height), fps=int(fps), duration=float(duration),
-        style=settings.hyperframes.style, fonts=faces, font_stack=stack,
+        style=c.highlight_style or settings.hyperframes.style, fonts=faces, font_stack=stack,
         # same visual size as the ASS captions (ASS PlayResY = the video height, so no height scaling)
         font_px=max(1, int(round(c.font_size * em_ratio))),
         # -webkit-text-stroke is centred on the glyph edge and paint-order puts the fill on top, so only
         # half of it shows: 2 x the ASS Outline (5 px in captions.build_ass) gives the same visible border.
-        stroke_px=2 * ASS_OUTLINE_PX,
+        stroke_px=2 * c.outline_px,
         primary=ass_color_to_css(c.primary_color), highlight=ass_color_to_css(c.highlight_color),
         top_px=(pct / 100 * height) if pct is not None else None,
         bottom_px=int(c.margin_v),
+        bold=c.bold, outline=_css_or_black(c.outline_color), shadow_px=c.shadow_px,
+        box=ass_color_to_css(c.box_color) if c.box else None,
+        emphasis=ass_color_to_css(c.emphasis_color), emphasis_scale=c.emphasis_scale,
+        emoji_family=EMOJI_ALIAS if any(marks.values()) else None, emoji_file=emoji_file,
+        hook=hook,
     )
-    groups = hf_template.group_words(list(words), c.words_per_line, duration)
+    shown = [w.model_copy(update={"text": caption_style.display_text(w.text, c.uppercase)}) for w in words]
+    groups = hf_template.group_words(shown, c.words_per_line, duration)
+    if marks:
+        k = 0
+        out_groups = []
+        for g in groups:
+            ws = []
+            for w in g.words:
+                if k in marks:
+                    w = dataclasses.replace(w, emph=True, emoji=marks[k])
+                ws.append(w)
+                k += 1
+            out_groups.append(dataclasses.replace(g, words=tuple(ws)))
+        groups = out_groups
     index = out_dir / "index.html"
     write_text_atomic(index, hf_template.render_html(groups, params))
     return index
@@ -713,7 +782,7 @@ def overlay_name(fmt: str) -> str:
     return f"captions_overlay.{fmt}"
 
 
-def _load_words(words_json: Path) -> list[Word]:
+def _load_words(words_json: Path, *, allow_empty: bool = False) -> list[Word]:
     try:
         raw = json.loads(Path(words_json).read_text(encoding="utf-8"))
         words = [Word(**w) for w in raw]
@@ -721,14 +790,14 @@ def _load_words(words_json: Path) -> list[Word]:
         raise HyperFramesError(f"{Path(words_json).name} not found (run the captions stage)") from e
     except (OSError, ValueError, TypeError) as e:
         raise HyperFramesError(f"{Path(words_json).name} is not valid: {str(e).splitlines()[0][:200]}") from e
-    if not words:
+    if not words and not allow_empty:
         raise HyperFramesError(f"{Path(words_json).name} has no words")
     return words
 
 
 def make_overlay(*, words_json: Path, cut: Path, lang: str, settings: Settings, out_dir: Path,
                  on_progress: ProgressFn | None = None, runner: Runner | None = None,
-                 env: HFEnv | None = None) -> Path:
+                 env: HFEnv | None = None, script: ClipScript | None = None) -> Path:
     """Build the composition for one clip-language and render (or reuse) its transparent overlay.
 
     Returns out_dir/captions_overlay.<fmt>. ``env`` lets the pipeline pass a memoised probe_env result.
@@ -741,7 +810,12 @@ def make_overlay(*, words_json: Path, cut: Path, lang: str, settings: Settings, 
         env = probe_env(s)
     if fmt == "webm" and not has_vp9_alpha_decoder():
         raise HyperFramesError("ffmpeg has no libvpx-vp9 decoder (needed for WebM alpha); set hyperframes.format=mov")
-    words = _load_words(words_json)
+    if script is None:  # hook + keywords come from the clip-language's script.json (G4/G5)
+        from .render import load_clip_script
+
+        script = load_clip_script(out_dir)
+    # a clip with no words still gets an overlay when it has a hook line to draw (G4)
+    words = _load_words(words_json, allow_empty=bool(caption_style.hook_text(script, settings)))
     try:
         info = ffmpeg.probe(Path(cut))
     except ffmpeg.FFmpegError as e:
@@ -753,7 +827,7 @@ def make_overlay(*, words_json: Path, cut: Path, lang: str, settings: Settings, 
 
     comp = out_dir / "hf"
     build_composition(words, lang=lang, duration=duration, settings=settings, out_dir=comp, gsap=env.gsap,
-                      fps=fps, width=width, height=height)
+                      fps=fps, width=width, height=height, script=script)
     dst = out_dir / overlay_name(fmt)
     stamp = {"composition_sha256": composition_hash(comp), "format": fmt, "fps": fps,
              "duration": round(duration, 3), "hf_version": env.hf_version}
