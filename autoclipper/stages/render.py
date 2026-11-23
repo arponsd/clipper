@@ -502,6 +502,17 @@ def render_clip(*, cut: Path, out_dir: Path, settings: Settings, on_progress: Pr
     report: dict = {}
     common = dict(cut=Path(cut), voice=voice, dst=final, audio=settings.audio, words_json=words, bed=bed,
                   report=report)
+    # captions.ass follows the current caption style, keywords and hook (G4/G5) on every render
+    script = load_clip_script(out_dir)
+    from .caption_style import hook_text
+    from .captions import rebuild_ass
+
+    try:
+        clip_duration = ffmpeg.probe(Path(cut)).duration
+    except ffmpeg.FFmpegError:
+        clip_duration = None  # render_final reports the broken cut
+    rebuild_ass(out_dir, lang=out_dir.name, settings=settings, script=script, duration=clip_duration)
+    has_hook = bool(hook_text(script, settings))
 
     def done(outcome: RenderOutcome) -> RenderOutcome:
         if audio_warning:
@@ -517,9 +528,9 @@ def render_clip(*, cut: Path, out_dir: Path, settings: Settings, on_progress: Pr
         render_final(ass=ass, on_progress=on_progress, **common)
         return done(RenderOutcome(path=final, engine_used="ass", warning=None))
 
-    if _no_words(words):
-        # Nothing is said in this clip (e.g. captions only over music): there are no captions to draw,
-        # so there is no overlay to make - not a HyperFrames failure.
+    if _no_words(words) and not has_hook:
+        # Nothing is said in this clip (e.g. captions only over music) and there is no hook: there is
+        # nothing to draw, so there is no overlay to make - not a HyperFrames failure.
         render_final(ass=None, on_progress=on_progress, **common)
         return done(RenderOutcome(path=final, engine_used="hyperframes", warning=None))
 
@@ -610,11 +621,32 @@ def audio_settings_changed(stamp: dict, settings: Settings) -> bool:
 
 
 def render_key(settings: Settings) -> dict:
-    """The settings a final.mp4 depends on beyond its inputs (CONTRACT_STEP3 5.1)."""
+    """The settings a final.mp4 depends on beyond its inputs (CONTRACT_STEP3 5.1). "style" is the HyperFrames
+    animation: captions.highlight_style when set (G5), else hyperframes.style."""
     if settings.captions.engine != "hyperframes":
         return {"caption_engine": "ass"}
     h = settings.hyperframes
-    return {"caption_engine": "hyperframes", "style": h.style, "format": h.format, "fps": h.fps}
+    return {"caption_engine": "hyperframes", "style": settings.captions.highlight_style or h.style,
+            "format": h.format, "fps": h.fps}
+
+
+def load_clip_script(out_dir: Path) -> ClipScript | None:
+    """out_dir/script.json, or None when it is missing or unreadable (no hook, no keywords then)."""
+    try:
+        return ClipScript.model_validate_json((Path(out_dir) / "script.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def style_changed(stamp: dict, out_dir: Path, settings: Settings) -> bool:
+    """The caption look (style fields, hook, keywords; caption_style.style_key) differs from the one the
+    final.mp4 was made with. A stamp from before G4/G5 (no style_key) matches only the step 1-4 look."""
+    from .caption_style import legacy_look, style_key
+
+    script = load_clip_script(out_dir)
+    if "style_key" not in stamp:
+        return not legacy_look(settings, script)
+    return stamp.get("style_key") != style_key(settings, script, Path(out_dir).name)
 
 
 def write_render_stamp(out_dir: Path, settings: Settings, outcome: RenderOutcome) -> Path:
@@ -626,6 +658,9 @@ def write_render_stamp(out_dir: Path, settings: Settings, outcome: RenderOutcome
         data["audio_key"] = audio_key(settings)  # the audio settings this render used (staleness)
     if outcome.audio:
         data["audio"] = outcome.audio  # informational (mix, loudness, trim)
+    from .caption_style import style_key
+
+    data["style_key"] = style_key(settings, load_clip_script(out_dir), Path(out_dir).name)  # the caption look (staleness, G4/G5)
     if outcome.engine_used == "hyperframes":
         data["hf_version"] = outcome.hf_version
         data["resolved_fps"] = outcome.fps
@@ -658,6 +693,8 @@ def render_settings_changed(out_dir: Path, settings: Settings) -> bool:
         return True
     if audio_settings_changed(stamp, settings):
         return True
+    if style_changed(stamp, out_dir, settings):
+        return True
     return any(stamp.get(k) != v for k, v in render_key(settings).items())
 
 
@@ -669,6 +706,8 @@ def render_is_current(out_dir: Path, settings: Settings) -> bool:
     if rendered_voiceover(stamp) != settings.voiceover:
         return False
     if audio_settings_changed(stamp, settings):
+        return False
+    if style_changed(stamp, out_dir, settings):
         return False
     key = render_key(settings)
     if any(stamp.get(k) != v for k, v in key.items()):

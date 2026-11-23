@@ -303,6 +303,37 @@ The voice-over audio settings (`audio.*` and `separation.background` / `model`) 
 
 **Cut-short voices.** Chatterbox sometimes stops a long take early (e.g. a 10 s voice for a 115-word Hindi narration that needs about 34 s). A take shorter than half of what its words need at `script.wps_en` / `script.wps_hi` is generated once more and the longer take kept. If it is still cut short it is marked `truncated` in voice.json, the clip gets a warning, it is never "lengthened" (a longer text would be cut short too), and the captions show only the words that are actually spoken (estimated, then aligned to the voice) instead of squeezing the whole text into the short voice. Voices made before this check get the same caption handling on their next re-render. With `audio.short_voice = trim_clip` such a clip ends about 1 s after the voice.
 
+### Hook text (first seconds)
+
+Every clip can open with a short, punchy **hook line** shown big at the top for the first seconds, separate from the captions (for example "He did not see this coming"). Claude writes it with the script, in the clip's language (Hindi in Devanagari, at most about 8 words, from the moment's hook) and it is stored as `"hook"` in `clips/NN/<lang>/script.json`. It works in both audio modes (with the voice-over off Claude writes it with the title).
+
+- **Edit it** on the clip page (field **On-screen hook**; empty = no hook for that clip; the **Moment** line in the side panel is the English reason the clip was picked, not the on-screen text) or in `script.json`, then re-render the clip. Scripts made before this version have no hook until you type one.
+- **Settings › Hook text** (`hook.*`): on/off, `duration` (2.5 s), `top_pct` (the hook's **top edge**, 8 % from the top; it grows downwards, so it never leaves the frame), `style` (`box` = text on a filled box, `plain` = outlined text), `font_size` (112, bigger than every caption preset), `uppercase`, `text_color` / `box_color` / `outline_color` (ASS `&HAABBGGRR`, with a colour picker next to each field) and `animation`. A second preview frame sits under the hook settings.
+- **Never over the captions:** a hook that would reach the caption line (a long line, a big font, a low top edge) is drawn smaller, down to 55 % of `font_size`, and moved up if even that is too tall; both engines use the same layout and wrap width. Saving refuses (422 / CLI error) only a hook that is on and would *start* at or below the captions (`errors["hook.top_pct"]`); a hook that is off is never checked.
+- **Claude's hook is checked:** a Hindi hook that is not in Devanagari is dropped (no hook rather than a Latin-script one). The text you type yourself is used as it is.
+- **Engines:** the ASS engine fades the hook in and out. The HyperFrames engine animates it in (`pop` scales in, `slide` drops in, `fade`) and fades it out; if HyperFrames fails the ASS fallback still shows the hook. A clip with no spoken words still gets its hook.
+- Changing the hook text of a rendered clip, or a hook setting while a hook is shown, marks the clip "re-render to apply"; a resume or re-render redoes only the render.
+
+### Caption style presets and keyword emphasis
+
+**Presets.** Settings › Captions › **Style preset** fills the style fields with a named bundle; you can still change any field afterwards (the page then says "changed by hand"). The preview next to it shows one frame with the current values (English / हिन्दी). Fonts, the position and the engine are never changed by a preset.
+
+| Preset | Look |
+|---|---|
+| `clean` | Regular weight, 4 words per line, thin outline, soft yellow highlight |
+| `bold_pop` | Big upper-case words, 2 per line, thick outline; the spoken word pops in yellow |
+| `karaoke` | 4 words per line that fill with gold as they are spoken |
+| `boxed` | White text on a dark box behind each line |
+| `gaming_neon` | Upper case, purple outline glow, neon-green pop, 2 words per line |
+
+CLI: `uv run autoclipper settings presets` lists them; `uv run autoclipper settings set captions.preset=bold_pop` applies one (add more `key=value` pairs after it to override fields, e.g. `captions.preset=bold_pop captions.font_size=80`).
+
+The style fields (`captions.*`): `bold`, `uppercase` (Latin text; Devanagari has no case), `outline_color` / `outline_px`, `shadow_px`, `box` / `box_color`, `highlight_style` (`color` = the spoken word changes colour, `pop` = and grows, `karaoke` = spoken words stay lit, `none`; `null` = the engine default: ASS `color`, HyperFrames `hyperframes.style`), plus the existing size, colours and words per line. The defaults are the look of earlier versions, so existing settings and renders are unchanged.
+
+**Keyword emphasis.** Claude also picks 2-5 **keywords** per clip (the most important words of the narration, or of what is said when the voice-over is off) and may give each one emoji. They are stored as `"keywords": [{"word": "clutch", "emoji": "🔥"}]` in `script.json` and can be edited on the clip page (**Keywords**: `clutch 🔥, insane, final round`). In the captions every occurrence is drawn in `captions.emphasis_color`, `captions.emphasis_scale` times bigger (both engines, at most `captions.emphasis_max_per_line` per line). Matching ignores case and punctuation, allows a known inflection ending only (`clutch` also marks `clutched`, `steal` marks `steals`; `star` does not mark `start`) and folds Hindi spelling variants (nukta, chandrabindu/anusvara), so it works for Whisper-word captions, narration captions and translated captions. A keyword that does not appear in the captions is simply not shown; with the voice-over on, keywords Claude picks that are not in the final (possibly shortened) narration are dropped when the script is written, and with it off a Hindi keyword must be in Devanagari. While a keyword is being spoken it takes the highlight colour like any other word (karaoke: once spoken), so the "current word" cue stays visible; with `captions.box` the ASS engine colours keywords but does not scale them (libass would draw a taller box behind them). The emoji must be one single emoji. The emoji is drawn after the keyword's first occurrence by the **HyperFrames engine only** (`captions.emoji`; libass cannot draw colour emoji, so the ASS engine shows the coloured word without it). HyperFrames uses Noto Color Emoji (SIL Open Font License 1.1): on Linux `sudo apt install fonts-noto-color-emoji` (or put `NotoColorEmoji.ttf` into `assets/fonts/`); on Windows download `NotoColorEmoji.ttf` from https://github.com/googlefonts/noto-emoji/tree/main/fonts into `assets\fonts\` (without it the page falls back to the system emoji font). It is linked (or, across file systems, copied) into the clip's local HyperFrames folder only when an emoji is drawn, so rendering stays offline; the font is not shipped in this repository (10 MB).
+
+Changing a caption style field that affects a clip, its keywords or `captions.emphasis` marks it "re-render to apply" (render.json `style_key`; the other language's font, emphasis settings of a clip without keywords and the emoji switch with the ASS engine do not). Renders from before this version count as made with the old look: they stay current until you change a new style field, turn on a hook that the clip has, or the clip gets keywords.
+
 ---
 
 ## Usage: Web UI
@@ -634,6 +665,22 @@ Change settings with `autoclipper settings set key.path=value`. The value is par
 | `captions.primary_color` / `captions.highlight_color` | white / yellow | ASS `&HAABBGGRR` colors (`&H` + 8 hex digits) |
 | `captions.position_pct` | `72` | Vertical centre of the caption line, in % of the height from the top (5-95). `null` = use `captions.margin_v` |
 | `captions.margin_v` | `520` | Distance of the captions from the bottom, in px, 0 to `clips.height` (only when `captions.position_pct` is `null`) |
+| `captions.preset` | `custom` | Last style preset applied (`clean`, `bold_pop`, `karaoke`, `boxed`, `gaming_neon`); `settings set captions.preset=<name>` fills the style fields. See [presets](#caption-style-presets-and-keyword-emphasis) |
+| `captions.bold` / `captions.uppercase` | `true` / `false` | Bold weight; upper-case text (Latin) |
+| `captions.outline_color` / `captions.outline_px` / `captions.shadow_px` | black / `5` / `2` | Text outline colour (ASS) and width, shadow size (0-20 px) |
+| `captions.box` / `captions.box_color` | `false` / `&H40000000` | A filled box behind each line instead of the outline |
+| `captions.highlight_style` | `null` | `color` / `pop` / `karaoke` / `none`; `null` = ASS `color`, HyperFrames `hyperframes.style` |
+| `captions.emphasis` | `true` | Draw the clip keywords (script.json `keywords`) in the emphasis colour |
+| `captions.emphasis_color` / `captions.emphasis_scale` | orange / `1.2` | Keyword colour (ASS) and size (1-2 x) |
+| `captions.emphasis_max_per_line` | `2` | Keywords emphasised per caption line (1-3) |
+| `captions.emoji` | `true` | HyperFrames engine: the keyword's emoji after it |
+| `hook.enabled` | `true` | Show the clip's hook line (script.json `hook`); see [Hook text](#hook-text-first-seconds) |
+| `hook.duration` | `2.5` | Seconds from the start (1-5) |
+| `hook.top_pct` | `8` | Top edge of the hook, % from the top (2-40; must start above the captions while the hook is on) |
+| `hook.style` | `box` | `box` (filled box) or `plain` (outlined text) |
+| `hook.font_size` / `hook.uppercase` | `112` / `false` | Largest hook size (30-200 px at 1080x1920; a long hook is drawn smaller to fit); upper-case |
+| `hook.text_color` / `hook.box_color` / `hook.outline_color` | white / red / black | ASS `&HAABBGGRR` colours |
+| `hook.animation` | `pop` | HyperFrames engine: `pop`, `slide` or `fade` in (ASS always fades) |
 | `captions.engine` | `ass` | `ass` = libass burn-in; `hyperframes` = animated HyperFrames captions (optional install, see [6](#6-hyperframes-animated-captions-optional)); falls back to `ass` per clip |
 | `hyperframes.node_bin_dir` | `~/tools/node22/bin` | Folder with `node` / `node.exe` (Node 22+); `<dir>/bin/node` is also accepted; `""` = the `node` on PATH. `~` and `%VAR%`/`$VAR` are expanded |
 | `hyperframes.package_dir` | `~/tools/hyperframes` | Folder given to `npm --prefix` when installing `hyperframes` |

@@ -285,10 +285,29 @@ def apply_setting(settings: Settings, assignment: str) -> Settings:
         new = Settings.model_validate(data)
     except ValidationError as e:
         raise CLIError(f"invalid value for {key}: {_validation_text(e)}") from e
+    if key == "captions.preset" and new.captions.preset != "custom":
+        from .caption_presets import apply_preset
+
+        new = apply_preset(new, new.captions.preset)  # G5: a preset fills the caption style fields
     if new.clips.min_seconds > new.clips.max_seconds:
         raise CLIError(f"clips.min_seconds ({new.clips.min_seconds}) must not exceed clips.max_seconds "
                        f"({new.clips.max_seconds})")
+    for path, msgs in new.cross_field_errors().items():
+        raise CLIError(f"invalid value for {path}: {'; '.join(msgs)}")
     return new
+
+
+def cmd_settings_presets(_args: argparse.Namespace) -> int:
+    """G5: list the caption style presets."""
+    from .caption_presets import PRESETS, matches_preset
+
+    s = _load_settings()
+    for pid, p in PRESETS.items():
+        mark = "*" if s.captions.preset == pid else " "
+        note = "" if s.captions.preset != pid or matches_preset(s.captions, pid) else " (changed by hand)"
+        _out(f"{mark} {pid:<12} {p['name']}: {p['description']}{note}")
+    _out("apply with: autoclipper settings set captions.preset=<name> (then change any field by hand)")
+    return 0
 
 
 def cmd_settings_set(args: argparse.Namespace) -> int:
@@ -738,12 +757,14 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("profiles", parents=[common], help="list Voicebox voice profiles").set_defaults(func=cmd_profiles)
 
     se = sub.add_parser("settings", parents=[common], help="show or change settings (data/settings.json)")
-    se_sub = se.add_subparsers(dest="settings_command", metavar="<show|set>")
+    se_sub = se.add_subparsers(dest="settings_command", metavar="<show|set|presets>")
     se_sub.required = True
     se_sub.add_parser("show", parents=[common], help="print all settings").set_defaults(func=cmd_settings_show)
     ss = se_sub.add_parser("set", parents=[common], help="set key.path=value (value parsed as JSON, else string)")
     ss.add_argument("assignments", nargs="+", metavar="key.path=value")
     ss.set_defaults(func=cmd_settings_set)
+    se_sub.add_parser("presets", parents=[common], help="list the caption style presets").set_defaults(
+        func=cmd_settings_presets)
 
     sub.add_parser("doctor", parents=[common], help="check ffmpeg, fonts, Voicebox, API key, node + HyperFrames").set_defaults(func=cmd_doctor)
 

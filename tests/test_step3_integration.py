@@ -13,7 +13,7 @@ from autoclipper import cli, ffmpeg, pipeline
 from autoclipper.config import Settings, load_settings, save_settings, settings_path
 from autoclipper.jobstore import JobStore
 from autoclipper.pipeline import Deps, rerender, run_job
-from autoclipper.stages import hyperframes as hf
+from autoclipper.stages import caption_style, hyperframes as hf
 from autoclipper.stages import render
 from autoclipper.stages.render import (RenderError, render_clip, render_final, render_is_current, render_key,
                                        write_render_stamp)
@@ -260,7 +260,9 @@ def test_render_key_stamp_and_is_current(media: dict) -> None:
     stamp = json.loads((out / "render.json").read_text(encoding="utf-8"))
     assert stamp == {"caption_engine": "hyperframes", "style": "pop", "format": "webm", "fps": None,
                      "engine_used": "hyperframes", "warning": None, "hf_version": "0.9.52", "resolved_fps": 25,
-                     "audio_key": render.audio_key(hfs)}
+                     "audio_key": render.audio_key(hfs),
+                     # G4/G5: the caption look (style fields, hook, keywords) the render used
+                     "style_key": caption_style.style_key(hfs, render.load_clip_script(out))}
     assert render_is_current(out, hfs) and not render_is_current(out, ass)
     hfs.hyperframes.style = "karaoke"
     assert not render_is_current(out, hfs)

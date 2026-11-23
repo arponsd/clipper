@@ -585,3 +585,38 @@ fieldset.is-inactive > .fields, fieldset.is-inactive > p.muted { opacity: 0.55; 
 /* job page: voice-over Mode switch */
 .mode-row { margin-top: .4rem; }
 .mode-row select { width: auto; max-width: 100%; }
+
+/* G5: caption style live preview (Settings > Captions), a CSS mock of one 9:16 frame */
+.cap-preview { display: grid; gap: .4rem; justify-items: start; margin: .5rem 0 .9rem; }
+.cap-preview .row { gap: .4rem; align-items: center; }
+.cap-preview [aria-pressed="true"] { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+.cp-frame {
+  position: relative; width: 216px; aspect-ratio: 9 / 16; border-radius: 8px; overflow: hidden;
+  border: 1px solid var(--border);
+  background: radial-gradient(circle at 30% 70%, #3b7d4f 0, transparent 45%),
+    linear-gradient(180deg, #5b6b82 0%, #2b3445 55%, #1b2230 100%);
+}
+.cp-face {
+  position: absolute; left: 50%; top: 40%; width: 38%; aspect-ratio: 3 / 4; border-radius: 50%;
+  background: #c9a88d; transform: translate(-50%, -50%); opacity: .85;
+}
+.cp-cap {
+  /* max-content: at left 50% the line would otherwise shrink-wrap to half the frame and wrap early */
+  position: absolute; left: 50%; width: max-content; max-width: 90%; transform: translate(-50%, -50%);
+  display: flex; flex-wrap: wrap;
+  justify-content: center; align-items: baseline; gap: 0 .26em; line-height: 1.25; white-space: nowrap;
+}
+.cp-cap .cp-w { paint-order: stroke fill; }
+.cp-cap .cp-emo { font-family: "Noto Color Emoji", sans-serif; }
+.cp-hook {
+  /* top edge at hook.top_pct (grows downwards, like the render); max-width is set from the render's wrap width */
+  position: absolute; left: 50%; width: max-content; max-width: 83%; transform: translateX(-50%); text-align: center;
+  text-wrap: balance; overflow-wrap: anywhere; font-weight: 700; line-height: 1.18; border-radius: .2em;
+  paint-order: stroke fill; box-sizing: content-box;
+}
+/* ASS colour field + swatch */
+.ass-color { display: flex; gap: .4rem; align-items: center; min-width: 0; }
+.ass-color input[type="text"] { flex: 1 1 auto; min-width: 0; }
+.ass-color .ass-swatch { flex: 0 0 2.4rem; width: 2.4rem; height: 2.2rem; padding: 2px; border: 1px solid var(--border);
+  border-radius: 6px; background: transparent; cursor: pointer; }
+.preset-note:empty { display: none; }

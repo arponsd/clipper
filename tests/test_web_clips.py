@@ -24,7 +24,8 @@ def test_get_script(api):
     store = make_job_on_disk()
     r = client.get(url(store, 1, "hi"))
     assert r.status_code == 200
-    assert_keys(r.json(), {"narration": str, "title": str, "description": str, "hashtags": list})
+    assert_keys(r.json(), {"narration": str, "title": str, "description": str, "hashtags": list,
+                           "hook": str, "keywords": list})  # G4/G5 (additive)
     assert r.json()["narration"] == "यह एक परीक्षण है"
 
 
@@ -51,7 +52,7 @@ def test_put_script_saves_normalized_and_metadata(api):
     r = client.put(url(store), json=GOOD)
     assert r.status_code == 200, r.text
     body = r.json()
-    assert_keys(body, {"script": dict, "voice_stale": bool})
+    assert_keys(body, {"script": dict, "voice_stale": bool, "style_stale": bool})  # style_stale: G4/G5 (additive)
     assert body["voice_stale"] is True  # narration changed, voice not regenerated
     assert body["script"]["narration"] == "A brand new narration"
     assert body["script"]["hashtags"] == ["#one", "#two"]

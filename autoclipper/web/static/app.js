@@ -129,6 +129,19 @@
   function parseTags(text) {
     return String(text || '').split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
   }
+  // G5 keywords typed as "word emoji, word, two words 🔥" -> [{word, emoji}]
+  const EMOJI_TAIL_RE = /^(.*?[\p{L}\p{M}\p{N}])\s*(\p{Extended_Pictographic}[\p{Extended_Pictographic}\u200d\ufe0f\u{1F3FB}-\u{1F3FF}]*)$/u;
+  function parseKeywords(text) {
+    return String(text || '').split(/[,\n]+/).map((x) => x.trim()).filter(Boolean).map((part) => {
+      const m = EMOJI_TAIL_RE.exec(part);
+      return m ? { word: m[1].trim(), emoji: m[2] } : { word: part.replace(/\s+/g, ' '), emoji: '' };
+    });
+  }
+  function formatKeywords(list) {
+    return (Array.isArray(list) ? list : []).map((k) => (k.emoji ? `${k.word} ${k.emoji}` : k.word)).join(', ');
+  }
+  const HOOK_MAX_CHARS = 100; // = autoclipper.stages.caption_style.HOOK_MAX_CHARS
+  const HOOK_MAX_WORDS = 12;
 
   // ------------------------------------------------------------------ banner + toasts
   const Banner = {
@@ -917,6 +930,7 @@
   function staleText(cl) {
     if (voiceoverChanged(cl)) return `Voice-over turned ${cl.voiceover ? 'on' : 'off'} - re-render to apply.`;
     if (cl && cl.audio_stale) return 'Made with an older audio mix or other audio settings - re-render to apply (or use "Apply & re-render" on the Mode row).';
+    if (cl && cl.style_stale) return 'Caption style, hook or keywords changed - re-render to apply.';
     return 'Caption engine/style changed - re-render to apply.';
   }
   function audioText(cl) {
@@ -1189,6 +1203,14 @@
     const tagPreview = el('div', { class: 'tag-preview', lang: langAttr(lang), 'aria-hidden': 'true' });
     const tagHelp = el('div', null, el('div', { class: 'hint', text: 'Separate with spaces or commas (up to 8).' }), tagPreview);
     const staleNote = el('p', { class: 'notice notice-warn', hidden: true, text: 'Narration changed - re-render to regenerate the voice.' });
+    // G4 hook line + G5 keywords
+    const hookIn = el('input', { type: 'text', lang: langAttr(lang), maxlength: String(HOOK_MAX_CHARS), spellcheck: hi ? 'false' : 'true' });
+    const hookCount = el('div', { class: 'counter', 'aria-live': 'polite' });
+    const hookHelp = el('div', null, el('div', { class: 'hint', text: 'Shown big at the top for the first seconds of the clip (Settings › Hook text). About 8 words reads best. Empty = no hook.' }), hookCount);
+    const kwIn = el('input', { type: 'text', lang: langAttr(lang), spellcheck: 'false' });
+    const kwPreview = el('div', { class: 'tag-preview', lang: langAttr(lang), 'aria-hidden': 'true' });
+    const kwHelp = el('div', null, el('div', { class: 'hint', text: 'Words to highlight in the captions, separated by commas. An emoji after a word (e.g. "clutch 🔥") is shown after it with the HyperFrames caption engine only.' }), kwPreview);
+    const styleNote = el('p', { class: 'notice notice-info', hidden: true, text: 'Hook or keywords changed - re-render to apply.' });
     const serverNote = el('p', { class: 'notice notice-info', hidden: true });
     const saveBtn = el('button', { type: 'submit', class: 'btn btn-primary', text: 'Save' });
     const revertBtn = el('button', { type: 'button', class: 'btn', text: 'Revert' });
@@ -1204,6 +1226,9 @@
       fieldWrap('title', 'Title', title, titleCount, 'cr-title'),
       fieldWrap('description', 'Description', desc, null, 'cr-desc'),
       fieldWrap('hashtags', 'Hashtags', tags, tagHelp, 'cr-tags'),
+      fieldWrap('hook', 'On-screen hook', hookIn, hookHelp, 'cr-hook'),
+      fieldWrap('keywords', 'Keywords', kwIn, kwHelp, 'cr-kw'),
+      styleNote,
       summary,
       el('div', { class: 'row' }, saveBtn, revertBtn, dirtyLabel));
 
@@ -1217,13 +1242,15 @@
       return typeof m.duration === 'number' ? m.duration : (m.end - m.start);
     }
     function formValue() {
-      return { narration: narration.value, title: title.value, description: desc.value, hashtags: parseTags(tags.value) };
+      return { narration: narration.value, title: title.value, description: desc.value, hashtags: parseTags(tags.value),
+        hook: hookIn.value.replace(/\s+/g, ' ').trim(), keywords: parseKeywords(kwIn.value) };
     }
     function isDirty() {
       if (!saved) return false;
       const f = formValue();
       return f.narration !== saved.narration || f.title !== saved.title || f.description !== (saved.description || '') ||
-        JSON.stringify(f.hashtags) !== JSON.stringify(saved.hashtags || []);
+        JSON.stringify(f.hashtags) !== JSON.stringify(saved.hashtags || []) || f.hook !== (saved.hook || '') ||
+        JSON.stringify(f.keywords) !== JSON.stringify(saved.keywords || []);
     }
     function updateCounters() {
       const w = countWords(narration.value);
@@ -1243,16 +1270,24 @@
       titleCount.classList.toggle('over', tl > TITLE_SOFT_MAX);
       const list = parseTags(tags.value);
       swap(tagPreview, list.slice(0, MAX_HASHTAGS).map((t) => el('span', { text: t })));
+      const hw = countWords(hookIn.value);
+      const hl = [...hookIn.value.trim()].length;
+      hookCount.textContent = hl ? `${hw} words · ${hl}/${HOOK_MAX_CHARS} characters${hw > 8 ? ' - long for a hook' : ''}` : 'No hook: nothing is shown.';
+      hookCount.classList.toggle('over', hw > 8);
+      swap(kwPreview, parseKeywords(kwIn.value).map((k) => el('span', { text: k.emoji ? `${k.word} ${k.emoji}` : k.word })));
       dirtyLabel.textContent = isDirty() ? 'Unsaved changes' : '';
     }
-    for (const i of [narration, title, desc, tags]) i.addEventListener('input', updateCounters);
+    for (const i of [narration, title, desc, tags, hookIn, kwIn]) i.addEventListener('input', updateCounters);
 
     function fillForm(s) {
-      saved = { narration: s.narration || '', title: s.title || '', description: s.description || '', hashtags: Array.isArray(s.hashtags) ? s.hashtags.slice() : [] };
+      saved = { narration: s.narration || '', title: s.title || '', description: s.description || '', hashtags: Array.isArray(s.hashtags) ? s.hashtags.slice() : [],
+        hook: s.hook || '', keywords: Array.isArray(s.keywords) ? s.keywords.map((k) => ({ word: k.word, emoji: k.emoji || '' })) : [] };
       narration.value = saved.narration;
       title.value = saved.title;
       desc.value = saved.description;
       tags.value = saved.hashtags.join(' ');
+      hookIn.value = saved.hook;
+      kwIn.value = formatKeywords(saved.keywords);
       updateCounters();
       updateButtons();
     }
@@ -1267,7 +1302,7 @@
       saveBtn.disabled = busy || busySaving || !saved;
       rerenderBtn.textContent = isDirty() ? 'Save & re-render' : 'Re-render';
     }
-    for (const i of [narration, title, desc, tags]) i.addEventListener('input', updateButtons);
+    for (const i of [narration, title, desc, tags, hookIn, kwIn]) i.addEventListener('input', updateButtons);
 
     function validateClient(f) {
       const e = {};
@@ -1282,6 +1317,10 @@
       if (f.description.length > 5000) e.description = ['At most 5000 characters.'];
       if (f.hashtags.length > MAX_HASHTAGS) e.hashtags = [`At most ${MAX_HASHTAGS} hashtags.`];
       else if (f.hashtags.some((t) => t.length > 100)) e.hashtags = ['Each hashtag can have at most 100 characters.'];
+      if ([...f.hook].length > HOOK_MAX_CHARS) e.hook = [`At most ${HOOK_MAX_CHARS} characters.`];
+      else if (countWords(f.hook) > HOOK_MAX_WORDS) e.hook = [`At most ${HOOK_MAX_WORDS} words (about 8 reads best).`];
+      if (f.keywords.length > 8) e.keywords = ['At most 8 keywords.'];
+      else if (f.keywords.some((k) => [...k.word].length > 40 || k.word.split(' ').length > 3)) e.keywords = ['Each keyword can have at most 3 words and 40 characters.'];
       return e;
     }
 
@@ -1300,6 +1339,7 @@
         const tagsChanged = JSON.stringify(sc.hashtags || []) !== JSON.stringify(f.hashtags);
         fillForm(sc);
         staleNote.hidden = !(r.data && r.data.voice_stale) || !voiceoverOn();
+        styleNote.hidden = !(r.data && r.data.style_stale);
         const notes = [];
         if (titleChanged) notes.push('The title was shortened to fit 70 characters.');
         if (tagsChanged) notes.push('The hashtags were adjusted ("#" added, spaces and duplicates removed).');
@@ -1395,9 +1435,11 @@
         if (a.background_note) rows.push(['Background level', 'The background is ' + a.background_note + '.']);
         if (typeof a.trimmed_to === 'number') rows.push(['Final length', `${fmtSecs(a.trimmed_to)} - trimmed after the short narration (ends at ${fmtSecs(a.voice_end || 0)})`]);
       }
-      if (clip.moment && clip.moment.hook) rows.push(['Hook', clip.moment.hook]);
+      // the moment's hook (why the clip was picked, in English) - not the on-screen hook line below
+      if (clip.moment && clip.moment.hook) rows.push(['Moment', clip.moment.hook]);
       swap(voiceInfo, rows.map(([k, val]) => [el('dt', { text: k }), el('dd', { text: val })]));
       staleNote.hidden = !entry.voice_stale || !vo;
+      styleNote.hidden = !entry.style_stale || isDirty();
       // prev/next clip-lang
       const pairs = [];
       for (const c of job.clips || []) for (const l of Object.keys(c.langs || {})) pairs.push([c.index, l]);
@@ -1428,7 +1470,8 @@
       } else if (entry.script && saved) {
         const s = entry.script;
         const changed = s.narration !== saved.narration || s.title !== saved.title || s.description !== saved.description ||
-          JSON.stringify(s.hashtags || []) !== JSON.stringify(saved.hashtags);
+          JSON.stringify(s.hashtags || []) !== JSON.stringify(saved.hashtags) || (s.hook || '') !== (saved.hook || '') ||
+          JSON.stringify((s.keywords || []).map((k) => ({ word: k.word, emoji: k.emoji || '' }))) !== JSON.stringify(saved.keywords || []);
         if (changed) {
           if (!isDirty()) { fillForm(s); serverNote.hidden = true; } else {
             serverNote.hidden = false;
@@ -1436,6 +1479,8 @@
             saved = deepClone(s);
             saved.description = saved.description || '';
             saved.hashtags = saved.hashtags || [];
+            saved.hook = saved.hook || '';
+            saved.keywords = (saved.keywords || []).map((k) => ({ word: k.word, emoji: k.emoji || '' }));
           }
         }
       } else if (entry.script && !saved) {
@@ -1508,7 +1553,8 @@
     voicebox: ['Voice (Voicebox)', 'Local text-to-speech server and the voice profile per language.'],
     clips: ['Clips', 'How many clips to cut and how long they are.'],
     audio: ['Audio mix', 'Levels of the original audio and the narration. The "loudness" mix measures both and keeps the background a fixed number of dB under the voice, however loud the source is.'],
-    captions: ['Captions', 'Burned-in word-by-word captions.'],
+    captions: ['Captions', 'Burned-in word-by-word captions. Pick a style preset to fill the style fields, then change any of them by hand.'],
+    hook: ['Hook text', 'A short, punchy line (written by Claude with the script, editable per clip) shown big at the top for the first seconds of every clip. A clip with an empty hook shows nothing.'],
     script: ['Narration script', 'Speaking rate used to size the narration to the clip.'],
     web: ['Web uploads', 'Limits for files uploaded through this page.'],
     separation: ['Vocal separation (optional)', 'Demucs removes the speech from the clip so the narration is not talking over someone else. Used only with the voice-over on and Background = "no_vocals"; a clip falls back to the original audio (with a warning) if Demucs is missing or fails. Run Doctor to check the install.'],
@@ -1571,6 +1617,30 @@
     'captions.highlight_color': ['Highlight colour', 'ASS colour of the spoken word.'],
     'captions.position_pct': ['Vertical position', 'Centre of the caption line, % from the top.'],
     'captions.margin_v': ['Bottom margin (px)', 'Only used with the legacy bottom position.'],
+    'captions.preset': ['Style preset', 'Fills the style fields below (size, weight, case, colours, outline, box, highlight, words per line). Fonts, position and engine are kept.'],
+    'captions.bold': ['Bold', null],
+    'captions.uppercase': ['Upper case', 'Latin text only; Devanagari has no case.'],
+    'captions.outline_color': ['Outline colour', 'ASS colour &HAABBGGRR.'],
+    'captions.outline_px': ['Outline (px)', '0 = no outline.'],
+    'captions.shadow_px': ['Shadow (px)', '0 = no shadow.'],
+    'captions.box': ['Box behind the line', 'A filled box (Box colour) behind each caption line instead of the outline.'],
+    'captions.box_color': ['Box colour', 'ASS colour &HAABBGGRR; AA = transparency (00 opaque, 80 half).'],
+    'captions.highlight_style': ['Highlight style', 'color = the spoken word turns the highlight colour; pop = it also grows; karaoke = spoken words stay highlighted; none. Not set = ASS color, HyperFrames its animation style.'],
+    'captions.emphasis': ['Keyword emphasis', 'Draw the clip keywords (picked by Claude, editable per clip) in the emphasis colour, bigger.'],
+    'captions.emphasis_color': ['Emphasis colour', 'ASS colour of the keywords.'],
+    'captions.emphasis_scale': ['Emphasis size', 'Keyword size relative to the other words.'],
+    'captions.emphasis_max_per_line': ['Keywords per line (max)', null],
+    'captions.emoji': ['Emoji after keywords', 'HyperFrames engine only (the ASS engine has no colour emoji).'],
+    'hook.enabled': ['Show the hook', null],
+    'hook.duration': ['Duration (s)', 'Seconds from the start of the clip.'],
+    'hook.top_pct': ['Top edge', 'Where the hook starts, % from the top; it grows downwards. A long hook is drawn smaller so it stays above the captions.'],
+    'hook.style': ['Style', 'box = text on a filled box; plain = outlined text.'],
+    'hook.font_size': ['Font size (px)', 'The largest size: a long hook is drawn smaller to fit.'],
+    'hook.uppercase': ['Upper case', null],
+    'hook.text_color': ['Text colour', 'ASS colour &HAABBGGRR.'],
+    'hook.box_color': ['Box colour', 'Box style only.'],
+    'hook.outline_color': ['Outline colour', 'Plain style only.'],
+    'hook.animation': ['Animation', 'HyperFrames engine: pop, slide or fade in. The ASS engine always fades in and out.'],
     'captions.engine': ['Caption engine', 'ass = burned-in libass captions (always available). hyperframes = animated HyperFrames captions (optional install, see README); falls back to ass per clip.'],
     'hyperframes.node_bin_dir': ['Node folder', 'Folder with node (Node 22+), e.g. ~/tools/node22/bin or %USERPROFILE%\\tools\\node22. Empty = the node on PATH.'],
     'hyperframes.package_dir': ['HyperFrames folder', 'Folder where `npm --prefix` installed hyperframes, e.g. ~/tools/hyperframes.'],
@@ -1603,6 +1673,9 @@
 
     let schema = null;
     let loaded = null;
+    let values = null;         // what the form is built from: loaded, or the form plus a preset just applied
+    let presets = null;        // G5: [{id, name, description, values}] or null
+    let previewLang = 'en';
     let profiles = null;       // array or null
     let profilesError = null;  // ApiError
     let fields = [];
@@ -1656,8 +1729,10 @@
         apiGet('/api/settings/schema'),
         apiGet('/api/settings'),
         apiGet('/api/voicebox/profiles').then((d) => { profilesError = null; return d; }, (e) => { profilesError = e; return null; }),
-      ]).then(([sc, st, pr]) => {
+        apiGet('/api/caption-presets').then((d) => (d && Array.isArray(d.presets) ? d.presets : null), () => null),
+      ]).then(([sc, st, pr, cp]) => {
         if (!ctx.alive) return;
+        presets = cp;
         schema = sc;
         loaded = st;
         settingsCache = st;
@@ -1668,9 +1743,10 @@
       });
     }
 
-    function build() {
+    function build(vals, markDirty) {
       fields = [];
-      dirty = false;
+      values = vals || loaded;
+      dirty = !!markDirty;
       const summary = errorNotice();
       const errs = new FormErrors(summary);
       const root = resolveRef(schema);
@@ -1696,7 +1772,7 @@
 
       const saveBtn = el('button', { type: 'submit', class: 'btn btn-primary', text: 'Save settings' });
       const revertBtn = el('button', { type: 'button', class: 'btn', text: 'Revert', on: { click: () => { if (!dirty || confirm('Discard your changes?')) build(); } } });
-      const state = el('span', { class: 'small muted', 'aria-live': 'polite' });
+      const state = el('span', { class: 'small muted', 'aria-live': 'polite', text: markDirty ? 'Unsaved changes' : '' });
       const form = el('form', { novalidate: true, 'aria-label': 'Settings' }, fsList, summary,
         el('div', { class: 'form-actions' }, saveBtn, revertBtn, state,
           el('span', { class: 'small muted', text: 'Changes apply to the next task.' })));
@@ -1734,7 +1810,163 @@
       swap(content, form);
       syncEngine(form);
       syncVoiceover(form);
+      syncStyle(form);
       form.addEventListener('change', () => { syncEngine(form); syncVoiceover(form); });
+      form.addEventListener('input', () => syncStyle(form));
+      form.addEventListener('change', () => syncStyle(form));
+    }
+
+    // ---- G5: caption presets + live preview (a CSS mock of one 9:16 frame) ----
+    function fieldValue(key, dflt) {
+      const f = fields.find((x) => x.path.join('.') === key);
+      if (!f) return dflt;
+      try { const v = f.get(); return v === undefined ? dflt : v; } catch (e) { return dflt; }
+    }
+    function formValues() {
+      const out = deepClone(values) || {};
+      for (const f of fields) { try { setPath(out, f.path, f.get()); } catch (e) { /* keep the old value */ } }
+      return out;
+    }
+    function applyPreset(id) {
+      const p = (presets || []).find((x) => x.id === id);
+      const cur = formValues();
+      cur.captions = Object.assign({}, cur.captions || {}, p ? p.values : {}, { preset: id });
+      build(cur, true);
+      toast(p ? `Preset "${p.name}" applied - save to keep it.` : 'Preset cleared.', 'ok');
+    }
+    function presetModified(id) {
+      const p = (presets || []).find((x) => x.id === id);
+      if (!p) return false;
+      return Object.entries(p.values).some(([k, v]) => fieldValue('captions.' + k, v) !== v);
+    }
+    function presetField(id, value, describedBy) {
+      const sel = el('select', { id, 'aria-describedby': describedBy });
+      sel.appendChild(el('option', { value: 'custom', text: 'Custom (no preset)' }));
+      for (const p of presets || []) sel.appendChild(el('option', { value: p.id, text: p.name }));
+      sel.value = value || 'custom';
+      if (sel.value !== (value || 'custom')) sel.value = 'custom';
+      const note = el('div', { class: 'hint preset-note', 'aria-live': 'polite' });
+      sel.addEventListener('change', () => applyPreset(sel.value));
+      return { el: el('div', { class: 'stack' }, sel, note), get: () => sel.value };
+    }
+    function assCss(v, fallback) {
+      const m = /^&H([0-9A-Fa-f]{8})$/.exec(String(v || '').trim());
+      if (!m) return fallback;
+      const h = m[1];
+      const a = parseInt(h.slice(0, 2), 16);
+      const b = parseInt(h.slice(2, 4), 16);
+      const g = parseInt(h.slice(4, 6), 16);
+      const r = parseInt(h.slice(6, 8), 16);
+      return `rgba(${r},${g},${b},${(1 - a / 255).toFixed(2)})`;
+    }
+    // An ASS colour text field (&HAABBGGRR) with a colour swatch next to it: picking a colour writes the BGR
+    // digits and keeps the transparency (AA); typing in the text field moves the swatch.
+    function assColorControl(inp, label) {
+      const sw = el('input', { type: 'color', class: 'ass-swatch', 'aria-label': `${label}: pick a colour` });
+      const toHex = () => {
+        const m = /^&H([0-9A-Fa-f]{2})([0-9A-Fa-f]{2})([0-9A-Fa-f]{2})([0-9A-Fa-f]{2})$/.exec(inp.value.trim());
+        if (m) sw.value = ('#' + m[4] + m[3] + m[2]).toLowerCase();
+      };
+      sw.addEventListener('input', () => {
+        const m = /^&H([0-9A-Fa-f]{2})/.exec(inp.value.trim());
+        const aa = m ? m[1].toUpperCase() : '00';
+        const h = sw.value.slice(1).toUpperCase();
+        inp.value = `&H${aa}${h.slice(4, 6)}${h.slice(2, 4)}${h.slice(0, 2)}`;
+        inp.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      inp.addEventListener('input', toHex);
+      toHex();
+      return el('div', { class: 'ass-color' }, inp, sw);
+    }
+    const PREVIEW = {
+      en: { words: ['total', 'madness', 'in', 'the', 'final', 'round', 'right', 'now'], emph: 1, hook: 'Wait for the last second' },
+      hi: { words: ['पूरा', 'पागलपन', 'आखिरी', 'राउंड', 'में', 'देखो', 'अभी', 'यार'], emph: 1, hook: 'आखिरी सेकंड तक देखो' },
+    };
+    function stylePreview() {
+      const frame = el('div', { class: 'cp-frame', 'aria-hidden': 'true' },
+        el('div', { class: 'cp-face' }), el('div', { class: 'cp-hook' }), el('div', { class: 'cp-cap' }));
+      const langBtns = ['en', 'hi'].map((l) => el('button', { type: 'button', class: 'btn btn-small', 'data-lang': l,
+        text: l === 'en' ? 'English' : 'हिन्दी', 'aria-pressed': String(l === previewLang),
+        on: { click: () => { previewLang = l; const f = frame.closest('form'); if (f) syncStyle(f); } } }));
+      return el('div', { class: 'cap-preview' },
+        el('div', { class: 'row' }, el('strong', { class: 'small', text: 'Preview' }), ...langBtns),
+        frame,
+        el('div', { class: 'hint', text: 'Approximate: the spoken word is "total", the keyword "madness" (emoji with HyperFrames only). Re-render clips to apply saved changes.' }));
+    }
+    function syncStyle(form) {
+      const fr = form.querySelector('.cp-frame');
+      const note = form.querySelector('.preset-note');
+      const pid = fieldValue('captions.preset', 'custom');
+      if (note) note.textContent = pid !== 'custom' && presetModified(pid) ? 'Changed by hand after the preset was applied.' : '';
+      if (!fr) return;
+      for (const b of form.querySelectorAll('.cap-preview [data-lang]')) b.setAttribute('aria-pressed', String(b.getAttribute('data-lang') === previewLang));
+      for (const f of form.querySelectorAll('.cp-frame')) paintPreview(f);
+    }
+    // One preview frame (there is one under Captions and one under Hook text, both show the same settings).
+    function paintPreview(fr) {
+      const k = fr.clientWidth > 0 ? fr.clientWidth / 1080 : 0.2;
+      const sample = PREVIEW[previewLang];
+      const hiLang = previewLang === 'hi';
+      const font = hiLang ? `"${fieldValue('captions.font_hi', 'Noto Sans Devanagari')}", "Noto Sans Devanagari", sans-serif`
+        : `"${fieldValue('captions.font_en', 'Noto Sans')}", "Noto Sans", sans-serif`;
+      const size = Number(fieldValue('captions.font_size', 78)) * 0.75 * k;
+      const upper = !!fieldValue('captions.uppercase', false);
+      const wpl = Math.max(1, Number(fieldValue('captions.words_per_line', 3)) || 3);
+      const primary = assCss(fieldValue('captions.primary_color'), '#fff');
+      const hl = assCss(fieldValue('captions.highlight_color'), '#ffe500');
+      const emc = assCss(fieldValue('captions.emphasis_color'), '#ffa500');
+      const outline = assCss(fieldValue('captions.outline_color'), '#000');
+      const box = !!fieldValue('captions.box', false);
+      const engine = fieldValue('captions.engine', 'ass');
+      const hstyle = fieldValue('captions.highlight_style', null) || (engine === 'hyperframes' ? fieldValue('hyperframes.style', 'pop') : 'color');
+      const cap = fr.querySelector('.cp-cap');
+      cap.replaceChildren();
+      const pct = fieldValue('captions.position_pct', 72);
+      if (typeof pct === 'number') { cap.style.top = pct + '%'; cap.style.bottom = ''; } else {
+        cap.style.top = ''; cap.style.bottom = (Number(fieldValue('captions.margin_v', 520)) / 1920 * 100) + '%';
+      }
+      cap.style.fontFamily = font;
+      cap.style.fontWeight = fieldValue('captions.bold', true) ? '700' : '400';
+      cap.style.background = box ? assCss(fieldValue('captions.box_color'), 'rgba(0,0,0,.75)') : 'transparent';
+      cap.style.padding = box ? `${0.12 * size}px ${0.3 * size}px` : '0';
+      const sh = Number(fieldValue('captions.shadow_px', 2)) || 0;
+      sample.words.slice(0, wpl).forEach((w, i) => {
+        const span = el('span', { class: 'cp-w', text: upper ? w.toUpperCase() : w, lang: hiLang ? 'hi' : null });
+        const emph = !!fieldValue('captions.emphasis', true) && i === sample.emph;
+        const active = i === 0;
+        let color = primary;
+        let scale = 1;
+        // like the render: a keyword rests in the emphasis colour; the spoken word takes the highlight colour
+        // (a keyword too); the ASS engine never scales words on a box
+        if (emph) { color = emc; scale = Number(fieldValue('captions.emphasis_scale', 1.2)) || 1; }
+        if (hstyle !== 'none' && active) color = hl;
+        if (active && hstyle === 'pop') scale *= 1.15;
+        if (box && engine === 'ass') scale = 1;
+        span.style.color = color;
+        span.style.fontSize = (size * scale).toFixed(1) + 'px';
+        span.style.webkitTextStroke = box ? '0' : `${(Number(fieldValue('captions.outline_px', 5)) * 2 * k).toFixed(2)}px ${outline}`;
+        span.style.textShadow = sh && !box ? `0 ${2 * sh * k}px ${7 * sh * k}px rgba(0,0,0,.55)` : 'none';
+        cap.appendChild(span);
+        if (emph && engine === 'hyperframes' && fieldValue('captions.emoji', true)) cap.appendChild(el('span', { class: 'cp-emo', text: '🔥' }));
+      });
+      const hook = fr.querySelector('.cp-hook');
+      const on = !!fieldValue('hook.enabled', true);
+      hook.hidden = !on;
+      if (!on) return;
+      const hass = Number(fieldValue('hook.font_size', 112)) || 112;
+      const hsize = hass * 0.75 * k;
+      const hbox = fieldValue('hook.style', 'box') === 'box';
+      hook.textContent = fieldValue('hook.uppercase', false) ? sample.hook.toUpperCase() : sample.hook;
+      hook.lang = hiLang ? 'hi' : '';
+      hook.style.top = Number(fieldValue('hook.top_pct', 8)) + '%';  // top edge; grows downwards like the render
+      hook.style.maxWidth = (900 * k).toFixed(1) + 'px';  // the render's wrap width (5/6 of the frame)
+      hook.style.fontFamily = font;
+      hook.style.fontWeight = fieldValue('captions.bold', true) ? '700' : '400';
+      hook.style.fontSize = hsize.toFixed(1) + 'px';
+      hook.style.color = assCss(fieldValue('hook.text_color'), '#fff');
+      hook.style.background = hbox ? assCss(fieldValue('hook.box_color'), '#e81a2a') : 'transparent';
+      hook.style.padding = hbox ? `${(Math.max(10, 0.18 * hass) * k).toFixed(1)}px ${0.42 * hsize}px` : '0';
+      hook.style.webkitTextStroke = hbox ? '0' : `${(hsize / 7).toFixed(2)}px ${assCss(fieldValue('hook.outline_color'), '#000')}`;
     }
 
     // Voicebox and narration-script fields stay editable but are greyed while the voice-over is off.
@@ -1797,6 +2029,7 @@
       const lbl = depth === 0 ? (SECTION_LABELS[key] || [node.title || humanize(path[path.length - 1]), null])
         : (FIELD_LABELS[key] || [node.title || humanize(path[path.length - 1]), null]);
       const fs = el('fieldset', { 'data-path': key }, el('legend', { text: lbl[0] }), lbl[1] ? el('p', { class: 'small muted', text: lbl[1] }) : null);
+      if (key === 'captions' || key === 'hook') fs.appendChild(stylePreview());
       const errEl = el('div', { class: 'field-error' });
       errs.register(key, fs, errEl);
       if (key === 'voicebox' && profilesError) {
@@ -1823,7 +2056,7 @@
       const id = 'set-' + key.replace(/[^A-Za-z0-9_-]/g, '-');
       const { node, nullable } = unwrapNullable(raw);
       const def = FIELD_LABELS[key] || [node.title || raw.title || humanize(path[path.length - 1]), node.description || null];
-      let value = getPath(loaded, path);
+      let value = getPath(values, path);
       if (value === undefined) value = 'default' in raw ? raw.default : node.default;
       const err = el('div', { class: 'field-error', id: id + '-err' });
       const hintText = [def[1], rangeText(node)].filter(Boolean).join(' ');
@@ -1840,6 +2073,9 @@
         const r = positionField(id, node, nullable, value, describedBy);
         control = r.el; get = r.get;
         wrap.classList.add('field-wide');
+      } else if (key === 'captions.preset' && presets) {
+        const r = presetField(id, value, describedBy);
+        control = r.el; get = r.get;
       } else if (PROFILE_FIELDS[key] && profiles && !profilesError) {
         const lang = PROFILE_FIELDS[key];
         const sel = el('select', { id, 'aria-describedby': describedBy });
@@ -1932,6 +2168,7 @@
           append(wrap, el('datalist', { id: listId }, DATALISTS[key].map((v) => el('option', { value: v }))));
         }
         control = inp;
+        if (/^(captions|hook)\.[a-z_]*color$/.test(key)) control = assColorControl(inp, def[0]);
         get = () => {
           const s = inp.value.trim();
           if (nullable && s === '') return null;

@@ -64,6 +64,21 @@ MOMENTS_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+# G4 hook line + G5 keywords, part of both the script and the metadata answers.
+_HOOK_PROP: dict[str, Any] = {"type": "string", "description": "on-screen hook line, at most 8 words"}
+_KEYWORDS_PROP: dict[str, Any] = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "word": {"type": "string", "description": "a key word exactly as it appears in the captions"},
+            "emoji": {"type": "string", "description": "one fitting emoji, or an empty string"},
+        },
+        "required": ["word", "emoji"],
+        "additionalProperties": False,
+    },
+}
+
 SCRIPT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -71,8 +86,10 @@ SCRIPT_SCHEMA: dict[str, Any] = {
         "title": {"type": "string"},
         "description": {"type": "string"},
         "hashtags": {"type": "array", "items": {"type": "string"}},
+        "hook": _HOOK_PROP,
+        "keywords": _KEYWORDS_PROP,
     },
-    "required": ["narration", "title", "description", "hashtags"],
+    "required": ["narration", "title", "description", "hashtags", "hook", "keywords"],
     "additionalProperties": False,
 }
 
@@ -83,8 +100,10 @@ METADATA_SCHEMA: dict[str, Any] = {
         "title": {"type": "string"},
         "description": {"type": "string"},
         "hashtags": {"type": "array", "items": {"type": "string"}},
+        "hook": _HOOK_PROP,
+        "keywords": _KEYWORDS_PROP,
     },
-    "required": ["title", "description", "hashtags"],
+    "required": ["title", "description", "hashtags", "hook", "keywords"],
     "additionalProperties": False,
 }
 
@@ -161,6 +180,20 @@ TRANSLATE_SYSTEM = (
     "Keep the meaning and the speaker's tone; use natural, short, spoken phrasing that reads well as a "
     "caption. Return plain text only: no notes, no quotes, no speaker labels."
 )
+
+
+def hook_keywords_instruction(lang: str, source: str) -> str:
+    """G4/G5 part of the script and metadata prompts. ``source`` names where the keywords come from."""
+    name = LANGUAGE_NAMES.get(lang, lang)
+    script = " in Devanagari script" if lang == "hi" else ""
+    return (
+        f"Also write a hook: one short, punchy line of at most 8 words in {name}{script}, shown big on screen "
+        "over the first 2-3 seconds of the clip. Derive it from the moment's hook, make the viewer want to keep "
+        "watching, and do not repeat the title word for word. No quotes, no hashtags, no emojis.\n"
+        f"Also pick 2 to 5 keywords: the most important single words of {source}, each copied exactly as it is "
+        "written there (same spelling and script), to be highlighted in the captions. Spread them over the "
+        "clip. For each keyword give one fitting emoji, or an empty string when no emoji fits."
+    )
 
 
 def language_rules(lang: str, what: str = "everything (narration, title, description)") -> str:
@@ -305,7 +338,8 @@ class AnthropicLLM:
             f"{language_rules(lang)}\n\n"
             f"{_length_instruction(lang, duration, target_words, target_seconds)}\n"
             "Also write: a title of at most 70 characters that makes people click, a 1-3 sentence "
-            "description, and 3 to 8 relevant hashtags (each starting with #, no spaces).\n\n"
+            "description, and 3 to 8 relevant hashtags (each starting with #, no spaces).\n"
+            f"{hook_keywords_instruction(lang, 'your narration')}\n\n"
             f"Why this moment was picked: {moment.reason or '-'}\n"
             f"Hook: {moment.hook or '-'}\n\n"
             "What is said in the clip (for context only; do not translate or repeat it):\n"
@@ -323,7 +357,8 @@ class AnthropicLLM:
         user = (
             f"{language_rules(lang, 'everything (title, description, hashtags)')}\n\n"
             f"Clip length: {duration:.1f} seconds. Write a title of at most 70 characters, a 1-3 sentence "
-            "description, and 3 to 8 relevant hashtags (each starting with #, no spaces).\n\n"
+            "description, and 3 to 8 relevant hashtags (each starting with #, no spaces).\n"
+            f"{hook_keywords_instruction(lang, _caption_source(lang))}\n\n"
             f"Why this moment was picked: {moment.reason or '-'}\n"
             f"Hook: {moment.hook or '-'}\n\n"
             "What is said in the clip (it may be in another language):\n"
@@ -394,6 +429,12 @@ class AnthropicLLM:
         if not text:
             raise LLMError("Claude returned an empty lengthened narration")
         return text
+
+
+def _caption_source(lang: str) -> str:
+    name = LANGUAGE_NAMES.get(lang, lang)
+    return (f"what is said in the clip (the captions show it in {name}; if the clip is in another language, "
+            f"give the {name} words a caption translation would use)")
 
 
 def word_range(target_words: int) -> tuple[int, int]:
