@@ -249,11 +249,11 @@ def clip_layout(tmp_path: Path, media) -> tuple[Path, Path]:
 def test_demucs_command_and_env(tmp_path):
     s = SeparationSettings(model="htdemucs_ft", segment=5, threads=3, models_dir="~/m")
     cmd = separation.demucs_command(Path("/py"), Path("/in.wav"), Path("/out"), s)
-    assert cmd[:3] == ["/py", "-m", "demucs.separate"]
+    assert cmd[:3] == [str(Path("/py")), "-m", "demucs.separate"]  # "\\py" on Windows
     assert cmd[cmd.index("-n") + 1] == "htdemucs_ft" and cmd[cmd.index("--segment") + 1] == "5"
     assert cmd[cmd.index("--two-stems") + 1] == "vocals" and cmd[cmd.index("-d") + 1] == "cpu"
     env = separation._env(s)
-    assert env["OMP_NUM_THREADS"] == "3" and env["TORCH_HOME"].endswith("/m") and "~" not in env["TORCH_HOME"]
+    assert env["OMP_NUM_THREADS"] == "3" and Path(env["TORCH_HOME"]).name == "m" and "~" not in env["TORCH_HOME"]
     assert separation._env(SeparationSettings(threads=0)).get("OMP_NUM_THREADS") == os.environ.get("OMP_NUM_THREADS")
 
 
