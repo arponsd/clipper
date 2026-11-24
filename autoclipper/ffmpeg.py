@@ -428,8 +428,10 @@ _AAC = ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]
 _SILENCE = "anullsrc=channel_layout=stereo:sample_rate=48000"
 # Mono -> stereo at unity gain on both channels (ffmpeg's implicit upmix puts mono at -3 dB per side).
 _MONO_TO_STEREO = "aformat=channel_layouts=mono,pan=stereo|c0=c0|c1=c0"
-# Final safety limiter: peaks stay below 0 dBFS. level=0 turns off auto-level (no make-up gain).
-_LIMITER = "alimiter=limit=0.97:level=0"
+# Final safety limiter. level=0 turns off auto-level (no make-up gain). alimiter is a sample-peak
+# limiter and AAC encoding adds overshoot, so the ceiling is -1 dBFS (0.891): at the old 0.97
+# (-0.26 dBFS) the decoded AAC still reached 0 dBFS with some FFmpeg builds (9.x on Windows).
+_LIMITER = "alimiter=limit=0.891:level=0"
 
 
 def cut_vertical(

@@ -271,6 +271,7 @@ def vertical(video, tmp_path) -> Path:
     return ffmpeg.cut_vertical(video, tmp_path / "cut.mp4", 0, 2, width=270, height=480)
 
 
+@pytest.mark.system_font
 def test_mix_burn_real_path_with_space_and_quote(vertical, tmp_path):
     d = tmp_path / "my clip's dir"
     d.mkdir()
@@ -346,7 +347,7 @@ def test_mix_burn_graph_and_fontsdir_only_with_fonts(monkeypatch, vertical, tmp_
     # HINDI_CAPTIONS-3: explicit unity-gain upmix of the mono voice, limiter after the mix
     assert "[0:a]aformat=channel_layouts=stereo,volume=0.15[a0]" in graph
     assert "[1:a]aformat=channel_layouts=mono,pan=stereo|c0=c0|c1=c0,volume=1.0[a1]" in graph
-    assert "[a0][a1]amix=inputs=2:normalize=0:duration=first,alimiter=limit=0.97:level=0[a]" in graph
+    assert "[a0][a1]amix=inputs=2:normalize=0:duration=first,alimiter=limit=0.891:level=0[a]" in graph
     assert "apad" not in graph
 
     fonts = tmp_path / "fonts"
@@ -358,7 +359,7 @@ def test_mix_burn_graph_and_fontsdir_only_with_fonts(monkeypatch, vertical, tmp_
 def test_mix_burn_graph_without_voice(monkeypatch, vertical, tmp_path):
     graph = _captured_graph(monkeypatch, vertical, tmp_path, None, voice=False)
     assert "amix" not in graph
-    assert "[0:a]aformat=channel_layouts=stereo,volume=0.15,alimiter=limit=0.97:level=0[a]" in graph
+    assert "[0:a]aformat=channel_layouts=stereo,volume=0.15,alimiter=limit=0.891:level=0[a]" in graph
 
 
 def test_synth_video(tmp_path):
@@ -419,7 +420,9 @@ def test_mix_burn_voice_volume_1_is_unity(vertical, tmp_path):
 def test_mix_burn_without_voice_is_limited(loud_vertical, tmp_path):
     out = ffmpeg.mix_burn(loud_vertical, tmp_path / "o.mp4", voice=None, ass=None, original_volume=2.0,
                           voice_volume=1.0, fonts_dir=None)
-    assert _peak_db(out) < 0.0
+    # The limiter keeps headroom for AAC overshoot: the decoded file stays clearly below 0 dBFS
+    # (volumedetect prints "-0.0" for a peak just under full scale, which this would also catch).
+    assert _peak_db(out) <= -0.3
 
 
 # --------------------------------------------------------------------------- WINDOWS-3 locked output

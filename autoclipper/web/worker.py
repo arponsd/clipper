@@ -23,7 +23,7 @@ from typing import Any, Callable, Iterator, Literal
 from .. import pipeline
 from ..config import Settings, data_dir, load_settings
 from ..joblock import JobLocked, has_lock_file, hold_job_lock, live_lock
-from ..jobstore import JobStore, jobs_root
+from ..jobstore import JobStore, jobs_root, read_job_text
 from ..models import Job
 from ..pipeline import Deps
 from ..publish import runner as publish_runner
@@ -121,7 +121,7 @@ def read_job(job_id: str) -> Job | None:
     p = jobs_root() / job_id / "job.json"
     for attempt in range(3):
         try:
-            return Job.model_validate_json(p.read_text(encoding="utf-8"))
+            return Job.model_validate_json(read_job_text(p))
         except FileNotFoundError:
             return None
         except (OSError, ValueError):
@@ -238,7 +238,7 @@ class Worker:
         for job_id in JobStore.list_ids():
             path = jobs_root() / job_id / "job.json"
             try:
-                job = Job.model_validate_json(path.read_text(encoding="utf-8"))
+                job = Job.model_validate_json(read_job_text(path))
             except (OSError, ValueError):
                 continue
             if job.status not in ("running", "queued"):

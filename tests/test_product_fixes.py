@@ -183,10 +183,10 @@ def test_audio_graph_strings():
     assert "volume='if(lt(t,8.0),0.15," in g and ":eval=frame[a0]" in g
     assert "[1:a]aformat=channel_layouts=mono,pan=stereo|c0=c0|c1=c0,volume=1.2[a1]" in g
     assert g.endswith("amix=inputs=2:normalize=0:duration=first,loudnorm=I=-14.0:TP=-1.5:LRA=11,"
-                      "aresample=48000,alimiter=limit=0.97:level=0[a]")
+                      "aresample=48000,alimiter=limit=0.891:level=0[a]")
     g2 = build_audio_graph(orig="[0:a]", orig_stereo="x", voice_label="[1:a]",
                            audio=a.model_copy(update={"loudnorm": False}), voice_end=8.0)
-    assert "loudnorm" not in g2 and g2.endswith("duration=first,alimiter=limit=0.97:level=0[a]")
+    assert "loudnorm" not in g2 and g2.endswith("duration=first,alimiter=limit=0.891:level=0[a]")
     g3 = build_audio_graph(orig="[0:a]", orig_stereo="x", voice_label=None,
                            audio=a.model_copy(update={"original_volume_after": 0.7}))
     assert g3.startswith("[0:a]x,volume=0.7,loudnorm=") and "amix" not in g3
@@ -648,6 +648,7 @@ def test_caption_position_none_is_legacy_margin_v():
     assert "\\pos(" not in ass and "\\an5" not in ass
 
 
+@pytest.mark.system_font
 def test_caption_burn_lands_near_position(tmp_path: Path):
     """Real libass burn: the bright text rows are centred near 72 % of the height."""
     w, h = 360, 640

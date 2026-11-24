@@ -183,12 +183,12 @@ def cmd_jobs(_args: argparse.Namespace) -> int:
     if not ids:
         _out("no jobs yet - start one with `autoclipper run <file-or-url>`")
         return 0
-    from .jobstore import jobs_root
+    from .jobstore import jobs_root, read_job_text
 
     for job_id in ids:
         path = jobs_root() / job_id / "job.json"
         try:
-            job = Job.model_validate_json(path.read_text(encoding="utf-8"))
+            job = Job.model_validate_json(read_job_text(path))
         except (OSError, ValueError) as e:
             _out(f"{job_id}  (unreadable job.json: {e.__class__.__name__})")
             continue

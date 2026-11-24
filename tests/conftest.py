@@ -7,15 +7,37 @@ Autouse fixtures for every test:
   project's real key into os.environ at import), HOME/XDG_CONFIG_HOME point at tmp_path (no real `ant`
   profile), the pipeline's real-client factories raise, and sockets may only connect to loopback.
   A test that really needs a factory must patch it with an explicit fake, or carry the `real_clients` marker.
+
+Tests marked `system_font` burn text with libass, which draws nothing without a system font (assets/fonts is
+not in git); they are skipped when fontconfig lists no font, e.g. on a bare CI runner (CI installs fonts-noto-core).
 """
 from __future__ import annotations
 
+import functools
 import ipaddress
 import os
+import shutil
 import socket
+import subprocess
 from pathlib import Path
 
 import pytest
+
+
+@functools.lru_cache(maxsize=1)
+def _system_font_available() -> bool:
+    if shutil.which("fc-list") is None:
+        return os.name == "nt"  # Windows always has fonts; libass finds them without fontconfig's fc-list
+    try:
+        out = subprocess.run(["fc-list", ":", "family"], capture_output=True, text=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return bool(out.strip())
+
+
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    if item.get_closest_marker("system_font") is not None and not _system_font_available():
+        pytest.skip("needs a system font for libass (fontconfig lists none; install e.g. fonts-noto-core)")
 
 
 @pytest.fixture(autouse=True)
