@@ -55,6 +55,20 @@ class VoiceboxSettings(BaseModel):
     # it gets its own, shorter limit so a slow Voicebox does not hold a clip for timeout_seconds again.
     # The original take is kept when it runs out. Capped at timeout_seconds.
     lengthen_timeout_seconds: float = Field(240.0, ge=10, le=7200)
+    # M2: generate the narration sentence by sentence (one Voicebox call per chunk, joined with short gaps).
+    # Chatterbox stops early on long input (a 115-word Hindi text came back as 10 s); short chunks do not.
+    chunking: bool = True
+    # Longer sentences are split at commas, then words. Chatterbox skipped a clause in a 155-character chunk.
+    chunk_max_chars: int = Field(150, ge=40, le=2000)
+    chunk_min_chars: int = Field(60, ge=0, le=500)  # shorter pieces are merged with a neighbour (Chatterbox
+    # babbles on very short input: a 6-word Hindi sentence came back as 12.7 s)
+    chunk_gap_seconds: float = Field(0.2, ge=0.0, le=1.5)  # silence between chunks
+    # Voicebox wait per chunk, and for the one retry of a chunk that came back cut short (both capped at
+    # timeout_seconds). A chunk that still fails stops the voice stage with an error (resume retries it).
+    chunk_timeout_seconds: float = Field(240.0, ge=10, le=3600)
+    chunk_retry_timeout_seconds: float = Field(120.0, ge=10, le=3600)
+    # Same seed for every chunk so the voice stays consistent; None = derived from the profile + language.
+    seed: int | None = Field(None, ge=0, le=2**31 - 1)
     english: VoiceProfile = Field(default_factory=VoiceProfile)
     # Hindi must use Chatterbox Multilingual.
     hindi: VoiceProfile = Field(default_factory=lambda: VoiceProfile(engine="chatterbox"))
@@ -108,8 +122,10 @@ class AudioSettings(BaseModel):
 
 class ScriptSettings(BaseModel):
     # Words per second of the TTS voice, measured on chatterbox in the sample job (EN ~3.0, HI ~3.36).
+    # M2: re-measured on complete sentence-by-sentence Hindi takes (speech only, gaps excluded; every chunk
+    # checked by ASR): 3.40 and 3.28 on the gaming clip, 3.07 on the Reagan clip -> HI 3.25.
     wps_en: float = Field(3.0, ge=1.0, le=6.0)
-    wps_hi: float = Field(3.35, ge=1.0, le=6.0)
+    wps_hi: float = Field(3.25, ge=1.0, le=6.0)
     # Narration target = clip length x fill_ratio (the LLM overshoots the word count by ~5 %).
     fill_ratio: float = Field(0.88, ge=0.5, le=1.0)
     # A voice shorter than this fraction of the clip gets one "lengthen" retry (new jobs only).
@@ -311,6 +327,10 @@ class Settings(BaseModel):
         older settings file never stops loading. Only a hook that is turned on is checked, and only for
         starting above the captions: a hook too big for the space left is drawn smaller at render time."""
         errors: dict[str, list[str]] = {}
+        vb = self.voicebox
+        if vb.chunk_min_chars >= vb.chunk_max_chars:
+            errors["voicebox.chunk_min_chars"] = [
+                f"must be smaller than voicebox.chunk_max_chars ({vb.chunk_max_chars})"]
         if self.hook.enabled:
             from .stages.caption_style import caption_top_px
 

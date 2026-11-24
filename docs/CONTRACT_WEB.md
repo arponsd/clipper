@@ -403,7 +403,7 @@ class AudioSettings(BaseModel):              # existing fields unchanged
 
 class ScriptSettings(BaseModel):             # NEW section Settings.script
     wps_en: float = Field(3.0, ge=1.0, le=6.0)   # measured: chatterbox EN ~3.0 words/s in the sample job
-    wps_hi: float = Field(3.35, ge=1.0, le=6.0)  # measured: chatterbox HI ~3.36 words/s in the sample job
+    wps_hi: float = Field(3.25, ge=1.0, le=6.0)  # M2: re-measured on complete sentence-by-sentence takes (was 3.35)
     fill_ratio: float = Field(0.88, ge=0.5, le=1.0)   # narration target = clip * fill_ratio (the LLM overshoots ~5 %)
     lengthen_below: float = Field(0.75, ge=0.3, le=0.95)  # voice < this x clip -> one lengthen retry
     def wps(self, lang: str) -> float

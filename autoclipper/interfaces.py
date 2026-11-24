@@ -70,7 +70,8 @@ class VoiceboxAPI(Protocol):
     def synthesize(self, text: str, *, profile_id: str, language: str, engine: str,
                    dst: Path, on_progress: ProgressFn | None = None) -> Path:
         """generate -> poll history until completed -> download audio bytes to dst. Returns dst.
-        A client may also accept ``timeout=`` (seconds) for one call; make_voice passes it only then."""
+        A client may also accept ``timeout=`` (seconds) and ``seed=`` (int) for one call; make_voice passes
+        each only when the client takes it."""
         ...
 
 

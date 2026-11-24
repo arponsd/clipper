@@ -4,6 +4,7 @@ from __future__ import annotations
 import difflib
 import json
 import logging
+import math
 import re
 import unicodedata
 from pathlib import Path
@@ -75,19 +76,83 @@ def _norm(token: str) -> str:
     return "".join(ch for ch in token if unicodedata.category(ch)[0] in "LMN")
 
 
+def distribute_segments(words: list[str], segments: list[tuple[float, float, int]] | None,
+                        duration: float) -> list[Word]:
+    """Spread ``words`` over known spans: ``segments`` = (start, end, word count) per generated voice chunk
+    (M2), in order. Falls back to one span over ``duration`` when the counts do not add up."""
+    if not segments or sum(n for _s, _e, n in segments) != len(words):
+        return distribute_words(words, duration)
+    out: list[Word] = []
+    k = 0
+    for start, end, n in segments:
+        out.extend(distribute_words(words[k:k + n], max(0.0, end - start), start=start))
+        k += n
+    return out
+
+
+def match_ratio(script_words: list[str], recognized: list[Word]) -> float:
+    """Share of the script words align_words can time from ``recognized`` (same matching rule)."""
+    if not script_words or not recognized:
+        return 0.0
+    a = [_norm(w) for w in script_words]
+    b = [_norm(w.text) for w in recognized]
+    matcher = difflib.SequenceMatcher(a=a, b=b, autojunk=False)
+    hits = sum(1 for blk in matcher.get_matching_blocks() for k in range(blk.size) if a[blk.a + k])
+    return hits / len(script_words)
+
+
+def clamp_to_segments(words: list[Word], segments: list[tuple[float, float, int]] | None) -> list[Word]:
+    """Keep each sentence's words out of the neighbouring sentences (M2): a word never starts before its own
+    voice chunk, and never runs into the next chunk (an unmatched word at a chunk edge is otherwise
+    interpolated into the other sentence). No-op when the counts differ."""
+    if not segments or sum(n for _s, _e, n in segments) != len(words):
+        return words
+    out: list[Word] = []
+    k = 0
+    for i, (start, _end, n) in enumerate(segments):
+        limit = segments[i + 1][0] if i + 1 < len(segments) else math.inf
+        for w in words[k:k + n]:
+            s = min(max(w.start, start), limit)
+            e = min(max(w.end, s), limit)
+            out.append(w if (s, e) == (w.start, w.end) else Word(start=round(s, 3), end=round(e, 3), text=w.text))
+        k += n
+    return out
+
+
+def transcribe_chunks(voice_wav: Path, lang: str, transcriber: Transcriber,
+                      segments: list[tuple[float, float, int]], tmp_dir: Path) -> list[Word]:
+    """Recognise each generated voice chunk (M2) on its own and shift its words onto the joined voice.
+    Whisper on a whole Hindi voice sometimes drops long stretches; one short sentence at a time it does not."""
+    out: list[Word] = []
+    for i, (start, end, _n) in enumerate(segments):
+        if end - start < 0.2:
+            continue
+        piece = Path(tmp_dir) / f".captions_chunk{i}.wav"
+        try:
+            ffmpeg.run(["-i", str(voice_wav), "-ss", f"{start:.3f}", "-t", f"{end - start:.3f}", "-c:a", "pcm_s16le",
+                        str(piece)], desc=f"cut voice chunk {i + 1}")
+            for w in transcribe_voice(piece, lang, transcriber):
+                ws = min(max(start, start + w.start), end)
+                out.append(Word(start=round(ws, 3), end=round(min(max(ws, start + w.end), end), 3), text=w.text))
+        finally:
+            piece.unlink(missing_ok=True)
+    return out
+
+
 def align_words(script_words: list[str], recognized: list[Word], duration: float, *,
-                trimmed: bool = False) -> list[Word]:
+                trimmed: bool = False, segments: list[tuple[float, float, int]] | None = None) -> list[Word]:
     """Map the exact script words onto recognized timings, monotonically.
 
     Matched words take the recognized timing; runs of unmatched words are spread by character
-    length between their matched neighbours. Fewer than 30% matches -> plain distribution.
+    length between their matched neighbours. Fewer than 30% matches -> plain distribution (over the
+    voice chunks' spans when ``segments`` is given, see distribute_segments).
     With ``trimmed`` (the voice was cut before the end of the text), script words after the last
     matched word are dropped: they were never spoken.
     """
     if not script_words:
         return []
     if not recognized:
-        return distribute_words(script_words, duration)
+        return distribute_segments(script_words, segments, duration)
 
     a = [_norm(w) for w in script_words]
     b = [_norm(w.text) for w in recognized]
@@ -99,7 +164,7 @@ def align_words(script_words: list[str], recognized: list[Word], duration: float
             if a[i]:  # pure punctuation tokens carry no timing evidence
                 timing[i] = recognized[j]
     if len(timing) < MIN_MATCH_RATIO * len(script_words):
-        return distribute_words(script_words, duration)
+        return distribute_segments(script_words, segments, duration)
     if trimmed:
         script_words = script_words[:max(timing) + 1]
 
@@ -369,7 +434,23 @@ def make_captions(*, narration: str, voice_wav: Path, lang: str, transcriber: Tr
             log.warning("voice transcription failed for %s (%s); spreading caption words evenly",
                         voice_wav.name, e)
             recognized = []
-    words = align_words(script_words, recognized, dur, trimmed=trimmed)
+    segments = None
+    if vr is not None and vr.chunks and not trimmed and vr.narration_hash == narration_hash(narration):
+        # M2: the voice was generated sentence by sentence; without usable recognition, each sentence's
+        # words are spread over its own chunk (sped up by the tempo) instead of over the whole voice
+        tempo = max(vr.tempo, 1e-6)
+        segments = [(c.start / tempo, (c.start + c.duration) / tempo, len(split_words(c.text))) for c in vr.chunks]
+    if segments and len(segments) > 1 and match_ratio(script_words, recognized) < 0.6:
+        # the whole-voice recognition missed a lot (Hindi): recognise the sentences one by one instead
+        try:
+            per_chunk = transcribe_chunks(voice_wav, lang, transcriber, segments, out_dir)
+        except Exception as e:  # noqa: BLE001 - keep what the whole-voice pass gave
+            log.warning("per-sentence transcription of %s failed (%s)", voice_wav.name, e)
+            per_chunk = []
+        if match_ratio(script_words, per_chunk) > match_ratio(script_words, recognized):
+            recognized = per_chunk
+    words = align_words(script_words, recognized, dur, trimmed=trimmed, segments=segments)
+    words = clamp_to_segments(words, segments)
     write_text_atomic(out_dir / "words.json",
                       json.dumps([w.model_dump() for w in words], indent=2, ensure_ascii=False))
     ass = out_dir / "captions.ass"

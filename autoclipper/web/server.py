@@ -424,7 +424,9 @@ class App:
                              "trimmed": bool(voice.get("trimmed", False)),
                              "lengthened": bool(voice.get("lengthened", False)),
                              "truncated": bool(voice.get("truncated", False)),
-                             "warnings": [str(w) for w in voice.get("warnings") or [] if isinstance(w, str)]}
+                             "warnings": [str(w) for w in voice.get("warnings") or [] if isinstance(w, str)],
+                             # M2: number of Voicebox calls (sentences) the take was generated in; 0 = one call
+                             "chunks": len(voice["chunks"]) if isinstance(voice.get("chunks"), list) else 0}
                 else:
                     voice = None
                 base = f"/api/jobs/{job.id}/clips/{c.index}/{lang}"

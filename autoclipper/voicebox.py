@@ -1,7 +1,7 @@
 """REST client for a local Voicebox TTS server (plain ``httpx``, not the SDK's ``httpx2``).
 
 API used:
-    POST /generate        {text, profile_id, language, engine} -> {"id"|"generation_id": ...}
+    POST /generate        {text, profile_id, language, engine[, seed]} -> {"id"|"generation_id": ...}
     GET  /history/{id}    -> {"status": "pending|generating|completed|failed|error", ...}
     GET  /audio/{id}      -> audio bytes
     GET  /profiles        -> [ {...}, ... ] or {"profiles": [...]}
@@ -112,10 +112,13 @@ class VoiceboxClient:
             raise VoiceboxError(f"unexpected /profiles response: {str(data)[:200]}")
         return [p for p in data if isinstance(p, dict)]
 
-    def generate(self, text: str, *, profile_id: str, language: str, engine: str) -> str:
+    def generate(self, text: str, *, profile_id: str, language: str, engine: str,
+                 seed: int | None = None) -> str:
         if not text.strip():
             raise VoiceboxError("cannot generate voice for empty text")
-        payload = {"text": text, "profile_id": profile_id, "language": language, "engine": engine}
+        payload: dict[str, Any] = {"text": text, "profile_id": profile_id, "language": language, "engine": engine}
+        if seed is not None:
+            payload["seed"] = int(seed)  # same seed for every chunk of a narration: a consistent voice
         data = self._json("POST", "/generate", json=payload)
         gen_id: Any = None
         if isinstance(data, dict):
@@ -184,15 +187,17 @@ class VoiceboxClient:
         return dst
 
     def synthesize(self, text: str, *, profile_id: str, language: str, engine: str,
-                   dst: Path, on_progress: ProgressFn | None = None, timeout: float | None = None) -> Path:
-        """generate -> wait -> download. ``timeout`` (seconds, capped at the client's) limits this wait."""
+                   dst: Path, on_progress: ProgressFn | None = None, timeout: float | None = None,
+                   seed: int | None = None) -> Path:
+        """generate -> wait -> download. ``timeout`` (seconds, capped at the client's) limits this wait;
+        ``seed`` (optional) is passed to Voicebox."""
         def sub(f: float, msg: str) -> None:
             if on_progress:
                 on_progress(0.1 + 0.8 * f, msg)
 
         if on_progress:
             on_progress(0.0, "requesting voice")
-        gen_id = self.generate(text, profile_id=profile_id, language=language, engine=engine)
+        gen_id = self.generate(text, profile_id=profile_id, language=language, engine=engine, seed=seed)
         self.wait(gen_id, on_progress=sub, timeout=timeout)
         out = self.download(gen_id, dst)
         if on_progress:

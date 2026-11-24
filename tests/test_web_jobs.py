@@ -347,7 +347,8 @@ def test_job_detail_structure(api):
                                "hook": str, "keywords": list})  # G4/G5 (additive)
     assert_keys(en["metadata"], {"language": str, "title": str, "description": str, "hashtags": list})
     assert_keys(en["voice"], {"duration": float, "clip_duration": float, "tempo": float, "shortened": bool,
-                              "trimmed": bool, "lengthened": bool, "warnings": list, "truncated": bool})
+                              "trimmed": bool, "lengthened": bool, "warnings": list, "truncated": bool,
+                              "chunks": int})  # M2: sentences generated one by one (additive)
     assert en["voice_stale"] is False and c["langs"]["hi"]["voice_stale"] is True
     assert c["langs"]["hi"]["script"]["narration"] == "नया पाठ"
     assert en["task"] is None
