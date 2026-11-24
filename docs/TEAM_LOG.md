@@ -2179,3 +2179,190 @@ and no secret). Team A's caption files untouched. Regression tests: NEW `tests/t
 - No in-app warning at the moment dry run is switched on (only the Schedule page note).
 
 ### Sign-off: APPROVED, committed on `feat/publish-schedule-covers` (not pushed)
+
+## Builder (team H: M2 Hindi narration length, sentence-by-sentence voice), 2026-11-24
+
+Branch `fix/hindi-voice-chunks` (worktree `../auto-clipper-hindi`), from main 38c35dd. Not committed (lead commits).
+
+### Why clip 00 hi was 10 s with no warning
+- `clips/00/hi/voice.json` (13:05 on 2026-11-23) has no `truncated` / `warnings` keys: it was made by the app on
+  :8765 running code from before 10c4d99 (16:07, which added `TRUNCATED_BELOW`). The check was never run on it.
+- And it was never re-checked: `_voice_is_current` only compared the narration hash, so every resume / re-render
+  reused the cut-short take (captions only got the "spoken prefix" treatment).
+- Root cause at the source: Chatterbox (multilingual) gets the whole 537-character text in one call and stops
+  after ~2 sentences. Probe on real Voicebox (one call per sentence): sentences of 73-106 chars come back complete
+  (3.0-3.9 words/s); a 6-word sentence on its own came back as **12.7 s** (rambling); a 155-char chunk of three
+  merged sentences skipped a clause in the middle with a normal-looking duration.
+
+### What I built
+- `autoclipper/stages/voice_chunks.py` (new): `split_sentences` / `split_narration` (split after `। ॥ . ? ! …` plus
+  closing quotes; abbreviations "Dr." "U.S." "e.g." "etc.", initials and decimals do not end a sentence; a
+  free-standing danda stays with its sentence; sentences > `chunk_max_chars` split at `, ; : -` then between words;
+  a chunk < `chunk_min_chars` takes in the following sentences, so a short question travels with its answer; a
+  short last chunk joins the one before; joining the chunks always gives back the text). Devanagari-aware
+  `spoken_words` (tokens with a letter/digit), per-chunk `chunk_truncated` (< 0.5 x expected) and
+  `chunk_overlong` (> 3 x expected + 1.5 s), `normalize_chunk` (44.1 kHz mono + edge-silence trim, never to
+  nothing), `concat_wavs` (stdlib `wave`, gaps, returns spans), `derive_seed`, `cache_key`, `ChunkOptions`, `ChunkInfo`.
+- `voice.make_voice(..., chunking=ChunkOptions|None)`: every take (first, shorten, lengthen) is generated chunk by
+  chunk with the same profile / engine / seed; a cut-short or rambling chunk is retried once
+  (`chunk_retry_timeout_seconds`, seed + 1) and the better take kept; still bad -> kept + warning naming the
+  sentence (`voice.json` `warnings`, job log `WARNING`, clip page), and a cut-short chunk marks the take
+  `truncated` (no lengthen; captions get whole sentences + the spoken prefix of the cut one). A chunk that errors
+  or times out is retried once with the full chunk wait; twice -> `VoiceboxError`/`VoiceboxTimeout` naming the
+  chunk (stage fails, resume retries). In the lengthen retry its timeout caps each chunk and a timeout is not
+  retried (keeps the existing "kept the original voice" warning). Progress per chunk ("voice chunk 3/5 ...");
+  cancel goes through the client's cancel-on-BaseException; no `*.try*` files are left. `voice.json` gains
+  `chunks` (text, words, start, duration, expected, attempts, cached, truncated, overlong) and `chunk_gap`.
+  Without `chunking` make_voice behaves exactly as before (whole-take retry).
+- Cache: chunks that passed are kept in `<clip>/<lang>/voice_chunks/<key>.wav` and reused only for an edited
+  narration (voice.json of another text); same narration again / no voice.json (re-cut, deleted voice) = fresh
+  take. Files not used by the final take are pruned.
+- `voicebox.py`: `generate/synthesize(..., seed=None)` sends `seed` only when given (Voicebox `/generate` takes it).
+- Settings (`voicebox.*`): `chunking` true, `chunk_max_chars` 150 (40-2000), `chunk_min_chars` 60 (0-500, must
+  be < max: cross-field 422), `chunk_gap_seconds` 0.2 (0-1.5), `chunk_timeout_seconds` 240 and
+  `chunk_retry_timeout_seconds` 120 (10-3600, capped at `timeout_seconds`), `seed` null (0..2^31-1). Labels in
+  the settings page; README section "Sentence by sentence" + settings table.
+- `script.wps_hi` 3.35 -> **3.25** (measured below). English unchanged (3.0; measured 3.16, the LLM overshoots).
+- `pipeline._voice_is_current(..., settings, lang)`: with chunking on, a one-call take (no `chunks`) that
+  `looks_truncated` is stale, so resume / re-render regenerates it (that fixes the existing clip-00 hi take).
+  Voice stage message adds "N sentences".
+- Captions (`captions.py`, small insertions): with `chunks` in voice.json, (1) when the whole-voice Whisper pass
+  matches < 60 % of the words, each chunk is transcribed on its own (`transcribe_chunks`) and the better result
+  used - Whisper small dropped whole Hindi sentences on the 36 s voice (recall 0.25) but heard every chunk alone;
+  (2) the fallback distribution spreads each sentence over its own chunk (`distribute_segments`); (3)
+  `clamp_to_segments` keeps a sentence's words inside its chunk. Tempo is applied to the spans.
+- Web: job API `voice.chunks` (int, additive; contract test updated); clip page shows "34.6 s (5 sentences,
+  generated one by one)".
+
+### Tests
+- `tests/test_voice_chunks.py` (new, 72 cases): splitting (danda / double danda / free-standing danda, English
+  abbreviations + initials + decimals + `$20,000.50`, quotes, ellipsis, caps, merges, never-loses-text over 5
+  setting pairs), concat durations + spans + mixed formats, edge trim, regression for clip 00 with a fake that
+  speaks only the first 150 chars (one call -> truncated warning; chunked -> spans the clip), same seed / profile /
+  timeout per chunk, cut-short retry (retry timeout, seed + 1), cut-short twice -> warning + spoken text, rambling
+  chunk, timeout retry then clean failure, lengthen timeout cap, per-chunk progress + cancel cleanup, cache reuse /
+  fresh take / cache off, old fakes without timeout/seed, tempo fit, old voice.json, captions per chunk (fallback,
+  recognised timing, per-chunk recognition, clamp), client seed payload, `ChunkOptions.from_settings`, model
+  validation, `PUT /api/settings` 422 for 13 bad values (types, bounds, unknown key, min >= max) + 200 round trip
+  saved to disk + 401/403, pipeline end-to-end, `_voice_is_current` regeneration rule.
+- Existing tests changed only where they pinned old behaviour: recut test looks for clip `00` in the path
+  (chunks now live in `voice_chunks/`), default `wps_hi` asserts / target words (88 -> 86), web voice contract
+  (+`chunks`).
+- Full suite: **1716 passed**, 3 deselected (slow), 8 min
+  (`TMPDIR=~/.cache/ac-hindi uv run pytest -q -p no:cacheprovider --basetemp ~/.cache/ac-hindi/bt-builder`).
+
+### Real verification (Voicebox 127.0.0.1:17493, CPU; one generation at a time; `uv run autoclipper rerender`,
+`AUTOCLIPPER_DATA_DIR=~/.cache/ac-hindi/data-builder`, copies of both jobs + settings.json)
+
+| clip | raw before | raw after | clip | chunks | retries | warnings |
+|------|-----------:|----------:|-----:|-------:|--------:|----------|
+| gaming 00 hi (115 words) | 10.12 s | **35.82 s** | 38.25 s | 5 | 0 | none |
+| gaming 00 en (104 words) | 31.54 s | 33.90 s | 38.25 s | 5 | 0 | none |
+| Reagan 01 hi (60 words)  | 18.72 s | 19.92 s | 28.84 s | 3 | 0 | none |
+
+- Chunk generation took 16-100 s each on CPU (the first includes model load): well under the 240 s chunk wait.
+- Speech spans the clip (silencedetect -40 dB / 0.15 s on voice.wav): gaming hi speech 0-35.8 s with only the
+  0.2-0.3 s sentence gaps; en 0-33.9 s; Reagan hi 0-19.9 s. Finals at -14.2 / -14.4 / -14.3 LUFS (ebur128).
+- Listening proxy: every chunk cut out and transcribed alone with Whisper small - gaming hi 108 of 115 words
+  heard in order (spelling noise only), en 98/104 exact, Reagan complete. Before: the old 10 s hi take had 36
+  recognised words ending at 9.9 s.
+- Calibration (complete takes only, speech time without gaps): Hindi 3.40 and 3.28 w/s (gaming, two takes),
+  3.07 w/s (Reagan) -> `wps_hi` 3.25. First gaming run used 180-char chunks: its 155-char chunk silently dropped
+  "बीस हजार डॉलर कमाने होंगे। और नोलन का प्लान?" with a normal duration -> max 150, forward merging.
+- Captions: words.json first/last word inside each chunk span; frames at 9.4 / 25.7 / 33.4 s (hi, before the final clamp tweak, which moved those words by < 0.06 s), 6.3 / 18.3 /
+  30.9 s (en) and 4.1 / 12.8 / 18.8 s (Reagan) show the expected word highlighted (सीधा, दुकान, अब; his, runs,
+  honestly?; जनवरी, फिर, रोंगटे).
+- Outputs: `~/.cache/ac-hindi/data-builder/jobs/20261123-123539-320812/clips/00/{hi,en}/final.mp4`,
+  `.../20261122-185849-65a6bd/clips/01/hi/final.mp4`; frames `~/.cache/ac-hindi/frames/all.png`; before
+  voice.json/words.json in `~/.cache/ac-hindi/before/`.
+
+### Notes for the lead
+- Duration checks cannot see a clause skipped inside a chunk (the 155-char case): only short chunks prevent it.
+  A per-chunk ASR check would catch it but Whisper small on Hindi is too noisy to use as a gate; not done.
+- The running app's existing cut-short Hindi takes are regenerated (Voicebox) on their next resume/re-render.
+- `docs/CONTRACT_WEB.md` still lists `wps_hi 3.35` (historical contract, not edited).
+
+## Reviewer (team H: M2 Hindi sentence-by-sentence voice), 2026-11-24
+
+Reviewed the uncommitted diff on `fix/hindi-voice-chunks` (main 38c35dd + working tree). Full suite:
+1716 passed, 3 deselected (`--basetemp ~/.cache/ac-hindi/bt-reviewer`). No servers started, Voicebox only read
+(`/openapi.json`: `/generate` accepts `seed` >= 0, so the seed is honoured).
+
+### Verified OK
+- Root cause for clip 00 hi: the live voice.json (13:05) has no `truncated`/`warnings` keys; 10c4d99 landed 16:07.
+- Builder outputs: chunk loudness -20.4..-20.8 LUFS (consistent), joins go to digital silence from
+  <= -32 dBFS (no clicks), gaps exactly 0.2 s of zeros. Whisper on the last 2.5 s of every chunk (gaming hi,
+  Reagan hi) hears each sentence's final words, so no chunk ends early. words.json: 115/115 words, first word
+  of each sentence starts at its chunk start.
+- Splitting: danda, ?/! , quotes, decimals, long unpunctuated runs (cut at <= 150 chars) behave as tested.
+
+### Findings
+1. MEDIUM `autoclipper/stages/voice.py` make_voice: `truncated` is computed from the first take only. When the
+   lengthened (or shortened) take has a chunk that is cut short twice, it is still kept: `truncated=False`,
+   `spoken_narration=None`, only a warning string. Captions then show words never spoken and the UI "Adjusted"
+   row does not say "cut short". Reproduced with the ChunkVoicebox fake (plan {3,4: short} + lengthen).
+2. LOW-MEDIUM voice.py `_generate_chunked`: `lengthen_timeout` is applied per chunk, not to the whole lengthen
+   retry (fake: timeouts [240, 100, 100, 100]); a 5-chunk lengthen can wait 5x the setting. Likewise
+   `voicebox.timeout_seconds` ("Timeout per narration") is now only a per-chunk cap; no overall bound.
+3. LOW voice_chunks.py splitting: Devanagari abbreviations (`डॉ.`) end a sentence, so "...नाम था डॉ." |
+   "रमेश शर्मा..." becomes two Voicebox calls with a pause inside the name. Conversely English sentence ends on an
+   abbreviation/initials (`U.S. It`, `D.C. He`, `5 p.m. Tomorrow`, `is no. He`) never split. Danda with no
+   following space (`वाक्य।दूसरा`) is not split either (falls back to the 150-char word cut).
+4. LOW voice.py: a first run that fails at chunk k (no voice.json yet) wipes `voice_chunks/` on resume
+   (`prev is None`), so the good chunks 1..k-1 are generated again.
+5. LOW voice_chunks.py: a 1-2 word chunk that cannot be merged (both neighbours near max_chars) is never checked
+   (CHUNK_MIN_WORDS=3), although short input is where Chatterbox babbles.
+6. INFO `docs/CONTRACT_WEB.md` still says wps_hi 3.35.
+
+## Lead (team H: M2 Hindi sentence-by-sentence voice), 2026-11-24
+
+Triage of the reviewer's findings on `fix/hindi-voice-chunks`; all accepted except one half of finding 2.
+
+| # | Finding | Decision | Fix / reason |
+|---|---------|----------|--------------|
+| 1 | `truncated` taken from the first take only | ACCEPTED | `make_voice` (chunking) recomputes `truncated` from the final take's chunks, so a shortened take with a cut-short chunk is `truncated` (spoken prefix for captions, "cut short" in the UI). A lengthened take with a chunk cut short twice is not used: `_try_lengthen(reject=...)` restores the original take with the warning "Voicebox cut sentence k/n of the lengthened voice short twice, so it was not used". Tests: `test_lengthened_take_with_a_chunk_cut_short_twice_is_not_used`, `test_shortened_take_with_a_chunk_cut_short_is_marked_truncated` |
+| 2a | `lengthen_timeout` caps each chunk, not the whole retry | ACCEPTED | it is now a budget for the whole lengthened take (`_clock` deadline): each chunk waits at most what is left; once it is used up the retry stops (VoiceboxTimeout -> original take kept with the existing warning). A cut-short-chunk retry with no time left keeps the take it has. Test: `test_lengthen_budget_is_shared_by_all_chunks` (fake clock, 30 s per call: waits 100/70/40/10, then kept original) |
+| 2b | `voicebox.timeout_seconds` has no overall bound | REJECTED (relabelled) | a 115-word narration is 5 calls of 16-100 s on CPU (first includes model load), a 60 s clip ~8 calls: an overall 600 s cap would fail good runs, and cancel already stops a run cleanly. The setting is now labelled "Timeout per Voicebox call" (UI help + README table say there is no whole-narration limit) |
+| 3 | splitting: `डॉ.` ends a sentence; `U.S. It` / `p.m. Tomorrow` / `no. He` / `D.C. He` never split; glued danda | ACCEPTED | Devanagari abbreviations (`डॉ` `प्रो` `श्री` `श्रीमती` ...) and dotted Devanagari initials (`ई.पू.`) never end a sentence (`है.` still does). English abbreviations split into titles (Mr, Dr, e.g., vs ... never end) and the rest (U.S., p.m., etc., no., initials), which end a sentence only before a typical opener (It, He, The, Tomorrow, ...), so `U.S. Army` / `No. 5` / `J. R. Tolkien` stay together. A danda glued to the next word gets a space (`space_after_danda`, chunking only); the voiced narration then differs by that space, script.json is synced and the job log says so. Tests: `test_split_devanagari_abbreviation_does_not_end_a_sentence`, `test_split_english_sentence_ending_on_an_abbreviation_or_initials`, `test_glued_danda_gets_a_space_and_splits` |
+| 4 | first run failing at chunk k wipes the good chunks on resume | ACCEPTED | `voice_chunks/.pending` holds the narration hash while a chunked take is made (removed on success); with no voice.json and the same hash pending, the cache is kept. Other text / re-cut (no marker) stays a fresh take. Test: `test_resume_after_a_failed_first_run_reuses_the_generated_chunks` (2 of 5 chunks reused) |
+| 5 | 1-2 word chunks never checked | ACCEPTED (half) | `chunk_overlong` (rambling) now checks any chunk with a spoken word (2 words: > 3.5 s at 3 w/s); a cut-short check still needs 3 words (too little to judge). Test: `test_short_unmergeable_chunk_is_still_checked_for_rambling` |
+| 6 | CONTRACT_WEB.md wps_hi 3.35 | ACCEPTED | updated to 3.25 with a note |
+
+Also fixed: README said `chunk_max_chars` 180 (two places); the default is 150. `test_lengthen_timeout_caps_every_chunk`
+now asserts each chunk waits <= the shared 50 s budget (it compared exact 50.0).
+Follow-up: the shared budget first made a one-chunk lengthen wait 44.9998 s instead of 45 s
+(`test_audio_mix.py::test_pipeline_passes_lengthen_timeout_and_shows_warning`); the remaining budget is rounded
+to 0.1 s, so the first chunk waits the whole setting.
+
+### Tests
+- `tests/test_voice_chunks.py`: 80 cases (8 new for the findings). Full suite: see sign-off below.
+
+### Real verification (Voicebox 127.0.0.1:17493, one generation at a time; `uv run autoclipper rerender`,
+`AUTOCLIPPER_DATA_DIR=~/.cache/ac-hindi/data-lead`, fresh copy of job 20261123-123539-320812 + settings.json)
+- The live job has meanwhile been switched to voice-over off by the user; in the copy only, `job.json`
+  `voiceover` was set to true. en voice.json removed in the copy so en is regenerated sentence by sentence too.
+- The copied settings.json pins `script.wps_hi` 3.35 (saved explicitly), so the checks ran at 3.35.
+
+| clip 00 (38.25 s) | raw before | raw after | chunks | attempts | warnings | final LUFS |
+|---|---:|---:|---:|---|---|---:|
+| hi (115 words) | 10.12 s (26 %) | **36.09 s (94 %)** | 5 | 2,1,1,1,1 | none | -14.2 |
+| en (104 words) | 31.54 s | 33.90 s (89 %) | 5 | 1,1,1,1,1 | none | -14.4 |
+
+- hi chunk 1 timed out once at 240 s (machine load ~32 from several test suites at once) and succeeded on the
+  retry; no chunk was cut short or rambling (durations 0.86-1.17 x expected). Hindi rate on this take:
+  115 words / 35.3 s of speech = 3.26 w/s, matching the 3.25 default.
+- voice.wav hi: no silence >= 0.4 s anywhere (silencedetect -40 dB), so speech runs 0-36.1 s with only the 0.2 s
+  joins. words.json: 115/115 (hi) and 104/104 (en) words, every word inside its own chunk span.
+- Outputs: `~/.cache/ac-hindi/showcase/gaming00_{hi,en}.mp4` + `_voice.json` + `_words.json`.
+
+### Remaining
+- The user's saved settings.json pins `wps_hi` 3.35: the new 3.25 default only applies to new installs or after
+  a settings reset (the difference is small: ~3 % on narration length).
+- No ASR gate per chunk: a clause skipped inside a chunk with a normal duration is not detected (max 150 chars
+  keeps it rare).
+- Non-chunked path (chunking off) still does not re-check `truncated` after a shorten (pre-M2 behaviour).
+- Voice-over on the live job is off; the running app on :8765 needs a restart on the merged code to use this.
+
+### Sign-off: APPROVED
+Full suite: **1724 passed**, 3 deselected (`--basetemp ~/.cache/ac-hindi/bt-lead`). Committed on
+`fix/hindi-voice-chunks` (not pushed).
