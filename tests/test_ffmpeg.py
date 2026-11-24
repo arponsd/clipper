@@ -271,6 +271,7 @@ def vertical(video, tmp_path) -> Path:
     return ffmpeg.cut_vertical(video, tmp_path / "cut.mp4", 0, 2, width=270, height=480)
 
 
+@pytest.mark.system_font
 def test_mix_burn_real_path_with_space_and_quote(vertical, tmp_path):
     d = tmp_path / "my clip's dir"
     d.mkdir()

@@ -194,6 +194,7 @@ def _gray_frame(path: Path, at: float, width: int, height: int) -> bytes:
     return out
 
 
+@pytest.mark.system_font
 def test_long_caption_line_wraps_inside_margins(tmp_path: Path) -> None:
     w, h = 1080, 1920
     cut = tmp_path / "black.mp4"

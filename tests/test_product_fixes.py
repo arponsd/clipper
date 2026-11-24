@@ -647,6 +647,7 @@ def test_caption_position_none_is_legacy_margin_v():
     assert "\\pos(" not in ass and "\\an5" not in ass
 
 
+@pytest.mark.system_font
 def test_caption_burn_lands_near_position(tmp_path: Path):
     """Real libass burn: the bright text rows are centred near 72 % of the height."""
     w, h = 360, 640
