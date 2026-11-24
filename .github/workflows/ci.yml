@@ -51,7 +51,23 @@ jobs:
 
       - name: Install FFmpeg (Windows)
         if: runner.os == 'Windows'
-        run: choco install ffmpeg -y --no-progress
+        # The Chocolatey feed sometimes times out (504): retry, then fall back to the BtbN FFmpeg build
+        # from GitHub releases, and fail here (not later) if neither gives a working ffmpeg.
+        run: |
+          set -u
+          for i in 1 2 3; do
+            if choco install ffmpeg -y --no-progress && command -v ffmpeg >/dev/null 2>&1; then
+              exit 0
+            fi
+            echo "choco install ffmpeg failed (attempt $i)"; sleep 15
+          done
+          echo "Falling back to the BtbN FFmpeg build"
+          url=https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/ffmpeg.zip" "$url"
+          unzip -q "$RUNNER_TEMP/ffmpeg.zip" -d "$RUNNER_TEMP/ffmpeg"
+          bin=$(cd "$RUNNER_TEMP"/ffmpeg/*/bin && pwd -W)
+          echo "$bin" >> "$GITHUB_PATH"
+          "$bin/ffmpeg.exe" -hide_banner -version | head -1
 
       # The 4 `system_font` tests burn text with libass. Point fontconfig at the Windows font folder
       # explicitly, so libass finds a font whatever fonts.conf the FFmpeg build ships (or lacks).
