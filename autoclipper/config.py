@@ -91,6 +91,36 @@ class ClipSettings(BaseModel):
         return v
 
 
+class SignalSettings(BaseModel):
+    """Local audio/video signals for moment picking (README "Moment picking for low-speech videos"). Computed
+    once per job (signals.json) with ffmpeg + numpy; used for videos with little speech."""
+    enabled: bool = True
+    video: bool = True  # scene cuts, motion and static (menu/map) detection; off = audio loudness only
+    sample_fps: float = Field(4.0, ge=0.5, le=10)  # frames per second sampled for the video analysis
+    sample_width: int = Field(96, ge=32, le=320)  # analysis frame width in px (height = 9/16 of it)
+    window_seconds: float = Field(10.0, ge=5, le=30)  # one line per window in the table given to the LLM
+    # A video with at least this share of speech is "speech-rich": the transcript alone picks the moments
+    # (as before); below it the LLM also gets the signal table and moments need not be speech-bounded.
+    speech_rich_coverage: float = Field(0.4, ge=0.0, le=1.0)
+    # A second is "static" when less than this share of the pixels changes (for >= 2 s in a row)
+    static_motion: float = Field(0.02, ge=0.0, le=0.5)
+    # A moment that is static for at least this share and mostly without speech is rejected (menu, map,
+    # loading screen); less static moments of low-speech videos are ranked down by their static share.
+    reject_static_fraction: float = Field(0.5, ge=0.1, le=1.0)
+    cut_threshold: float = Field(0.35, ge=0.05, le=1.0)  # picture change score (0..1) for a scene cut
+    # A second is "menu-like" (map, menu, pause blur, fade) when at least this share of the analysis frame is
+    # flat (no texture) for >= 2 s in a row; treated like static.
+    menu_flatness: float = Field(0.6, ge=0.2, le=1.0)
+    timeout_seconds: float = Field(900.0, ge=30, le=7200)
+
+
+class ContextSettings(BaseModel):
+    """Source context for the LLM (README "Video context for titles and descriptions")."""
+    enabled: bool = True  # give the moment picker and the script/metadata writer the video's page info + notes
+    credit_source: bool = True  # make sure each description credits the original creator and links the source
+    description_chars: int = Field(1000, ge=0, le=1000)  # how much of the page description is kept
+
+
 class AudioSettings(BaseModel):
     # Voice-over mix (see README "Audio mix"):
     # "loudness" = measure the voice and the background (EBU R128) and set their levels from that: the voice
@@ -310,6 +340,8 @@ class Settings(BaseModel):
     whisper: WhisperSettings = Field(default_factory=WhisperSettings)
     voicebox: VoiceboxSettings = Field(default_factory=VoiceboxSettings)
     clips: ClipSettings = Field(default_factory=ClipSettings)
+    signals: SignalSettings = Field(default_factory=SignalSettings)
+    context: ContextSettings = Field(default_factory=ContextSettings)
     audio: AudioSettings = Field(default_factory=AudioSettings)
     captions: CaptionSettings = Field(default_factory=CaptionSettings)
     hook: HookSettings = Field(default_factory=HookSettings)

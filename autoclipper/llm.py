@@ -14,6 +14,7 @@ from typing import Any
 
 from .config import LLMSettings
 from .models import ClipScript, Moment
+from .stages.source_info import CONTEXT_RULES
 
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
 DEFAULT_MAX_TOKENS = 16000
@@ -174,6 +175,31 @@ METADATA_SYSTEM = (
     "match what happens and what is said in the clip."
 )
 
+MOMENTS_LOW_SPEECH_SYSTEM = (
+    "You are a senior short-form video editor who finds the most viral moments in long videos "
+    "for YouTube Shorts, Instagram Reels and Facebook Reels. This video has little speech, so you judge "
+    "mainly from what happens on screen and in the sound, using the per-window signal table: action peaks, "
+    "sudden loud hits, fast cutting and movement. You pick self-contained moments with a strong start, a "
+    "clear payoff and something actually happening the whole time. Use only times inside the video."
+)
+
+
+def _with_context_rules(system: str, context: str) -> str:
+    return f"{system}\n\n{CONTEXT_RULES}" if context else system
+
+
+def _context_part(context: str) -> str:
+    return f"{context}\n\n" if context else ""
+
+
+def _credit_instruction(context: str) -> str:
+    if not context:
+        return ""
+    return ("In the description, credit the original creator by name and include the source URL when the "
+            "<source_context> gives them (for example \"Original video by <creator>: <url>\"). "
+            "Say what the clip really shows (for example GTA 6 gameplay).\n")
+
+
 TRANSLATE_SYSTEM = (
     "You translate the spoken lines of a short video into another language for on-screen captions. "
     "Translate each line on its own, keep its id, and never merge, split, drop or reorder lines. "
@@ -311,18 +337,50 @@ class AnthropicLLM:
     # ---- interfaces.LLM
 
     def pick_moments(self, transcript_text: str, *, count: int, min_seconds: float,
-                     max_seconds: float, video_duration: float) -> list[Moment]:
-        user = (
-            f"Video duration: {video_duration:.1f} seconds.\n"
-            f"Find the {count} most viral moments. Each moment must be between {min_seconds:g} and "
-            f"{max_seconds:g} seconds long, must not overlap another moment, and should start and "
-            "end on sentence boundaries from the transcript. For each give start and end in seconds, "
-            "the hook (the line that grabs attention), the reason it works, and a score from 0 to 1. "
-            "Order by score, best first.\n\n"
-            "Transcript, one segment per line as [start-end] text:\n"
-            f"<transcript>\n{transcript_text}\n</transcript>"
-        )
-        data = self.complete_json(system=MOMENTS_SYSTEM, user=user, schema=MOMENTS_SCHEMA)
+                     max_seconds: float, video_duration: float, context: str = "", signals: str = "",
+                     speech_coverage: float | None = None) -> list[Moment]:
+        """``context``: delimited source context block; ``signals``: the low-speech signal table (then the
+        moments need not be speech-bounded); both optional."""
+        if signals:
+            cov = f"about {speech_coverage:.0%}" if speech_coverage is not None else "a small part"
+            user = (
+                f"{_context_part(context)}"
+                f"Video duration: {video_duration:.1f} seconds. Someone speaks during only {cov} of it.\n"
+                f"Find the {count} best moments for short vertical clips. Each moment must be between "
+                f"{min_seconds:g} and {max_seconds:g} seconds long and must not overlap another moment.\n"
+                "Pick moments mainly from what happens, using the signal table: strong sudden loudness jumps "
+                "(gunshots, crashes, explosions, sirens, music hits), loud windows, several scene cuts and high "
+                "motion mark action; the few speech lines show reactions and story beats worth keeping. Avoid "
+                "windows marked STATIC, MENU or SILENT (maps, menus, pause, loading or end screens) and long quiet "
+                "stretches of walking or driving where nothing happens (low loudness, small jumps). A moment "
+                "does not have to start or end on a sentence: start 1-3 seconds before the action builds up "
+                "and end right after its payoff; if a sentence is spoken at a boundary, do not cut it. "
+                "For each give start and end in seconds, the hook (the line that grabs attention, or a "
+                "short description of what happens when nobody speaks), the reason it works, and a score from "
+                "0 to 1. Order by score, best first. You cannot see the picture: in the hook and the reason, do "
+                "not invent specific events (a chase, an explosion, a crash) that neither the transcript nor the "
+                "source context supports; describe what the signals show (a loud action burst, a sudden hit, "
+                "fast cutting) in terms of what the video is about. The hook is shown to viewers: never quote the "
+                "table itself in it (no ranks, dB values, 'motion' or 'loudness' numbers).\n\n"
+                f"<signals>\n{signals}\n</signals>\n\n"
+                "Transcript (sparse), one segment per line as [start-end] text:\n"
+                f"<transcript>\n{transcript_text}\n</transcript>"
+            )
+            system = MOMENTS_LOW_SPEECH_SYSTEM
+        else:
+            user = (
+                f"{_context_part(context)}"
+                f"Video duration: {video_duration:.1f} seconds.\n"
+                f"Find the {count} most viral moments. Each moment must be between {min_seconds:g} and "
+                f"{max_seconds:g} seconds long, must not overlap another moment, and should start and "
+                "end on sentence boundaries from the transcript. For each give start and end in seconds, "
+                "the hook (the line that grabs attention), the reason it works, and a score from 0 to 1. "
+                "Order by score, best first.\n\n"
+                "Transcript, one segment per line as [start-end] text:\n"
+                f"<transcript>\n{transcript_text}\n</transcript>"
+            )
+            system = MOMENTS_SYSTEM
+        data = self.complete_json(system=_with_context_rules(system, context), user=user, schema=MOMENTS_SCHEMA)
         out: list[Moment] = []
         for item in data.get("moments") or []:
             try:
@@ -333,38 +391,44 @@ class AnthropicLLM:
 
     def write_script(self, *, lang: str, clip_transcript: str, moment: Moment,
                      duration: float, target_words: int,
-                     target_seconds: float | None = None) -> ClipScript:
+                     target_seconds: float | None = None, context: str = "") -> ClipScript:
         user = (
+            f"{_context_part(context)}"
             f"{language_rules(lang)}\n\n"
             f"{_length_instruction(lang, duration, target_words, target_seconds)}\n"
             "Also write: a title of at most 70 characters that makes people click, a 1-3 sentence "
             "description, and 3 to 8 relevant hashtags (each starting with #, no spaces).\n"
+            f"{_credit_instruction(context)}"
             f"{hook_keywords_instruction(lang, 'your narration')}\n\n"
             f"Why this moment was picked: {moment.reason or '-'}\n"
             f"Hook: {moment.hook or '-'}\n\n"
             "What is said in the clip (for context only; do not translate or repeat it):\n"
-            f"<clip_transcript>\n{clip_transcript}\n</clip_transcript>"
+            f"<clip_transcript>\n{clip_transcript or '(nobody speaks in this clip)'}\n</clip_transcript>"
         )
-        data = self.complete_json(system=SCRIPT_SYSTEM, user=user, schema=SCRIPT_SCHEMA)
+        data = self.complete_json(system=_with_context_rules(SCRIPT_SYSTEM, context), user=user,
+                                  schema=SCRIPT_SCHEMA)
         try:
             return ClipScript.model_validate(data)
         except Exception as e:  # noqa: BLE001
             raise LLMError(f"Claude returned an invalid script: {str(data)[:200]}") from e
 
     def write_publish_metadata(self, *, lang: str, clip_transcript: str, moment: Moment,
-                               duration: float) -> ClipScript:
+                               duration: float, context: str = "") -> ClipScript:
         """Voice-over off: title/description/hashtags in ``lang``; the narration stays empty."""
         user = (
+            f"{_context_part(context)}"
             f"{language_rules(lang, 'everything (title, description, hashtags)')}\n\n"
             f"Clip length: {duration:.1f} seconds. Write a title of at most 70 characters, a 1-3 sentence "
             "description, and 3 to 8 relevant hashtags (each starting with #, no spaces).\n"
+            f"{_credit_instruction(context)}"
             f"{hook_keywords_instruction(lang, _caption_source(lang))}\n\n"
             f"Why this moment was picked: {moment.reason or '-'}\n"
             f"Hook: {moment.hook or '-'}\n\n"
             "What is said in the clip (it may be in another language):\n"
-            f"<clip_transcript>\n{clip_transcript}\n</clip_transcript>"
+            f"<clip_transcript>\n{clip_transcript or '(nobody speaks in this clip)'}\n</clip_transcript>"
         )
-        data = self.complete_json(system=METADATA_SYSTEM, user=user, schema=METADATA_SCHEMA,
+        data = self.complete_json(system=_with_context_rules(METADATA_SYSTEM, context), user=user,
+                                  schema=METADATA_SCHEMA,
                                   max_tokens=min(SHORTEN_MAX_TOKENS, self.max_tokens))
         try:
             return ClipScript.model_validate({**data, "narration": ""})

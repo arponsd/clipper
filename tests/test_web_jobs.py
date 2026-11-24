@@ -317,7 +317,8 @@ def test_job_detail_structure(api):
     from test_web_support import SUMMARY_KEYS
 
     assert_keys(d, {**SUMMARY_KEYS, "stages": dict, "options": (dict, type(None)), "clips": list,
-                    "voiceover": bool, "voiceover_override": (bool, type(None))})  # voice-over on/off (additive)
+                    "voiceover": bool, "voiceover_override": (bool, type(None)),  # voice-over on/off (additive)
+                    "source_info": (dict, type(None))})  # video context (additive, CONTRACT_WEB section 14)
     assert d["voiceover"] is True and d["voiceover_override"] is None
     assert set(d["stages"]) >= {"ingest", "transcribe", "moments", "cut"}
     for st in d["stages"].values():

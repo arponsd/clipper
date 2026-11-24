@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .. import ffmpeg
 from ..interfaces import ProgressFn
@@ -89,7 +89,10 @@ def _reject(path: Path) -> Path | None:
         return None
 
 
-def _download(url: str, job_dir: Path, on_progress: ProgressFn | None) -> Path:
+InfoFn = Callable[[dict], None]
+
+
+def _download(url: str, job_dir: Path, on_progress: ProgressFn | None, on_info: InfoFn | None = None) -> Path:
     import yt_dlp  # imported lazily: heavy, and tests monkeypatch yt_dlp.YoutubeDL
 
     best = [0.0]  # video+audio formats download as separate files; never report going backwards
@@ -116,9 +119,14 @@ def _download(url: str, job_dir: Path, on_progress: ProgressFn | None) -> Path:
         "progress_hooks": [hook],
     }
     _report(on_progress, 0.0, f"downloading {url}")
+    info: Any = None
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
+            if on_info is not None and hasattr(ydl, "extract_info"):
+                # same download, but keep the page info (title, uploader, description, tags) for the context
+                info = ydl.extract_info(url, download=True)
+            else:
+                ydl.download([url])
     except Exception as e:  # yt_dlp.utils.DownloadError and friends
         raise IngestError(f"download failed for {url}: {e}") from e
     path = find_source(job_dir)
@@ -129,12 +137,20 @@ def _download(url: str, job_dir: Path, on_progress: ProgressFn | None) -> Path:
     except IngestError:
         _reject(path)
         raise
+    if on_info is not None and isinstance(info, dict):
+        try:
+            on_info(info)
+        except Exception:  # noqa: BLE001 - the context is optional; never fail a finished download for it
+            pass
     _report(on_progress, 1.0, "downloaded")
     return path
 
 
-def ingest(source: str, job_dir: Path, *, on_progress: ProgressFn | None = None) -> Path:
-    """Copy a local file or download a URL to ``job_dir/source.<ext>``. Idempotent."""
+def ingest(source: str, job_dir: Path, *, on_progress: ProgressFn | None = None,
+           on_info: InfoFn | None = None) -> Path:
+    """Copy a local file or download a URL to ``job_dir/source.<ext>``. Idempotent.
+
+    ``on_info`` receives yt-dlp's info dict for a URL download (the source context); never for a file."""
     job_dir = Path(job_dir)
     existing = find_source(job_dir)
     if existing is not None:
@@ -150,7 +166,7 @@ def ingest(source: str, job_dir: Path, *, on_progress: ProgressFn | None = None)
         raise IngestError("no source given - pass a video file path or an http(s) URL")
     job_dir.mkdir(parents=True, exist_ok=True)
     if is_url(source):
-        return _download(source.strip(), job_dir, on_progress)
+        return _download(source.strip(), job_dir, on_progress, on_info)
     return _copy_local(source, job_dir, on_progress)
 
 

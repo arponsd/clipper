@@ -90,3 +90,6 @@ class Job(BaseModel):
     voiceover: bool | None = None
     stages: dict[str, StageState] = Field(default_factory=dict)
     clips: list[ClipState] = Field(default_factory=list)
+    # Pointer to the job's source context file ("source_info.json": page title, creator, description excerpt,
+    # tags, the user's notes); None = none recorded (jobs made before it existed).
+    source_info: str | None = None

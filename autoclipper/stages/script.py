@@ -10,7 +10,10 @@ from ..config import ScriptSettings
 from ..interfaces import LLM, ShortenFn
 from ..models import ClipScript, Moment, Transcript
 from ._atomic import write_text_atomic
+from ._optional import call_with_optional
 from .moments import format_transcript
+from .source_info import (SourceInfo, apply_source_credit, context_for_prompt, drop_misleading_hashtags,
+                          ensure_game_hashtag)
 
 WORDS_PER_SECOND = {"en": 2.6, "hi": 2.2}
 FILL_RATIO = 0.9
@@ -165,20 +168,34 @@ def load_script(path: Path) -> ClipScript:
         raise ScriptError(f"could not read {path}: {e}; fix the JSON or delete it to regenerate") from e
 
 
+def apply_source(script: ClipScript, source: SourceInfo | None, lang: str, *, credit: bool = True) -> ClipScript:
+    """Source-context fixes on LLM metadata: game footage loses hashtags that sell it as real life, news or a
+    movie and gets the game's Latin hashtag (#GTA6) when missing, and (``credit``) the description credits the original creator by name with the source URL."""
+    if source is None:
+        return script
+    tags = ensure_game_hashtag(drop_misleading_hashtags(script.hashtags, source), source)
+    desc = apply_source_credit(script.description, source, lang) if credit else script.description
+    if tags == script.hashtags and desc == script.description:
+        return script
+    return script.model_copy(update={"hashtags": tags, "description": desc})
+
+
 def _generate_script(*, llm: LLM, transcript: Transcript, moment: Moment, lang: str,
-                     script_settings: ScriptSettings | None = None) -> ClipScript:
+                     script_settings: ScriptSettings | None = None, source: SourceInfo | None = None) -> ClipScript:
     duration = moment.end - moment.start
     clip_transcript = format_transcript(transcript, moment.start, moment.end)
+    optional = {"context": context_for_prompt(source)}
     if script_settings is None:
         target = target_words(duration, lang)
-        script = llm.write_script(lang=lang, clip_transcript=clip_transcript, moment=moment,
-                                  duration=duration, target_words=target)
+        script = call_with_optional(llm.write_script, lang=lang, clip_transcript=clip_transcript, moment=moment,
+                                    duration=duration, target_words=target, optional=optional)
     else:
         target = target_words(duration, lang, wps=script_settings.wps(lang),
                               fill_ratio=script_settings.fill_ratio)
         target_seconds = round(duration * script_settings.fill_ratio, 1)
-        script = llm.write_script(lang=lang, clip_transcript=clip_transcript, moment=moment,
-                                  duration=duration, target_words=target, target_seconds=target_seconds)
+        script = call_with_optional(llm.write_script, lang=lang, clip_transcript=clip_transcript, moment=moment,
+                                    duration=duration, target_words=target, target_seconds=target_seconds,
+                                    optional=optional)
     if not script.narration.strip():
         raise ScriptError(f"the LLM returned an empty {lang} narration")
     if count_words(script.narration) > target * SHORTEN_THRESHOLD:
@@ -192,20 +209,23 @@ def _generate_script(*, llm: LLM, transcript: Transcript, moment: Moment, lang: 
 
 
 def write_script(*, llm: LLM, transcript: Transcript, moment: Moment, lang: str,
-                 out_json: Path, script_settings: ScriptSettings | None = None) -> ClipScript:
+                 out_json: Path, script_settings: ScriptSettings | None = None,
+                 source: SourceInfo | None = None, credit: bool = True) -> ClipScript:
     """Ask the LLM for the script, shorten once if far too long, normalize and write out_json.
 
     With ``script_settings`` the word target uses its per-language words/s and fill_ratio, and the
     LLM is also told the spoken duration to fill (target_seconds). Without it, step-1 constants.
+    ``source`` (stages.source_info) is given to the LLM as delimited context and applied by apply_source.
     """
     script = _generate_script(llm=llm, transcript=transcript, moment=moment, lang=lang,
-                              script_settings=script_settings)
+                              script_settings=script_settings, source=source)
+    script = apply_source(script, source, lang, credit=credit)
     save_script(script, out_json)
     return script
 
 
 def write_metadata_script(*, llm: LLM, transcript: Transcript, moment: Moment, lang: str,
-                          out_json: Path) -> ClipScript:
+                          out_json: Path, source: SourceInfo | None = None, credit: bool = True) -> ClipScript:
     """Voice-over off: script.json with title/description/hashtags in ``lang`` and an empty narration.
 
     Uses the LLM's optional ``write_publish_metadata``; an LLM without it writes a normal script, whose
@@ -213,15 +233,18 @@ def write_metadata_script(*, llm: LLM, transcript: Transcript, moment: Moment, l
     """
     duration = moment.end - moment.start
     clip_transcript = format_transcript(transcript, moment.start, moment.end)
+    optional = {"context": context_for_prompt(source)}
     fn = getattr(llm, "write_publish_metadata", None)
     if callable(fn):
-        script = fn(lang=lang, clip_transcript=clip_transcript, moment=moment, duration=duration)
+        script = call_with_optional(fn, lang=lang, clip_transcript=clip_transcript, moment=moment,
+                                    duration=duration, optional=optional)
     else:
-        script = llm.write_script(lang=lang, clip_transcript=clip_transcript, moment=moment,
-                                  duration=duration, target_words=target_words(duration, lang))
+        script = call_with_optional(llm.write_script, lang=lang, clip_transcript=clip_transcript, moment=moment,
+                                    duration=duration, target_words=target_words(duration, lang), optional=optional)
     from .caption_style import check_llm_extras
 
     script = check_llm_extras(normalize_script(script.model_copy(update={"narration": ""})), lang, voiceover=False)
+    script = apply_source(script, source, lang, credit=credit)
     if not script.title:
         raise ScriptError(f"the LLM returned an empty {lang} title")
     save_script(script, out_json)
@@ -229,11 +252,12 @@ def write_metadata_script(*, llm: LLM, transcript: Transcript, moment: Moment, l
 
 
 def add_narration(*, llm: LLM, transcript: Transcript, moment: Moment, lang: str, script: ClipScript,
-                  out_json: Path, script_settings: ScriptSettings | None = None) -> ClipScript:
+                  out_json: Path, script_settings: ScriptSettings | None = None,
+                  source: SourceInfo | None = None) -> ClipScript:
     """Voice-over turned on for a script written without narration: ask the LLM for a narration and keep
     the existing (possibly user-edited) title, description and hashtags."""
     fresh = _generate_script(llm=llm, transcript=transcript, moment=moment, lang=lang,
-                             script_settings=script_settings)
+                             script_settings=script_settings, source=source)
     # the keywords must come from the new narration (the captions now show it); a hook already there is kept
     merged = script.model_copy(update={"narration": fresh.narration, "keywords": fresh.keywords,
                                        "hook": script.hook or fresh.hook})
