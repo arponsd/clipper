@@ -656,7 +656,7 @@ Change settings with `autoclipper settings set key.path=value`. The value is par
 | `audio.short_voice_below` | `0.6` | "Short" = the narration ends before this share of the clip (0.1-0.95) |
 | `audio.short_voice_tail` | `1.0` | `trim_clip`: seconds the clip runs on after the narration (0-5; the clip is never under 3 s) |
 | `audio.max_speedup` | `1.25` | Max atempo used to fit the voice into the clip |
-| `audio.loudnorm` | `true` | Normalize the loudness of the final mix (a limiter always keeps peaks below 0 dBFS) |
+| `audio.loudnorm` | `true` | Normalize the loudness of the final mix (a limiter always keeps peaks at or below -1 dBFS) |
 | `audio.target_lufs` | `-14` | Loudness target for `audio.loudnorm` (-30 to -8 LUFS) |
 | `script.wps_en` / `script.wps_hi` | `3.0` / `3.35` | Words per second of the voice, used to size the narration (measured on chatterbox; 1-6) |
 | `script.fill_ratio` | `0.88` | Share of the clip the narration should fill (0.5-1) |
