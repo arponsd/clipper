@@ -620,3 +620,6 @@ fieldset.is-inactive > .fields, fieldset.is-inactive > p.muted { opacity: 0.55; 
 .ass-color .ass-swatch { flex: 0 0 2.4rem; width: 2.4rem; height: 2.2rem; padding: 2px; border: 1px solid var(--border);
   border-radius: 6px; background: transparent; cursor: pointer; }
 .preset-note:empty { display: none; }
+
+/* source context notes on the job page */
+.pre-wrap { white-space: pre-wrap; }

@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import traceback
 import types
 import typing
@@ -122,10 +123,123 @@ def cmd_run(args: argparse.Namespace) -> int:
     with hold_job_lock(job_id) if job_id else contextlib.nullcontext():
         store = run_job(source, settings=settings, langs=args.langs, count=args.clips,
                         min_seconds=args.min, max_seconds=args.max, job_id=job_id, log=_out, debug=args.debug,
-                        voiceover=args.voiceover)
+                        voiceover=args.voiceover, notes=args.notes)
     _out()
     _print_status(store.job, store.dir)
     return 0 if store.job.status == "done" else 1
+
+
+def _notes_arg(value: str) -> str:
+    from .stages.source_info import NOTES_MAX
+
+    if len(value) > NOTES_MAX:
+        raise argparse.ArgumentTypeError(f"notes must be at most {NOTES_MAX} characters (got {len(value)})")
+    return value
+
+
+def _print_source_info(info: Any) -> None:
+    if info is None:
+        _out("  no source context recorded (source_info.json missing)")
+        return
+    for key in ("kind", "title", "uploader", "channel", "url", "upload_date", "site", "filename"):
+        val = getattr(info, key)
+        if val:
+            _out(f"  {key}: {val}")
+    if info.duration:
+        _out(f"  duration: {info.duration:.0f}s")
+    if info.categories:
+        _out(f"  categories: {', '.join(info.categories)}")
+    if info.tags:
+        _out(f"  tags: {', '.join(info.tags[:15])}" + (" ..." if len(info.tags) > 15 else ""))
+    if info.description:
+        first = info.description.splitlines()[0]
+        _out(f"  description: {first[:150]}" + ("..." if len(info.description) > len(first[:150]) else ""))
+    if info.notes:
+        _out(f"  notes: {info.notes}")
+    if info.looks_like_game():
+        _out("  detected: video game footage")
+
+
+def cmd_context(args: argparse.Namespace) -> int:
+    """Show or change a job's source context (source_info.json): notes, or a fresh page-info fetch."""
+    from .joblock import hold_job_lock
+    from .jobstore import JobStore
+    from .stages import source_info as si
+
+    try:
+        store = JobStore.load(args.job)
+    except FileNotFoundError:
+        raise CLIError(f"job {args.job!r} not found (see `autoclipper jobs`)") from None
+    changed = False
+    with hold_job_lock(args.job):
+        if args.fetch:
+            info = si.read_source_info(store.dir) or si.from_source(store.job.source)
+            url = info.url or store.job.source
+            if si.from_source(url).kind != "url":
+                raise CLIError("this job's source is not a URL, so there is no page info to fetch")
+            settings = _load_settings()
+            _out(f"fetching page info for {url} (no video download)")
+            try:
+                fresh = si.fetch_url_info(url, description_chars=settings.context.description_chars)
+            except Exception as e:  # noqa: BLE001 - yt-dlp errors
+                raise CLIError(f"could not fetch the page info: {str(e).strip().splitlines()[0][:300]}") from e
+            si.write_source_info(store.dir, si.merge(si.read_source_info(store.dir), fresh))
+            changed = True
+        if args.notes is not None or args.clear_notes:
+            si.set_notes(store.dir, "" if args.clear_notes else args.notes, source=store.job.source)
+            changed = True
+        if changed and store.job.source_info != si.SOURCE_INFO_FILE:
+            store.job.source_info = si.SOURCE_INFO_FILE
+            store.save()
+    _out(f"job {store.job.id} source context:")
+    _print_source_info(si.read_source_info(store.dir))
+    if changed and (store.dir / "moments.json").exists():
+        _out("note: moments and scripts already written keep their text; delete moments.json (re-pick) or a "
+             "clip's script.json (rewrite) and resume the job to use the new context")
+    return 0
+
+
+def cmd_signals(args: argparse.Namespace) -> int:
+    """Compute (or show the cached) audio/video signals of a job and print the table the LLM gets."""
+    from .joblock import hold_job_lock
+    from .jobstore import JobStore
+    from .models import Transcript
+    from .stages.ingest import find_source
+    from .stages.signals import (SignalsError, compute_signals, legend, speech_coverage, window_size,
+                                 window_summary)
+
+    try:
+        store = JobStore.load(args.job)
+    except FileNotFoundError:
+        raise CLIError(f"job {args.job!r} not found (see `autoclipper jobs`)") from None
+    settings = _load_settings()
+    src = find_source(store.dir)
+    if src is None:
+        raise CLIError(f"job {args.job} has no source video yet - resume it first")
+    audio = store.dir / "audio.wav"
+    t0 = time.monotonic()
+    # the job lock: never a second full video decode next to a running job (JobLocked -> CLI error)
+    with hold_job_lock(args.job):
+        try:
+            sig = compute_signals(src, store.dir / "signals.json", settings.signals,
+                                  audio=audio if audio.is_file() else None, on_progress=lambda f, m: None)
+        except SignalsError as e:
+            raise CLIError(f"could not compute the signals: {e}") from e
+    took = time.monotonic() - t0
+    _out(f"signals for {store.job.id}: {len(sig.cuts)} scene cuts, {sum(sig.static or [])} static and "
+         f"{sum(sig.menu or [])} menu-like seconds of {len(sig.loudness_db)} "
+         f"(computed in {sig.compute_seconds:.1f}s{', cached' if took < sig.compute_seconds / 2 else ''})")
+    tp = store.dir / "transcript.json"
+    if tp.is_file() and args.table:
+        t = Transcript.model_validate_json(tp.read_text(encoding="utf-8"))
+        cov = speech_coverage(t)
+        mode = ("low speech: the moment picker gets this table" if cov < settings.signals.speech_rich_coverage
+                else "speech-rich: the transcript alone picks the moments")
+        _out(f"speech coverage {cov:.0%} ({mode})")
+        w = window_size(sig.duration, settings.signals.window_seconds)
+        _out(legend(w, sig.has_video))
+        _out(window_summary(sig, t, window=w))
+    return 0
 
 
 def cmd_rerender(args: argparse.Namespace) -> int:
@@ -741,7 +855,26 @@ def build_parser() -> argparse.ArgumentParser:
                          "so with --job it switches an existing job)")
     vo.add_argument("--voiceover", dest="voiceover", action="store_true", default=None,
                     help="add the narration voice-over for this job even if the `voiceover` setting is off")
+    r.add_argument("--notes", type=_notes_arg, default=None,
+                   help="context for the titles and descriptions, e.g. \"GTA 6 gameplay by Nemsk\" (at most 1000 "
+                        "characters; with --job it replaces the job's notes)")
     r.set_defaults(func=cmd_run)
+
+    cx = sub.add_parser("context", parents=[common],
+                        help="show or change a job's source context (page title, creator, your notes)")
+    cx.add_argument("job", help="job id")
+    cx.add_argument("--notes", type=_notes_arg, default=None, help="replace the job's context notes")
+    cx.add_argument("--clear-notes", action="store_true", help="remove the job's context notes")
+    cx.add_argument("--fetch", action="store_true",
+                    help="fetch the page info (title, creator, description, tags) of a URL job again, without "
+                         "downloading the video (needs the network; for jobs made before this existed)")
+    cx.set_defaults(func=cmd_context)
+
+    sg = sub.add_parser("signals", parents=[common],
+                        help="compute a job's audio/video signals (signals.json) and show the moment-picker table")
+    sg.add_argument("job", help="job id")
+    sg.add_argument("--no-table", dest="table", action="store_false", help="only the summary line")
+    sg.set_defaults(func=cmd_signals)
 
     rr = sub.add_parser("rerender", parents=[common], help="re-render one clip from its edited script.json")
     rr.add_argument("job", help="job id")

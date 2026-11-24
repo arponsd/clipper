@@ -318,14 +318,21 @@ class Worker:
         self._cond.notify_all()
 
     def submit_job(self, source: str, *, options: JobOptions, upload: Path | None = None,
-                   voiceover_default: bool = True) -> Task:
+                   voiceover_default: bool = True, notes: str | None = None) -> Task:
         """``voiceover_default`` (the `voiceover` setting) is stored as the job's mode when the options
-        have none, so a later Settings change never switches this job."""
+        have none, so a later Settings change never switches this job. ``notes`` (the "Context / notes" field)
+        go into the job's source_info.json with what the source string tells (URL or upload file name)."""
         vo = options.voiceover if options.voiceover is not None else bool(voiceover_default)
         # the one request-thread write: a brand-new job (CONTRACT 1a), its voice-over mode fixed in it
         store = JobStore.create(source, voiceover=vo)
         job_id = store.job.id
         try:
+            from ..stages import source_info as si
+
+            # job.json is not saved again here (one request-thread save per new job); the pipeline's ingest
+            # stage sets job.source_info, and the API reads source_info.json directly
+            si.write_source_info(store.dir, si.from_source(source).model_copy(
+                update={"notes": si.clean_notes(notes or "")}))
             if upload is not None:
                 upload = Path(upload)
                 os.replace(upload, store.dir / f"source{upload.suffix.lower()}")

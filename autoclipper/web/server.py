@@ -28,10 +28,11 @@ from starlette.responses import FileResponse, MalformedRangeHeader, RangeNotSati
 
 from ..cli import run_doctor
 from ..config import Settings, data_dir, load_settings, settings_path
-from ..jobstore import JOB_STAGES, jobs_root
+from ..jobstore import JOB_STAGES, OPTIONAL_JOB_STAGES, jobs_root
 from ..models import ClipScript, ClipState, Job
 from ..stages._atomic import write_text_atomic
 from ..stages.script import MAX_HASHTAGS
+from ..stages.source_info import NOTES_MAX, read_source_info
 from .auth import DEFAULT_ALLOWED_HOSTS, GuardMiddleware, is_loopback, load_or_create_token
 from .errors import APIError, VALIDATION_FAILED, error_body, error_response, install_error_handlers, validation_errors
 from ..joblock import has_lock_file
@@ -62,6 +63,7 @@ JOB_ID_RE = r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"
 HEX32_RE = r"^[0-9a-f]{32}$"
 IDEMPOTENCY_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,200}\Z")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+_NOTES_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 ASS_COLOR_RE = re.compile(r"^&H[0-9A-Fa-f]{8}\Z")  # \Z: "$" would accept a trailing newline
 MAX_SETTING_STR = 200
 MAX_URL_LEN = 2048
@@ -88,6 +90,16 @@ class JobOptionsIn(BaseModel):
     langs: list[Literal["en", "hi"]] | None = Field(None, min_length=1, max_length=2)
     # Voice-over for this job; None = the `voiceover` setting. False = captions only (original audio).
     voiceover: bool | None = None
+    # "Context / notes": what the video is, who made it ("GTA 6 gameplay by Nemsk"); given to the LLM with the
+    # video's page info for moments, titles, descriptions and hashtags. Stored in source_info.json.
+    notes: str | None = Field(None, max_length=NOTES_MAX)
+
+    @field_validator("notes")
+    @classmethod
+    def _notes(cls, v: str | None) -> str | None:
+        if v is not None and _NOTES_CONTROL.search(v):
+            raise ValueError("notes must not contain control characters (line breaks and tabs are fine)")
+        return v
 
     @field_validator("langs")
     @classmethod
@@ -336,12 +348,29 @@ def _read_script(path: Path) -> ClipScript | None:
         return None
 
 
+def _source_info_dict(job_id: str) -> dict | None:
+    """The job's source context for the job page (source_info.json), or None when there is none."""
+    info = read_source_info(_job_dir(job_id))
+    if info is None:
+        return None
+    return {"kind": info.kind, "title": info.title, "uploader": info.uploader, "channel": info.channel,
+            "url": info.url, "upload_date": info.upload_date, "site": info.site, "filename": info.filename,
+            "duration": info.duration, "categories": list(info.categories), "tags": list(info.tags[:15]),
+            "description": info.description[:300], "notes": info.notes, "game": info.looks_like_game()}
+
+
 def _stage_dict(stages: dict, names: list[str]) -> dict:
     out = {}
     for name in names:
         st = stages.get(name)
-        out[name] = (st.model_dump() if st is not None
-                     else {"status": "pending", "progress": 0.0, "message": ""})
+        if st is not None:
+            out[name] = st.model_dump()
+        elif name in OPTIONAL_JOB_STAGES and stages.get("moments") is not None and \
+                stages["moments"].status in ("done", "skipped"):
+            # a job made before this stage existed: it was never needed
+            out[name] = {"status": "skipped", "progress": 1.0, "message": "not used (older job)"}
+        else:
+            out[name] = {"status": "pending", "progress": 0.0, "message": ""}
     for name, st in stages.items():
         out.setdefault(name, st.model_dump())
     return out
@@ -396,6 +425,7 @@ class App:
         d["stages"] = _stage_dict(job.stages, list(JOB_STAGES))
         opts = read_options(job.id)
         d["options"] = opts.to_dict() if opts is not None else None
+        d["source_info"] = _source_info_dict(job.id)
         try:
             settings: Settings | None = self.settings_loader()
         except (ValidationError, ValueError, OSError):
@@ -788,9 +818,9 @@ def create_app(*, worker: Worker | None = None, settings_loader: Callable[[], Se
                 if found is None:
                     raise APIError(404, f"upload {body.upload_id} not found")
                 path, name = found
-                task = state.worker.submit_job(f"upload:{name}", options=options, upload=path)
+                task = state.worker.submit_job(f"upload:{name}", options=options, upload=path, notes=o.notes)
             else:
-                task = state.worker.submit_job(body.url or "", options=options)
+                task = state.worker.submit_job(body.url or "", options=options, notes=o.notes)
             if key is not None:
                 store[key] = {"hash": digest, "job_id": task.job_id, "created_at": time.time()}
                 state.idem_save(store)

@@ -33,6 +33,8 @@ renames/removals need a TEAM_LOG note and lead sign-off. Architect files (`confi
 | `source.<ext>` | `stages.ingest.ingest` | copied file or yt-dlp download (mp4 preferred) |
 | `audio.wav` | `stages.ingest.extract_audio_for_asr` | 16 kHz mono pcm_s16le |
 | `transcript.json` | `stages.transcribe.run_transcribe` | `models.Transcript` JSON |
+| `source_info.json` | pipeline ingest (`stages.source_info`), web `submit_job`, CLI `run --notes` / `context` | `SourceInfo` JSON: page title, creator, description excerpt, tags, categories, duration, upload date, URL / file name, user notes (job.json `source_info` points at it) |
+| `signals.json` | `stages.signals.compute_signals` (job stage `signals`) | per-second loudness/jumps/motion/static/menu flags + scene cuts, with the analysis params and source stamps (staleness) |
 | `moments.json` | `stages.moments.run_moments` | JSON list of `models.Moment` dicts (validated, sorted by score desc) |
 | `clips/NN/cut.mp4` | `stages.cut.cut_clip` | 1080x1920 h264/aac, original audio (silent track added if source has none) |
 | `clips/NN/<lang>/script.json` | `stages.script.write_script` (and pipeline when voice shortens) | `models.ClipScript` JSON - **user-editable** |

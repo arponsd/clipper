@@ -18,7 +18,8 @@
   const JOB_ID_RE = '[A-Za-z0-9][A-Za-z0-9_-]{0,63}';
   const LANG_NAMES = { en: 'English', hi: 'हिन्दी (Hindi)' };
   const LANG_SHORT = { en: 'EN', hi: 'HI' };
-  const JOB_STAGES = ['ingest', 'transcribe', 'moments', 'cut'];
+  const JOB_STAGES = ['ingest', 'transcribe', 'signals', 'moments', 'cut'];
+  const NOTES_MAX = 1000; // options.notes (server: stages.source_info.NOTES_MAX)
   const CLIP_STAGES = ['script', 'voice', 'captions', 'render'];
   const DEFAULT_EXTS = ['.mp4', '.mov', '.mkv', '.webm', '.avi', '.m4v', '.ogv'];
   const DEFAULT_MAX_MB = 4096;
@@ -585,12 +586,18 @@
     voIn.setAttribute('aria-describedby', 'nj-voiceover-hint nj-voiceover-err');
     const voField = el('div', { class: 'field' }, el('label', { class: 'check' }, voIn, 'Voice-over narration'), voHint, voErr);
     errs.register('options.voiceover', voField, voErr);
+    // Context / notes: what the video is and who made it; Claude uses it (with the page info of a URL) for
+    // the moments, titles, descriptions and hashtags.
+    const notesIn = el('textarea', { id: 'nj-notes', rows: '2', maxlength: String(NOTES_MAX),
+      placeholder: 'e.g. GTA 6 gameplay by Nemsk: robbing every bank without stopping' });
     const optsFs = el('fieldset', null, el('legend', { text: 'Options' }),
       el('div', { class: 'fields' },
         fieldWrap('options.clips', 'Number of clips', clipsIn, '1–30', 'nj-clips'),
         fieldWrap('options.min_seconds', 'Min length (s)', minIn, '5–180 seconds', 'nj-min'),
         fieldWrap('options.max_seconds', 'Max length (s)', maxIn, '10–180, at least the minimum', 'nj-max'),
-        langsField, voField));
+        langsField, voField),
+      fieldWrap('options.notes', 'Context / notes (optional)', notesIn,
+        `What the video is and who made it, up to ${NOTES_MAX} characters. Used with the video page's title and channel for the titles, descriptions and hashtags.`, 'nj-notes'));
 
     // --- progress + actions
     const upBar = el('div', { class: 'bar upload', role: 'progressbar', 'aria-label': 'Upload progress', 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': 0 }, el('span'));
@@ -714,6 +721,9 @@
       if (!langs.length) clientErrors['options.langs'] = ['Pick at least one language.'];
       o.langs = langs;
       o.voiceover = voIn.checked; // always sent: the job keeps the mode shown on the form
+      const notes = notesIn.value.trim();
+      if (notes.length > NOTES_MAX) clientErrors['options.notes'] = [`At most ${NOTES_MAX} characters.`];
+      else if (notes) o.notes = notes;
       return o;
     }
 
@@ -893,6 +903,15 @@
   }
 
   // ================================================================== JOB DETAIL
+  function sourceInfoRows(si) {
+    if (!si) return [];
+    const rows = [];
+    const what = [si.title, si.uploader ? 'by ' + si.uploader : '', si.game ? '(video game footage)' : '']
+      .filter(Boolean).join(' ');
+    if (what) rows.push(el('dt', { text: 'Video' }), el('dd', { text: what }));
+    if (si.notes) rows.push(el('dt', { text: 'Context / notes' }), el('dd', { class: 'pre-wrap', text: si.notes }));
+    return rows;
+  }
   function stageBox(name, st) {
     const s = st || { status: 'pending', progress: 0, message: '' };
     return el('div', { class: 'stage is-' + s.status },
@@ -1088,6 +1107,7 @@
           el('dt', { text: 'Source' }), el('dd', { text: d.source || '' }),
           el('dt', { text: 'Created' }), el('dd', { text: fmtDate(d.created_at) }),
           el('dt', { text: 'Options' }), el('dd', { text: optText }),
+          ...sourceInfoRows(d.source_info),
           el('dt', { text: 'Voice-over' }), el('dd', null, el('span', { text: voText + voFrom }), modeRow),
           el('dt', { text: 'Output' }), el('dd', { text: `${d.rendered || 0} rendered, ${d.failed || 0} failed` }),
           d.task ? el('dt', { text: 'Task' }) : null,
@@ -1556,6 +1576,8 @@
     captions: ['Captions', 'Burned-in word-by-word captions. Pick a style preset to fill the style fields, then change any of them by hand.'],
     hook: ['Hook text', 'A short, punchy line (written by Claude with the script, editable per clip) shown big at the top for the first seconds of every clip. A clip with an empty hook shows nothing.'],
     script: ['Narration script', 'Speaking rate used to size the narration to the clip.'],
+    signals: ['Moment signals', 'For videos with little speech (gameplay, sports, music): loudness peaks, scene cuts and static/menu screens are measured locally with FFmpeg and given to Claude with the transcript, so action moments can be picked and maps or menus avoided. Speech-rich videos are picked from the transcript as before.'],
+    context: ['Video context', 'The video page\'s title, channel, description and tags (and your notes on the New job form) are given to Claude, so titles and hashtags say what the video really is and credit its creator.'],
     web: ['Web uploads', 'Limits for files uploaded through this page.'],
     separation: ['Vocal separation (optional)', 'Demucs removes the speech from the clip so the narration is not talking over someone else. Used only with the voice-over on and Background = "no_vocals"; a clip falls back to the original audio (with a warning) if Demucs is missing or fails. Run Doctor to check the install.'],
     hyperframes: ['HyperFrames captions (optional)', 'Animated captions rendered with the HyperFrames CLI (Node 22+). Used only when the caption engine is "hyperframes"; a clip falls back to ASS captions if HyperFrames is missing or fails. Run Doctor to check the install.'],
@@ -1596,6 +1618,20 @@
     'clips.width': ['Width (px)', 'Even number.'],
     'clips.height': ['Height (px)', 'Even number.'],
     'clips.reframe': ['Reframe mode', 'crop = centre crop to 9:16; blur = whole frame over a blurred fill.'],
+    'signals.enabled': ['Use audio/video signals', 'Off = moments from the transcript only.'],
+    'signals.video': ['Analyse the picture', 'Scene cuts, motion and static/menu screens. Off = loudness only (faster).'],
+    'signals.sample_fps': ['Frames per second analysed', 'Lower is faster; 4 is enough for cuts and motion.'],
+    'signals.sample_width': ['Analysis width (px)', 'Frames are shrunk to this width before analysis.'],
+    'signals.window_seconds': ['Window (s)', 'One line per window in the table Claude gets.'],
+    'signals.speech_rich_coverage': ['Speech-rich above', 'Share of the video with speech (0-1) from which the transcript alone picks the moments, as before.'],
+    'signals.static_motion': ['Static below', 'Share of changed pixels (0-1) under which a second counts as static.'],
+    'signals.reject_static_fraction': ['Reject moments static for', 'Share (0-1) of a moment that may be static or menu-like (without speech) before it is dropped.'],
+    'signals.cut_threshold': ['Scene-cut threshold', 'Picture change (0-1) that counts as a cut; lower finds more cuts.'],
+    'signals.menu_flatness': ['Menu/map flatness', 'Share of flat, texture-less picture (0-1) from which a second counts as a map or menu screen.'],
+    'signals.timeout_seconds': ['Timeout (s)', 'Signals that take longer are skipped (moments from the transcript only).'],
+    'context.enabled': ['Give Claude the video context', 'Page title, channel, description excerpt, tags and your notes.'],
+    'context.credit_source': ['Credit the creator', 'Each description names the original creator and links the source video.'],
+    'context.description_chars': ['Description excerpt (characters)', 'How much of the page description is kept (0-1000).'],
     'audio.mix': ['Mix', 'loudness = measure the voice and the background and set their levels from that (recommended). gain = the old fixed volume factors.'],
     'audio.voice_lufs': ['Voice loudness (LUFS)', 'loudness mix: the narration is normalised to this before the final loudness normalisation.'],
     'audio.background_db_below_voice': ['Background under the voice (dB)', 'loudness mix: how far the background sits under the narration while it plays. 18-20 dB keeps the voice clear over loud game or music audio.'],

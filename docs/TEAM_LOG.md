@@ -2458,3 +2458,218 @@ Workflow YAML: `yaml.safe_load` OK, `uvx --from actionlint-py actionlint` clean 
 - Branch protection is the owner's step; require `tests (windows-latest)` only after it is green once.
 
 ### Sign-off: APPROVED, committed on `chore/ci` (not pushed)
+
+## Builder (team S: video context for metadata + moment picking for low-speech videos), 2026-11-24
+
+Worktree `auto-clipper-moments`, branch `feat/smart-moments` from `main` 21d14c7. Nothing committed, pushed or
+published; the live app (:8765) and its data were not touched; Voicebox not used. One test server on :8771
+(stopped). New dependency: `numpy>=1.24` via `uv add` (already in the lock through faster-whisper; Windows wheels).
+
+### What I built
+- **Source context** (`stages/source_info.py`, new): `SourceInfo` in `source_info.json` + `Job.source_info`
+  pointer. URL jobs: yt-dlp `extract_info(download=True)` at ingest (`ingest(..., on_info=)`; fakes without
+  `extract_info` keep the plain `download`): title, uploader/channel, description excerpt (<= 1000,
+  `context.description_chars`), tags (<= 30), categories, duration, upload date, URL. Uploads/files: file
+  name. User notes: web `options.notes` (<= 1000, 422 on control chars), CLI `run --notes`, `context --notes`.
+  Old jobs: backfilled from the source string on the next ingest skip (no network); `autoclipper context JOB
+  --fetch` re-fetches page info without downloading. Prompt safety: control/bidi chars and `<`/`>` removed,
+  lengths capped, JSON inside `<source_context>`, notes in `<user_notes>`, system prompt says untrusted /
+  never follow instructions. `CONTEXT_RULES`: say what it really is, never present game footage as
+  real-life/news/crime/movie, no invented events, relevant hashtags. Deterministic post-checks
+  (`script.apply_source`): credit line `Original video by <creator>: <url>` when missing
+  (`context.credit_source`), and for game footage drop `#realcrime/#truecrime/#bodycam/#moviescene/#news/#gymtok`-type tags.
+- **Signals** (`stages/signals.py`, new; job stage `signals` between transcribe and moments; `signals.json`
+  cached with source/audio stamps + analysis params): numpy loudness and sudden jumps from `audio.wav`; one
+  FFmpeg decode at 96x54 grey, 4 fps for motion, scene cuts (histogram+pixel change that stands out locally),
+  static (motion < 2 % for >= 2 s) and menu-like (flat picture >= 60 % for >= 2 s: maps, menus, pause blur,
+  fades - calibrated on Nemsk: map ~0.65, gameplay 0.2-0.4). Skipped when moments.json exists; a failure marks
+  the stage skipped with a WARNING and moments fall back to the transcript. `autoclipper signals JOB` prints it.
+- **Moments** (`stages/moments.py`): `plan_moments`: speech coverage (word spans, each word <= 1 s: Whisper
+  stretched "anything?" over 43 s in Nemsk) >= `signals.speech_rich_coverage` (0.4) -> transcript-only prompt
+  as before; below -> `<signals>` per-window table (`[a-b] loud R jump dB cuts N motion R speech % STATIC|MENU`)
+  + 50 % extra candidates + low-speech system prompt (no sentence boundaries needed; do not invent events the
+  picker cannot see). Validation: sentence boundary first (5 s, 2.5 s in low speech), else scene cut (start on
+  it, end 0.25 s before) or quiet point within 3 s; static/menu >= 50 % with < 50 % speech rejected (logged);
+  low speech: static ends trimmed, partly static ranked down. Empty transcript allowed in low-speech mode.
+- LLM (`llm.py`): `pick_moments(..., context, signals, speech_coverage)`, `write_script(..., context)`,
+  `write_publish_metadata(..., context)`; new args go through `stages/_optional.call_with_optional` (only to
+  callables that declare them by name, so older fakes / `**kwargs` proxies keep working). Without context
+  the prompts are unchanged.
+- Settings: `signals.*` (enabled, video, sample_fps, sample_width, window_seconds, speech_rich_coverage,
+  static_motion, menu_flatness, reject_static_fraction, cut_threshold, timeout_seconds) and `context.*`
+  (enabled, credit_source, description_chars), all bounded -> 422 via PUT /api/settings.
+- Web: `options.notes`, detail `source_info`, `signals` stage (older jobs: "skipped / not used (older job)"),
+  New job "Context / notes" textarea, job page Video/notes rows, settings labels. `_job_complete` treats a
+  missing `signals` state as finished (`jobstore.OPTIONAL_JOB_STAGES`). CONTRACT.md / CONTRACT_WEB.md section 14.
+- Shared-file edits: `tests/test_web_jobs.py::test_job_detail_structure` key set (+ `source_info`), README.
+
+### Tests
+- New: `tests/test_smart_moments.py` (signals on synthetic lavfi media: tone bursts, `life` patterns with hard
+  cuts, a static flat frame; cache/staleness; speech coverage; window table; boundary fallback; static
+  rejection/trim/down-rank; low-speech vs speech-rich prompts; old LLM signature; source info cleaning,
+  delimiters, injection escape; credit + hashtag checks; pipeline stage, failure, off, old job) and
+  `tests/test_smart_moments_api.py` (POST /api/jobs notes: 201 + side effects, 422 x6, boundaries, 401/403,
+  404, idempotency 409; detail contract; settings 200 persisted / 422 x16 unchanged file / 401/403; ingest
+  on_info; URL job with fake yt-dlp; CLI notes/context/fetch/signals).
+- Full suite: **1808 passed, 3 deselected** (8 min). Run 1 had 6 failures from `**kwargs` proxies, the detail key set
+  and a second request-thread job.json save -> fixed: optional args only to named params; `submit_job` writes
+  source_info.json without re-saving job.json, the pointer is set at ingest.
+
+### Real verification (`AUTOCLIPPER_DATA_DIR=~/.cache/ac-moments/data-builder`, copies of 3 jobs + settings.json)
+Driver `~/.cache/ac-moments/scratch/verify_run.py` runs only ingest-skip -> signals -> moments -> script on a
+copy (real Claude, en; scripts in `verify-<tag>/`). Page info via `autoclipper context JOB --fetch`.
+- Signals time: Nemsk 35 min AV1 1080p30 72 s alone / 100 s with the test suite running; Nolan 21 min AV1
+  1080p60 103 s alone / 126 s loaded; Reagan 0.4 s. LLM: moments 5-12 s, 5-6 scripts 20-29 s.
+- Nemsk (coverage 1 %, low-speech path): old picks 2 good + map/walking/cutscene/outro, titles "#movieclips
+  #thriller", "#gymtok", "#crimescene #streetfootage". New: 6 bank-heist gameplay moments (frames checked,
+  `~/.cache/ac-moments/showcase/nemsk_{new,old}_NN_mid.jpg`), all titles say GTA 6, hashtags #GTA6/#Nemsk/
+  #BankHeist, every description credits Nemsk + URL. First run invented "police chase/sirens" from loudness
+  -> added the "do not invent events you cannot see" rule; second run honest but more generic.
+- Nolan (63 %, speech-rich path, transcript-only as before): same story beats (muscle car backstory, dad
+  roast, $10K vs $100K, NPC bank robbery, last-second steal); old `#gta5` gone, credit to MrBeast Gaming.
+  Note: one title says "MrBeast roasts Nolan" (uploader name taken as the speaker) - unverified.
+- Reagan (66 %, file source, no creator): the same two moments (closing start moved 231.9 -> 211.1 s),
+  titles/tags equivalent, no credit line (nothing to credit). Static talking head kept (speech guard).
+
+### Notes for the lead
+- The LLM cannot see frames: low-speech hooks/titles are generic by design now. A real fix is sending a few
+  keyframes per candidate to Claude (vision) - follow-up.
+- Signals runtime is decode-bound (AV1 dav1d ~8 cores); under load Nolan 60 fps took 126 s (> 2 min target).
+- Window table moments tend to land on 10 s window edges; snapping only moves them to a cut/quiet point
+  within 3 s.
+
+## Reviewer (team S: code + safety), 2026-11-24
+
+Reviewed the uncommitted diff on `feat/smart-moments` (source_info, signals, moments, script, llm, pipeline,
+ingest, CLI, web server/worker/frontend, config). New tests: 81 passed (`test_smart_moments*.py`). Findings
+(each reproduced with a small probe script, not by reading alone):
+
+1. MEDIUM - static/menu post-filter can fail a speech-rich job that worked before. The rejection runs for
+   speech-rich videos too, and when every LLM pick is rejected `run_moments` raises MomentsError (job fails).
+   Probe: slideshow/screen recording, coverage 45% (speech-rich), all seconds static, 40% speech per moment
+   -> 3 of 3 picks rejected, `kept []`. Before this branch the job produced clips. Speech-rich videos also
+   ask for exactly `count` candidates, so any rejection there means fewer clips. Fix: only reject on the
+   low-speech path (or never let the filter empty the list: keep the best rejected ones as a fallback).
+2. MEDIUM (privacy) - the source URL is copied verbatim into the LLM prompt and into every published
+   description's credit line. For a direct-file URL job (yt-dlp Generic extractor), a signed URL such as
+   `...v.mp4?X-Amz-Signature=...&X-Amz-Credential=...` becomes "Original video by <signed URL>" in the
+   public description. Fix: credit only extractor page URLs (not Generic), or strip query/userinfo for
+   Generic sources.
+3. LOW - memory: `_frames` keeps every sampled frame in RAM. Defaults are fine (35 min ~ 45 MB), but the
+   allowed maximums (10 fps, 320 px wide) need ~4 GB for a 2 h video. Cap fps x width x duration, or
+   compute features streaming per chunk.
+4. LOW - `autoclipper signals JOB` takes no job lock and does not catch SignalsError (generic CLI error
+   path); running it during a job runs a second full decode. `context` does take the lock.
+5. LOW - Hindi credit line reads "मूल वीडियो: <creator>: <url>" (two colons).
+6. LOW - `_CONTROL` in source_info misses C1 controls (U+0080-009F), U+2028/2029 and U+FEFF; harmless
+   inside the JSON block but worth adding.
+
+Checked and fine: angle brackets removed so page text cannot close `<source_context>`/`<user_notes>`; length
+caps on every field; frontend renders source_info via textContent only; signals failure (any exception,
+timeout) degrades to transcript-only with a warning and `skipped` state; staleness keyed on source/audio
+name+size+mtime and analysis params; settings out of range -> 422 (tested); notes 422/401/403/404/idempotency
+tested; Windows: binary pipes, utf-8 writes, path split on both separators.
+
+## Reviewer (output quality, team S: smart moments + video context), 2026-11-24
+
+Own copies in `~/.cache/ac-moments/data-reviewer` (Nemsk, Nolan; builder's signals.json/source_info.json reused).
+2 real runs: Nemsk 6 moments + Hindi metadata (`verify-r1`), Nolan moments only (`verify-r1`). Frames/contact
+sheets in `~/.cache/ac-moments/review/`. New test files: 81 passed. Nothing committed; live app/Voicebox untouched.
+
+### Verdict: CHANGES REQUESTED (metadata honesty: big win; low-speech picking: better, but map screens leak in)
+- **Better than before.** Old Nemsk picks: 2 good + gym/cutscene/map/outro with `#gymtok #crimescene` (Hindi was
+  worse: `#मूवीसीन #क्राइमसीन #जिम`). New: 4-5 of 6 are real heist gameplay; every EN/HI title says GTA 6; creator +
+  URL credited. Nolan and Reagan: no meaningful regression.
+- **[High] Map screens are not detected and are rewarded as "hits".** In GTA 6 the map/planning screen mutes the
+  game audio. 18 of the 20 biggest `onset_db` jumps in Nemsk follow < -55 dB silence (seconds 49, 78, 640, 642,
+  729, 912, 1087, 1374-78, 1577-78, 1593, 1763). I checked frames at 45/76/909/1085/1372/1575/639: all are map
+  screens, and **none** is flagged `menu` (flatness 0.11-0.58 < 0.6, motion 0.13-0.45 because the map pans). Results:
+  - pick 3 (1520-1580, v2) ends with 1571-1572 blur + **~7 s of map**; its hook "Goes Loud... Then Dead Silent" and
+    the reason's "36 dB hit at the payoff" describe the map opening and its UI clicks (1577-1578).
+  - 615-660 (v1 "Ends With a Massive Bang", r1 "Sudden massive hit", Hindi "अचानक लगा बड़ा झटका") is walking out,
+    getting into a car, **a map at ~637-641**, then driving. Its "46 dB jump" (642) is just the game audio coming back.
+  Fix: measure jumps against a floor (e.g. `max(prev, median-10 dB)`), so a rise out of silence is not a hit. Flag
+  near-silent runs >= 2 s with no speech as avoid/MENU (14 runs in Nemsk, which line up with the maps). Let
+  `_trim_avoided_edges` drop them.
+- **[Medium] Hindi credit duplicated.** In r1 clip 0, Claude wrote `ओरिजिनल वीडियो नेम्स्क का: <url>` (creator name in
+  Devanagari). `apply_source_credit` needs the Latin "Nemsk", so it added a second line, `मूल वीडियो: Nemsk: <url>`.
+  Fix: treat it as credited when the URL is there, or ask for the creator name in its original spelling.
+- **[Medium] The misleading-hashtag filter is Latin-only.** The old Hindi tags `#मूवीसीन #क्राइमसीन #फिल्मीदुनिया`
+  would get through today. Add Devanagari equivalents or a transliteration list. Some Hindi sets (r1 clips 0 and 5)
+  have no Latin `#GTA6` at all, which hurts discovery: add the Latin game tag when the source is a game.
+- **[Low] Boundaries stay on the 10 s grid.** In v2, 11 of 12 boundaries are multiples of 10; only 1289.25 moved.
+  Clips start or end mid-drive (1880-1940 ends after about 20 s of plain driving). Consider a finer table
+  (5 s) or snapping to the best cut/quiet point within the window instead of within 3 s.
+- **[Low] Hooks describe signal metrics.** For example "The loudest, fastest stretch", "Full-volume action", and
+  reasons such as "motion 9". These are honest but generic. As the builder said, the real fix is a few frames per
+  candidate (vision), a follow-up.
+- **Nolan.** Both new runs (v1 and r1) dropped the old #0 premise clip (0-38 "Whatever car Nolan steals... I will
+  buy his father"). r1 put the premise in the hook text of 55-112, but that clip doesn't contain the line. The rest
+  is equal or better (old `#gta5` and `#funny/#roleplay` tags are gone). "MrBeast Roasts Nolan" is plausible: Nolan
+  says "Jimmy, I'm so nervous" just before the roleplay.
+- **Reagan.** The same 2 moments; the closing clip now starts at 211.1 s ("Here's a coincidence today"), which is
+  better.
+- **Runtime.** 72-126 s, as the builder reported; the target is borderline met.
+
+## Lead (team S: triage, fixes, sign-off), 2026-11-24
+
+Own data dir `~/.cache/ac-moments/data-lead` (copy of Nemsk + builder's fetched `source_info.json` + settings copy).
+Two real Claude runs on Nemsk (`verify-lead1`, `verify-lead2`, 6 moments, en + hi). Live app, its data and
+Voicebox untouched; no test server started.
+
+### Code review findings
+1. MEDIUM static filter fails speech-rich jobs -> **accepted, both fixes**: rejection, trimming and down-ranking
+   now run on the low-speech path only (speech-rich videos keep every pick exactly as before), and the filter
+   never empties the list (best rejected picks are kept, logged "kept, nothing better"). The old test that
+   expected MomentsError was turned into the opposite regression test; reviewer's slideshow probe is a test.
+2. MEDIUM signed URL leaks into prompt/descriptions -> **accepted**: `_clean_url` always drops `user:pass@`; for
+   anything but a site extractor's canonical page URL (Generic extractor, no extractor, `from_source` backfill)
+   query and fragment are dropped, only a short `v=` id is kept. Test with the reviewer's S3 URL.
+3. LOW memory at max settings -> **accepted (streaming)**: `_scan_frames` feeds 64-frame chunks into
+   `_FrameStats` (change share, histogram distance, flatness); frames are never all in memory. Nemsk
+   signals.json before/after: cuts, motion and flatness identical; 82 s with the full suite running.
+4. LOW `signals` CLI without lock / SignalsError -> **accepted**: holds the job lock (JobLocked -> exit 1),
+   SignalsError -> "could not compute the signals: ...". Test.
+5. LOW Hindi double colon -> **accepted**: `मूल वीडियो: <creator> - <url>`.
+6. LOW `_CONTROL` gaps -> **accepted**: C1, U+2028/2029, U+FEFF added (escaped, no literal invisible chars).
+
+### Output-quality findings
+1. HIGH map screens counted as hits -> **accepted, both parts**. (a) jumps measured from
+   `max(median of the 3 s before, video median - 10 dB)`: Nemsk's top jumps were the map closing (642 s: 45.6 dB,
+   1377: 45.4, 912: 39.9); now the top is 27.4 at 18 s and the map returns are 8-15. (b) `silent_seconds`:
+   below min(-50, median - 20) dBFS, >= 2 s, no speech, click-only gaps <= 3 s bridged, 1 s padding; part of
+   `avoid` (computed at read time, no extra file field), `SILENT` in the table + legend + prompt. Plus a
+   **split**: an avoid run >= 3 s INSIDE a low-speech moment splits it, the longest part >= min is kept and
+   ranked down by the cut share (608-662 with the map at 637-641 -> 608-637). `SIGNALS_VERSION` 2 (old files
+   recompute once). Speech-rich Nolan/Reagan unaffected (offline check: validate with signals == without).
+2. MEDIUM Hindi credit duplicated -> **accepted**: a description containing the source URL counts as credited;
+   without a URL the creator name must be there.
+3. MEDIUM hashtag filter Latin-only -> **accepted**: Devanagari forms (मूवी, फिल्म/फ़िल्म, क्राइमसीन, न्यूज/न्यूज़,
+   समाचार, सीसीटीवी, बॉडीकैम, ...; `#जिम` only as a whole tag since `जिम्मेदारी` starts the same) after NFC; Latin
+   `crimescene`/`streetfootage` added. `ensure_game_hashtag`: the game named in the page title (else tags) gets
+   its Latin tag (#GTA6, #GTA5, #Minecraft, ...) first if missing, list capped at 8. Description not used
+   (Nolan's mentions Minecraft).
+4. LOW 10 s grid boundaries -> **partly accepted**: low-speech fallback snapping to a cut/quiet point now within
+   5 s (speech-rich stays 3 s). A finer table is not worth the prompt size; the driving tails need vision.
+5. LOW hooks quote signal numbers -> **accepted as prompt rule** ("never quote the table in the hook");
+   reasons may still cite them (internal). Real fix = keyframes to Claude (follow-up).
+- Nolan premise clip dropped / hook mentioning a line outside the clip -> **not changed**: LLM variance on the
+  unchanged speech-rich path; listed as remaining.
+
+### Final Nemsk run (`verify-lead2`; frames + table in `~/.cache/ac-moments/showcase/SUMMARY.md`, `showcase/lead/`)
+0-29 intro montage + bank (good), 1885-1945 bank then ~25 s driving, 398-458 mostly driving (weak),
+1018-1073.25 Fleeca robbery (good), 1513.5-1572.75 robbery, ends before the map (good), 1289.25-1318 LOMBANK
+hold-up (good). No map screen in any pick (12-frame sheets checked). All 12 titles say GTA 6, every
+description has exactly one credit with the URL, every EN/HI hashtag set has #GTA6, no misleading tags.
+Hooks no longer quote numbers. Signals 82 s; moments LLM 16 s.
+
+### Tests
+Full suite (keys unset): **1821 passed, 3 deselected** (8m24s). New/changed smart-moments tests: 94.
+
+### Sign-off: APPROVED, committed on `feat/smart-moments` (not pushed)
+
+### Remaining
+- The picker cannot tell driving from action (both loud + moving): 1-2 of 6 Nemsk clips have long driving
+  stretches. Follow-up: keyframes per candidate to Claude (vision).
+- Nolan: premise clip (0-38 s) not always picked; LLM variance. Signals runtime near the 2 min target on 60 fps AV1.
+- Windows CI not run locally.

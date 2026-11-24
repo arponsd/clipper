@@ -220,8 +220,10 @@ It exits with code 1 if anything required is missing. HyperFrames and Demucs row
 ## CLI usage
 
 ```bash
-uv run autoclipper run <file-or-url> [--clips N] [--min S] [--max S] [--langs en,hi] [--job ID] [--no-voiceover | --voiceover]
+uv run autoclipper run <file-or-url> [--clips N] [--min S] [--max S] [--langs en,hi] [--job ID] [--no-voiceover | --voiceover] [--notes TEXT]
 uv run autoclipper rerender <job_id> <clip> <lang>
+uv run autoclipper context <job_id> [--notes TEXT | --clear-notes] [--fetch]
+uv run autoclipper signals <job_id> [--no-table]
 uv run autoclipper status <job_id>
 uv run autoclipper jobs
 uv run autoclipper profiles
@@ -258,7 +260,7 @@ Progress lines look like `[<job_id>] <stage> <clip>/<lang> <pct>% <message>`, fo
 
 **Re-runs are idempotent.** A stage is skipped when its output file exists and is not empty. When a stage is regenerated, every stage after it in that clip and language runs again.
 
-**Failures are isolated.** If one clip fails in one language (for example a Voicebox error), the error is recorded in `job.json` and every other clip keeps going. The job fails only if a job-level stage fails (ingest, transcribe, moments, or every cut), or if every clip-language fails.
+**Failures are isolated.** If one clip fails in one language (for example a Voicebox error), the error is recorded in `job.json` and every other clip keeps going. The job fails only if a job-level stage fails (ingest, transcribe, moments, or every cut), or if every clip-language fails. A failed **signals** stage never fails the job.
 
 **Rerender** uses the saved `script.json`, which you may have edited. The voice is regenerated only when the narration text changed: the sha256 of the narration is compared with `narration_hash` in `voice.json`. Captions, `final.mp4` and `metadata.json` are always rebuilt. If the voice stage had to shorten the narration to fit the clip, the shortened text is written back to `script.json`, so the captions always match the audio.
 
@@ -284,6 +286,103 @@ With the voice-over off, for every clip and language:
 - **Publishing:** unchanged; the title, description and hashtags come from `metadata.json`.
 
 Each job keeps the mode it was created with (the setting at that moment, or `--no-voiceover` / `--voiceover` / the New job checkbox), so changing the setting later only affects new jobs; jobs made before this option existed are voice-over jobs. To switch an existing job, use `run --job ID --no-voiceover` (or `--voiceover`), or on the job page pick **Mode: Voice-over + captions / Original audio + captions** and press **Apply & re-render** (this queues a run of the job that re-renders every clip made in the other mode; on an unfinished job it also runs the remaining steps, i.e. scripts, voices and renders, and the confirm dialog says so). Switching the mode makes the affected stages stale: a resume or a re-render redoes the captions and the render (and, when turning the voice-over on, writes a narration for a script that has none, keeping your title, and makes the voice). An earlier voice-over take is kept on disk, so switching back does not regenerate it.
+
+### Video context for titles and descriptions
+
+Claude only hears the transcript, so a quiet gameplay video once came back as "movie scene", "#gymtok" or
+"real crime footage". Every job now keeps what is known about its source in `source_info.json` (job.json
+points at it with `"source_info"`):
+
+- **URL jobs:** from yt-dlp at download time: page title, uploader/channel, the first 1000 characters of
+  the description (`context.description_chars`), tags, categories, duration, upload date, page URL.
+- **Uploads / local files:** the file name.
+- **Your notes:** the **Context / notes** box on the web New job form, or `run --notes "..."` (at most 1000
+  characters), e.g. `GTA 6 gameplay by Nemsk`.
+
+The moment picker and the script/metadata writer (title, description, hashtags, hook) get this as a
+delimited block. Page text is treated as **untrusted data**: control characters and angle brackets are
+removed, lengths are capped, it sits inside `<source_context>` and Claude is told never to follow
+instructions in it. Claude is told to say what the content really is (e.g. GTA 6 gameplay), never to
+present game footage as real-life events, news, crime footage or a movie scene, not to claim events nothing
+supports, and to keep hashtags relevant. Two checks run after Claude answers:
+
+- with `context.credit_source` on (default), a description that does not contain the source URL gets a line
+  `Original video by <creator>: <url>` (Hindi: `मूल वीडियो: <creator> - <url>`); a description with the URL
+  counts as credited, since Claude may write the creator's name in Devanagari. Without a URL the creator's
+  name must be in it;
+- for video game footage (category Gaming, or a game in the title/tags/notes), hashtags such as
+  `#realcrime`, `#truecrime`, `#bodycam`, `#crimescene`, `#moviescene`, `#news` or `#gymtok` are dropped,
+  and their Hindi forms too (`#मूवीसीन`, `#क्राइमसीन`, `#फिल्मीदुनिया`, `#न्यूज़`, `#जिम`, ...). When the page
+  title (or its tags) names a known game, its Latin hashtag (`#GTA6`, `#Minecraft`, ...) is added first if
+  missing, also in Hindi sets, so people searching for the game find the clip.
+
+**Privacy of the source URL.** The URL goes into the prompt and into every published description, so it is
+cleaned first: login details (`user:pass@`) are always removed, and for anything but a site's canonical page
+URL (yt-dlp's Generic extractor: a direct file link or an unknown page, or a job made before this feature)
+the query string and fragment are dropped too (signed links such as `?X-Amz-Signature=...` never leak); only
+a video id `v=` is kept.
+
+Jobs made before this have no `source_info.json` and simply run without context (a local file name is
+filled in on the next resume). To add context to such a job:
+
+```bash
+uv run autoclipper context <job_id> --fetch                          # page info of a URL job (no video download)
+uv run autoclipper context <job_id> --notes "GTA 6 gameplay by Nemsk"
+```
+
+Moments and scripts already written keep their text: delete `moments.json` (re-pick) or a clip's
+`script.json` (rewrite) and resume the job to use the new context.
+
+### Moment picking for low-speech videos
+
+Moments used to come from the transcript only, so gameplay with little talk gave weak clips (map screens,
+cutscene lines, walking). A new job stage, **signals** (between transcribe and moments), measures cheap
+local signals once and caches them in `signals.json`:
+
+- **audio** (numpy on `audio.wav`): loudness per second and the biggest sudden jump per second (gunshots,
+  crashes, sirens, music hits). A jump is measured from at least 10 dB under the video's median loudness,
+  so sound coming back after silence (closing a GTA map) is not a "hit". **Silent** seconds (below
+  min(-50 dBFS, median - 20 dB), at least 2 s, no speech; short click-only gaps bridged, one second added on
+  each side) are treated like static/menu screens: in games the map, menu and loading screens mute the sound
+  while the picture may still pan;
+- **picture** (one FFmpeg decode at 96x54 grey, 4 frames per second): motion, scene cuts, **static**
+  seconds (almost nothing moves for 2 s or more) and **menu-like** seconds (a flat, texture-less picture
+  for 2 s or more: maps, menus, pause blurs, fades).
+
+The frames are analysed in small chunks as FFmpeg streams them, so memory stays small at any length or
+`sample_fps`/`sample_width`. `signals.json` is reused until the source, `audio.wav`, a `signals.*` analysis
+setting or the file format version changes. On this
+machine it takes about 70-100 s for a 35-minute 1080p AV1 video (decoding dominates); turn
+`signals.video` off for loudness only (a second or two).
+
+How the moments are picked then depends on how much of the video has speech (word timings, a word counts
+at most 1 s):
+
+- **Speech-rich** (at least `signals.speech_rich_coverage`, 40 %): exactly as before, from the transcript.
+- **Low speech:** Claude also gets a compact table, one line per 10 s window (`signals.window_seconds`,
+  widened for very long videos so the table never has more than 360 lines), for example
+  `[1880-1890] loud 9 jump 17 cuts 1 motion 8 speech 0%` or `[1750-1760] ... MENU` (also `STATIC`,
+  `SILENT`), is told to pick action peaks and avoid static/menu/silent windows and long quiet stretches, may cut moments that do not start or end on
+  a sentence, and is asked for 50 % more candidates than needed.
+
+After Claude answers:
+
+- in every video, a moment start/end with no sentence boundary nearby snaps to a **scene cut** (start on the
+  cut, end 0.25 s before it) or a **quiet point** within 3 s (5 s in a low-speech video, whose picks land on
+  the table's window grid); sentence boundaries still win (within 5 s, or 2.5 s in a low-speech video);
+- low-speech videos only (speech-rich videos keep every pick, exactly as before):
+  - a static/menu/silent stretch without speech at either end is trimmed off (if the moment stays long
+    enough); one of 3 s or more in the middle splits the moment, and the longest part that is still long
+    enough is kept, ranked down by the share that was cut;
+  - a moment that is static/menu/silent for at least `signals.reject_static_fraction` (50 %) of its length
+    **and** mostly without speech is dropped; a partly static one is ranked down by its static share;
+  - the filter never empties the list: if every pick would be dropped, the best of them are kept (logged),
+    so a job never fails because of it.
+
+`uv run autoclipper signals <job_id>` computes (or shows) a job's signals and prints the table Claude gets
+(it takes the job lock, so it refuses to run next to a running job).
+If the signals fail (e.g. an unreadable video stream), the stage is marked skipped with a warning and the
+moments come from the transcript as before. Captions of non-speech stretches are naturally sparse.
 
 ### Audio mix (voice-over)
 
@@ -591,6 +690,8 @@ data/
     source.mp4                      copied or downloaded source
     audio.wav                       16 kHz mono for ASR
     transcript.json                 segments + word timestamps
+    source_info.json                source context: page title, creator, description excerpt, tags, your notes
+    signals.json                    per-second loudness, sudden jumps, motion, static/menu flags, scene cuts
     moments.json                    chosen moments (start, end, hook, reason, score)
     clips/00/
       cut.mp4                       1080x1920 cut with original audio
@@ -652,6 +753,19 @@ Change settings with `autoclipper settings set key.path=value`. The value is par
 | `clips.min_seconds` / `clips.max_seconds` | `20` / `60` | Clip length bounds |
 | `clips.width` / `clips.height` | `1080` / `1920` | Output size (240-3840, even numbers) |
 | `clips.reframe` | `crop` | `crop` = center crop; `blur` = whole frame over a blurred fill |
+| `signals.enabled` | `true` | Measure audio/video signals for moment picking (see [Moment picking for low-speech videos](#moment-picking-for-low-speech-videos)) |
+| `signals.video` | `true` | Also analyse the picture (scene cuts, motion, static/menu screens); `false` = loudness only |
+| `signals.sample_fps` / `signals.sample_width` | `4` / `96` | Frames per second (0.5-10) and frame width in px (32-320) of the picture analysis |
+| `signals.window_seconds` | `10` | One line per window in the table Claude gets (5-30) |
+| `signals.speech_rich_coverage` | `0.4` | Share of the video with speech from which moments come from the transcript alone (0-1) |
+| `signals.static_motion` | `0.02` | Share of changed pixels under which a second is static (0-0.5) |
+| `signals.menu_flatness` | `0.6` | Share of flat picture from which a second is menu/map-like (0.2-1) |
+| `signals.reject_static_fraction` | `0.5` | Low-speech videos: a moment static/menu/silent for this share, mostly without speech, is dropped (0.1-1) |
+| `signals.cut_threshold` | `0.35` | Picture change score for a scene cut (0.05-1; lower = more cuts) |
+| `signals.timeout_seconds` | `900` | Longer signal runs are given up (moments from the transcript only) |
+| `context.enabled` | `true` | Give Claude the video's page info and your notes (see [Video context](#video-context-for-titles-and-descriptions)) |
+| `context.credit_source` | `true` | Make every description credit the original creator and link the source |
+| `context.description_chars` | `1000` | Characters of the page description kept (0-1000) |
 | `audio.mix` | `loudness` | `loudness` = measured levels (see [Audio mix](#audio-mix-voice-over)); `gain` = the old fixed factors |
 | `audio.voice_lufs` | `-16` | Loudness mix: voice level before the final loudnorm (-30 to -8 LUFS) |
 | `audio.background_db_below_voice` | `18` | Loudness mix: background level under the narration, in dB below the voice (0-40) |

@@ -1,6 +1,6 @@
 """Pipeline orchestrator: source video -> per-clip, per-language finished shorts.
 
-Job stages (once per job):      ingest -> transcribe -> moments -> cut
+Job stages (once per job):      ingest -> transcribe -> signals -> moments -> cut
 Clip stages (per clip x lang):  script -> voice -> captions -> render (+ metadata)
 
 Progress lives in data/jobs/<id>/job.json through JobStore, so a later web UI can read it while a
@@ -25,7 +25,7 @@ from pydantic import ValidationError
 
 from .config import Settings, load_settings
 from .interfaces import LLM, LogFn, ProgressFn, Transcriber, VoiceboxAPI
-from .jobstore import CLIP_STAGES, JOB_STAGES, JobStore
+from .jobstore import CLIP_STAGES, JOB_STAGES, OPTIONAL_JOB_STAGES, JobStore
 from .models import ClipLangState, ClipScript, ClipState, Moment, StageState, Transcript
 
 SUPPORTED_LANGS = ("en", "hi")
@@ -348,18 +348,90 @@ class _Reporter:
 # ---------------------------------------------------------------------------------------------
 # job-level stages
 # ---------------------------------------------------------------------------------------------
-def _job_stage_ingest(store: JobStore, rep: _Reporter) -> Path:
+def _record_source_info(store: JobStore, log: LogFn, settings: Settings | None = None,
+                        info: dict | None = None) -> None:
+    """source_info.json: the yt-dlp page info of a fresh download (``info``), else what the source string
+    tells (backfill for older jobs, no network). The user's notes are kept. job.json points at the file."""
+    from .stages import source_info as si
+
+    try:
+        if info is not None:
+            chars = settings.context.description_chars if settings is not None else si.DESCRIPTION_MAX
+            fresh = si.from_ytdlp(info, store.job.source, description_chars=chars)
+            si.write_source_info(store.dir, si.merge(si.read_source_info(store.dir), fresh))
+        else:
+            si.ensure_source_info(store.dir, store.job.source)
+    except (OSError, ValueError) as e:  # the context is optional: never fail the job for it
+        log(f"[{store.job.id}] warning: could not write {si.SOURCE_INFO_FILE}: {_error_text(e)}")
+        return
+    if store.job.source_info != si.SOURCE_INFO_FILE:
+        store.job.source_info = si.SOURCE_INFO_FILE
+        store.save()
+
+
+def _job_stage_ingest(store: JobStore, rep: _Reporter, settings: Settings | None = None) -> Path:
     from .stages.ingest import extract_audio_for_asr, find_source, ingest
 
     existing = find_source(store.dir)
     if existing is not None and output_exists(existing) and output_exists(store.dir / "audio.wav"):
+        _record_source_info(store, rep.log, settings)
         rep.skip("ingest", message=existing.name)
         return existing
     rep.start("ingest", message=store.job.source)
-    src = ingest(store.job.source, store.dir, on_progress=rep.progress("ingest"))
+    got: dict = {}
+    src = ingest(store.job.source, store.dir, on_progress=rep.progress("ingest"), on_info=got.update)
+    _record_source_info(store, rep.log, settings, got or None)
     extract_audio_for_asr(src, store.dir)
     rep.done("ingest", message=src.name)
     return src
+
+
+def job_source_info(store: JobStore, settings: Settings):
+    """The job's SourceInfo for the LLM calls, or None (context turned off, or no source_info.json)."""
+    if not settings.context.enabled:
+        return None
+    from .stages.source_info import read_source_info
+
+    return read_source_info(store.dir)
+
+
+def _job_stage_signals(store: JobStore, rep: _Reporter, settings: Settings, source: Path):
+    """Compute (or reuse) signals.json. Only needed while moments are still to be picked; a failure never
+    fails the job (moments are then picked from the transcript only). Returns Signals or None."""
+    out = store.dir / "moments.json"
+    if not settings.signals.enabled:
+        rep.skip("signals", message="turned off in settings (signals.enabled)")
+        return None
+    if output_exists(out):
+        rep.skip("signals", message="moments already picked")
+        return None
+    from .stages.signals import SignalsError, compute_signals, signals_current
+
+    sig_path = store.dir / "signals.json"
+    audio = store.dir / "audio.wav"
+    cached = signals_current(sig_path, source, audio if audio.is_file() else None, settings.signals)
+    if cached is not None:
+        rep.skip("signals", message="signals.json")
+        return cached
+    rep.start("signals", message="loudness" + (", scene cuts, motion" if settings.signals.video else ""))
+    try:
+        sig = compute_signals(source, sig_path, settings.signals, audio=audio,
+                              on_progress=rep.progress("signals"))
+    except (SignalsError, OSError, ValueError) as e:
+        msg = f"unavailable ({_error_text(e).splitlines()[0][:200]}); moments from the transcript only"
+        rep.line("signals", 1.0, "WARNING " + msg)
+        store.set_stage("signals", "skipped", 1.0, msg)
+        return None
+    except Exception as e:  # noqa: BLE001 - e.g. FFmpegError: the signals are optional
+        msg = f"unavailable ({_error_text(e).splitlines()[0][:200]}); moments from the transcript only"
+        rep.line("signals", 1.0, "WARNING " + msg)
+        store.set_stage("signals", "skipped", 1.0, msg)
+        return None
+    statics = sum(sig.static or []) + sum(sig.menu or [])
+    rep.done("signals", message=f"{sig.compute_seconds:.0f}s: {len(sig.cuts)} scene cuts, "
+                                f"{statics} static/menu seconds" if sig.has_video
+             else f"{sig.compute_seconds:.0f}s: audio only")
+    return sig
 
 
 def _job_stage_transcribe(store: JobStore, rep: _Reporter, settings: Settings, deps: _LazyDeps) -> Transcript:
@@ -384,7 +456,7 @@ def _job_stage_transcribe(store: JobStore, rep: _Reporter, settings: Settings, d
 
 
 def _job_stage_moments(store: JobStore, rep: _Reporter, settings: Settings, deps: _LazyDeps,
-                       transcript: Transcript) -> tuple[list[Moment], bool]:
+                       transcript: Transcript, signals: Any = None) -> tuple[list[Moment], bool]:
     """Returns (moments, fresh): fresh is True when moments were (re)generated in this run."""
     out = store.dir / "moments.json"
     fresh = False
@@ -401,10 +473,17 @@ def _job_stage_moments(store: JobStore, rep: _Reporter, settings: Settings, deps
         else:
             rep.skip("moments", message=f"{len(moments)} moments in moments.json")
     if moments is None:
-        from .stages.moments import run_moments
+        from .stages.moments import plan_moments, run_moments
+        from .stages.source_info import context_for_prompt
 
-        rep.start("moments", message=f"asking {settings.llm.model} for {settings.clips.count} moments")
-        moments = run_moments(transcript, deps.llm, settings.clips, out)
+        plan = plan_moments(transcript, settings.clips, signals, settings.signals)
+        how = (f"; low speech ({plan.signals.coverage:.0%}): using audio/video signals"
+               if plan.low_speech and plan.signals is not None else "")
+        rep.start("moments", message=f"asking {settings.llm.model} for {settings.clips.count} moments{how}")
+        context = context_for_prompt(job_source_info(store, settings))
+        moments = run_moments(transcript, deps.llm, settings.clips, out, signals=signals,
+                              signal_settings=settings.signals if signals is not None else None, context=context,
+                              log=lambda line: rep.line("moments", 0.9, line))
         fresh = True
         rep.done("moments", message=f"{len(moments)} moments")
     if not moments:
@@ -780,7 +859,8 @@ def _add_narration(store: JobStore, rep: _Reporter, settings: Settings, deps: _L
 
     rep.start("script", clip.index, lang, "writing the narration (voice-over turned on)")
     script = add_narration(llm=deps.llm, transcript=transcript, moment=clip.moment, lang=lang, script=script,
-                           out_json=script_path, script_settings=settings.script)
+                           out_json=script_path, script_settings=settings.script,
+                           source=job_source_info(store, settings))
     rep.done("script", clip.index, lang, "narration written; title kept")
     return script
 
@@ -810,13 +890,15 @@ def _process_clip_lang(store: JobStore, rep: _Reporter, settings: Settings, deps
         elif vo:
             rep.start("script", clip.index, lang, f"{clip.moment.duration:.1f}s clip")
             script = write_script(llm=deps.llm, transcript=transcript, moment=clip.moment, lang=lang,
-                                  out_json=script_path, script_settings=settings.script)
+                                  out_json=script_path, script_settings=settings.script,
+                                  source=job_source_info(store, settings), credit=settings.context.credit_source)
             regenerated = True
             rep.done("script", clip.index, lang, script.title)
         else:
             rep.start("script", clip.index, lang, "title, description, hashtags (voice-over off)")
             script = write_metadata_script(llm=deps.llm, transcript=transcript, moment=clip.moment, lang=lang,
-                                           out_json=script_path)
+                                           out_json=script_path, source=job_source_info(store, settings),
+                                           credit=settings.context.credit_source)
             regenerated = True
             rep.done("script", clip.index, lang, script.title)
 
@@ -869,12 +951,15 @@ def _process_clip_lang(store: JobStore, rep: _Reporter, settings: Settings, deps
 def run_job(source: str, *, settings: Settings | None = None, deps: Deps | None = None,
             langs: list[str] | None = None, count: int | None = None, min_seconds: float | None = None,
             max_seconds: float | None = None, job_id: str | None = None, log: LogFn = print,
-            debug: bool = False, voiceover: bool | None = None) -> JobStore:
+            debug: bool = False, voiceover: bool | None = None, notes: str | None = None) -> JobStore:
     """Run (or resume, with job_id) a whole job. Returns the JobStore with the final job state.
 
     ``voiceover`` (run --no-voiceover / --voiceover, web options.voiceover) is stored in job.json as the
     job's mode. None keeps the job's stored mode; a new job stores the `voiceover` setting, so later
     Settings changes do not switch it (a job without a stored mode predates the option: on).
+
+    ``notes`` (run --notes, web "Context / notes") replaces the user's notes in source_info.json; None keeps
+    them. They are given to the LLM with the video's page info (title, creator, tags).
 
     Raises PipelineError when a job-level stage fails. Per clip-language failures are recorded in
     job.json (ClipLangState.error) and do not raise.
@@ -898,6 +983,11 @@ def run_job(source: str, *, settings: Settings | None = None, deps: Deps | None 
         job.voiceover = bool(voiceover)
     s = settings_for_job(job, s)
     lazy = _LazyDeps(s, deps)
+    if notes is not None:
+        from .stages.source_info import SOURCE_INFO_FILE, set_notes
+
+        set_notes(store.dir, notes, source=job.source)
+        job.source_info = SOURCE_INFO_FILE
     job.status = "running"
     job.error = None
     store.save()
@@ -907,11 +997,13 @@ def run_job(source: str, *, settings: Settings | None = None, deps: Deps | None 
 
     stage = "ingest"
     try:
-        src = _job_stage_ingest(store, rep)
+        src = _job_stage_ingest(store, rep, s)
         stage = "transcribe"
         transcript = _job_stage_transcribe(store, rep, s, lazy)
+        stage = "signals"
+        signals = _job_stage_signals(store, rep, s, src)
         stage = "moments"
-        moments, fresh = _job_stage_moments(store, rep, s, lazy, transcript)
+        moments, fresh = _job_stage_moments(store, rep, s, lazy, transcript, signals)
         if not fresh:
             _warn_ignored_overrides(store, log, moments, count, min_seconds, max_seconds)
         _populate_clips(store, moments, s.languages, fresh=fresh, log=log)
@@ -1036,8 +1128,12 @@ def _job_complete(store: JobStore) -> bool:
     error, in every language of the job (the languages any clip has state for)."""
     job = store.job
     finished = ("done", "skipped")
-    if any(job.stages.get(s) is None or job.stages[s].status not in finished for s in JOB_STAGES):
-        return False
+    for s in JOB_STAGES:
+        st = job.stages.get(s)
+        if st is None and s in OPTIONAL_JOB_STAGES:
+            continue  # a job made before this stage existed
+        if st is None or st.status not in finished:
+            return False
     langs = {lang for c in job.clips for lang in c.langs}
     if not job.clips or not langs:
         return False

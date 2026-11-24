@@ -662,3 +662,21 @@ These are part of the contract now. Tests: `tests/test_web_review_fixes.py` plus
 - **render.json** adds `style_key` (the caption style fields that matter for that clip-language: its own font only,
   the emphasis fields and keywords only while emphasis is active, `emoji` only for HyperFrames with an emoji; hook
   text + settings when a hook is drawn). A stamp without it is current only for the step 1-4 look.
+
+## 14. Video context + smart moments, additive (builder team S, 2026-11-24)
+
+- `POST /api/jobs`: `options.notes` (optional str, 0..1000 chars, no control characters except tab/CR/LF;
+  else 422 `errors["options.notes"]`). `Worker.submit_job(..., notes=)` writes the new job's
+  `source_info.json` (what the source string tells: URL, or the upload file name, plus the cleaned notes) and
+  sets `job.json` `"source_info": "source_info.json"`. Notes are NOT in options.json. The Idempotency-Key hash
+  covers them (same key + other notes -> 409).
+- `GET /api/jobs/{id}`: new key `source_info`: `null` or
+  `{"kind","title","uploader","channel","url","upload_date","site","filename","duration"(number|null),
+  "categories"[str],"tags"[str, <= 15],"description"(<= 300 chars),"notes","game"(bool)}`.
+- Job stages are now `ingest, transcribe, signals, moments, cut` (`jobstore.JOB_STAGES`). A job made before
+  that has no `signals` state: the detail reports it as `skipped` / "not used (older job)" once moments are
+  done, and `pipeline._job_complete` treats it as finished (`jobstore.OPTIONAL_JOB_STAGES`).
+- Settings: new sections `signals` (`config.SignalSettings`) and `context` (`config.ContextSettings`); `PUT
+  /api/settings` validates them like every other section (422 with dotted errors, unknown keys 422).
+- Frontend: New job "Context / notes" textarea (`options.notes`), the `signals` stage box, a "Video" /
+  "Context / notes" row on the job page, labels for both settings sections.
