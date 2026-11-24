@@ -570,19 +570,29 @@ def _lengthen_fn(deps: _LazyDeps, lang: str):
     return lengthen
 
 
-def _voice_is_current(out_dir: Path, script: ClipScript) -> bool:
-    from .stages.voice import load_voice_result, narration_hash
+def _voice_is_current(out_dir: Path, script: ClipScript, settings: Settings | None = None,
+                      lang: str = "en") -> bool:
+    """voice.wav matches the narration. M2: with voicebox.chunking on, a take made in one Voicebox call
+    that came out far shorter than its words need (Chatterbox stopped early) is not current either, so
+    the next resume / re-render regenerates it sentence by sentence."""
+    from .stages.voice import load_voice_result, looks_truncated, narration_hash
 
     if not output_exists(out_dir / "voice.wav"):
         return False
     result = load_voice_result(out_dir)
-    return result is not None and result.narration_hash == narration_hash(script.narration)
+    if result is None or result.narration_hash != narration_hash(script.narration):
+        return False
+    if (settings is not None and settings.voicebox.chunking and not result.chunks
+            and looks_truncated(result.narration, result.raw_duration, settings.script.wps(lang))):
+        return False
+    return True
 
 
 def _run_voice(store: JobStore, rep: _Reporter, settings: Settings, deps: _LazyDeps, clip: ClipState,
                lang: str, script: ClipScript, script_path: Path, allow_lengthen: bool = False) -> ClipScript:
     from . import ffmpeg
     from .stages.voice import make_voice
+    from .stages.voice_chunks import ChunkOptions
 
     out_dir = store.clip_dir(clip.index, lang)
     cut = store.clip_dir(clip.index) / "cut.mp4"
@@ -598,14 +608,18 @@ def _run_voice(store: JobStore, rep: _Reporter, settings: Settings, deps: _LazyD
                         fill_ratio=settings.script.fill_ratio,
                         lengthen_timeout=min(settings.voicebox.lengthen_timeout_seconds,
                                              settings.voicebox.timeout_seconds),
-                        wps=settings.script.wps(lang))
+                        wps=settings.script.wps(lang),
+                        chunking=ChunkOptions.from_settings(settings.voicebox))
     if result.narration.strip() != script.narration.strip():
         # Keep script.json in sync with what was actually spoken (captions + rerender rely on it).
         script = script.model_copy(update={"narration": result.narration})
         _write_script(script_path, script)
-        how = "lengthened to fill the clip" if result.lengthened else "shortened to fit"
+        how = ("lengthened to fill the clip" if result.lengthened else "shortened to fit" if result.shortened
+               else "given a space after each glued । (sentence split)")
         rep.line("voice", 1.0, f"narration was {how}; script.json updated", clip.index, lang)
     notes = [f"{result.final_duration:.1f}s"]
+    if len(result.chunks) > 1:
+        notes.append(f"{len(result.chunks)} sentences")
     if result.tempo != 1.0:
         notes.append(f"tempo x{result.tempo:.2f}")
     if result.trimmed:
@@ -810,7 +824,7 @@ def _process_clip_lang(store: JobStore, rep: _Reporter, settings: Settings, deps
         stage = "voice"
         if not vo:
             _skip_voice(store, rep, clip, lang)
-        elif not regenerated and _voice_is_current(out_dir, script):
+        elif not regenerated and _voice_is_current(out_dir, script, settings, lang):
             rep.skip("voice", clip.index, lang, "voice.wav matches script")
         else:
             # Lengthen only a narration the LLM wrote, never one the user edited before a resume:
@@ -990,7 +1004,7 @@ def rerender(job_id: str, clip: int, lang: str, *, settings: Settings | None = N
         stage = "voice"
         if not s.voiceover:
             _skip_voice(store, rep, cs, lang)
-        elif _voice_is_current(out_dir, script):
+        elif _voice_is_current(out_dir, script, s, lang):
             rep.skip("voice", clip, lang, "narration unchanged")
         else:
             script = _run_voice(store, rep, s, lazy, cs, lang, script, script_path, allow_lengthen=False)

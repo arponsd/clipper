@@ -70,8 +70,8 @@ def test_new_settings_defaults_and_types():
     assert (s.audio.original_volume, s.audio.original_volume_after, s.audio.duck_ramp_seconds,
             s.audio.loudnorm, s.audio.target_lufs) == (0.15, 1.0, 0.4, True, -14.0)
     assert (s.script.wps_en, s.script.wps_hi, s.script.fill_ratio, s.script.lengthen_below) == \
-        (3.0, 3.35, 0.88, 0.75)
-    assert s.script.wps("en") == 3.0 and s.script.wps("hi") == 3.35 and s.script.wps("xx") == 3.0
+        (3.0, 3.25, 0.88, 0.75)  # M2: wps_hi re-measured on complete chunked Hindi takes
+    assert s.script.wps("en") == 3.0 and s.script.wps("hi") == 3.25 and s.script.wps("xx") == 3.0
     assert s.captions.position_pct == 72.0 and s.captions.margin_v == 520
     assert s.web.max_upload_mb == 4096 and ".mp4" in s.web.allowed_extensions and ".ogv" in s.web.allowed_extensions
     dump = s.model_dump()
@@ -331,9 +331,10 @@ def test_write_script_with_settings_passes_target_seconds(tmp_path: Path):
     out = tmp_path / "hi" / "script.json"
     s = scr.write_script(llm=llm, transcript=fake_transcript(120, 5), moment=Moment(start=10, end=40),
                          lang="hi", out_json=out, script_settings=ScriptSettings())
-    assert llm.calls == [("write_script", dict(lang="hi", duration=30, target_words=88, target_seconds=26.4))]
+    # wps_hi 3.25 (M2): round(30 x 3.25 x 0.88) = 86
+    assert llm.calls == [("write_script", dict(lang="hi", duration=30, target_words=86, target_seconds=26.4))]
     assert json.loads(out.read_text(encoding="utf-8"))["narration"] == s.narration
-    assert scr.count_words(s.narration) == 88
+    assert scr.count_words(s.narration) == 86
     llm2 = FakeLLM()
     scr.write_script(llm=llm2, transcript=fake_transcript(120, 5), moment=Moment(start=10, end=40),
                      lang="en", out_json=tmp_path / "en.json",
@@ -550,7 +551,7 @@ def test_pipeline_passes_script_settings_and_lengthens_new_scripts(video: Path):
     dur = store.job.clips[0].moment.end - store.job.clips[0].moment.start
     by_lang = {c[1]["lang"]: c[1] for c in ws}
     assert by_lang["en"]["target_words"] == round(dur * 3.0 * 0.88)
-    assert by_lang["hi"]["target_words"] == round(dur * 3.35 * 0.88)
+    assert by_lang["hi"]["target_words"] == round(dur * Settings().script.wps_hi * 0.88)
     assert by_lang["hi"]["target_seconds"] == pytest.approx(round(dur * 0.88, 1))
     assert [c[1]["lang"] for c in llm.calls if c[0] == "lengthen"] == ["en", "hi"]
     for lang in ("en", "hi"):

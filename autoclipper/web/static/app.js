@@ -1418,7 +1418,7 @@
       narrField.hidden = !vo;
       voOffNote.hidden = vo;
       if (v && vo) {
-        rows.push(['Voice', fmtSecs(v.duration)]);
+        rows.push(['Voice', fmtSecs(v.duration) + (v.chunks > 1 ? ` (${v.chunks} sentences, generated one by one)` : '')]);
         rows.push(['Tempo', typeof v.tempo === 'number' ? `${v.tempo.toFixed(2)}×` : '?']);
         const flags = ['shortened', 'trimmed', 'lengthened', 'truncated'].filter((k) => v[k]).map((k) => (k === 'truncated' ? 'cut short by Voicebox' : k));
         rows.push(['Adjusted', flags.length ? flags.join(', ') : 'no']);
@@ -1575,8 +1575,15 @@
     'whisper.language': ['Source language', 'Leave empty to auto-detect (or e.g. en, hi).'],
     'voicebox.url': ['Voicebox URL', 'e.g. http://127.0.0.1:17493'],
     'voicebox.poll_interval': ['Poll interval (s)', null],
-    'voicebox.timeout_seconds': ['Timeout per narration (s)', null],
-    'voicebox.lengthen_timeout_seconds': ['Timeout for the "lengthen" retry (s)', 'A too-short narration is re-generated once with a longer text. If that takes longer than this, it is cancelled and the first voice is kept (with a warning).'],
+    'voicebox.timeout_seconds': ['Timeout per Voicebox call (s)', 'Max wait for one generation. With sentence-by-sentence voices that is one sentence (the sentence timeouts below are capped at it); there is no limit for the whole narration, which can take several minutes on CPU. Cancel the job to stop it.'],
+    'voicebox.lengthen_timeout_seconds': ['Timeout for the "lengthen" retry (s)', 'A too-short narration is re-generated once with a longer text. If that takes longer than this in total (all its sentences together), it is cancelled and the first voice is kept (with a warning).'],
+    'voicebox.chunking': ['Generate sentence by sentence', 'One Voicebox call per sentence (joined with a short pause) instead of one call for the whole narration. Chatterbox often stops early on long text, which made Hindi narrations far too short. Turn off only to compare.'],
+    'voicebox.chunk_max_chars': ['Longest chunk (characters)', 'A longer sentence is split at commas, then between words.'],
+    'voicebox.chunk_min_chars': ['Shortest chunk (characters)', 'Shorter sentences are joined with a neighbour (very short input can make Chatterbox ramble). Must be smaller than the longest chunk.'],
+    'voicebox.chunk_gap_seconds': ['Pause between sentences (s)', 'Silence inserted between the generated sentences.'],
+    'voicebox.chunk_timeout_seconds': ['Timeout per sentence (s)', 'Max wait for one sentence (capped at the timeout per Voicebox call). A sentence that fails is tried once more.'],
+    'voicebox.chunk_retry_timeout_seconds': ['Timeout for a sentence retry (s)', 'A sentence that came back cut short (or far too long) is generated once more with this limit; if it is still wrong it is kept with a warning.'],
+    'voicebox.seed': ['Seed', 'Same seed for every sentence so the voice stays consistent. Empty = picked from the voice profile.'],
     'voicebox.english': ['English voice', null],
     'voicebox.hindi': ['Hindi voice', 'Hindi needs a multilingual engine (Chatterbox).'],
     'voicebox.english.profile_id': ['Voice profile', null],

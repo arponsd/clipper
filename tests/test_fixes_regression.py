@@ -654,7 +654,8 @@ def test_recut_clip_regenerates_voice_captions_and_render(video: Path) -> None:
     assert again.job.status == "done"
     # clip 0 was re-cut, so its voice was regenerated (and only clip 0's)
     assert vb.calls, "clip 0 was re-cut, so its voice must be generated again"
-    assert {Path(c["dst"]).parent.parent.name for c in vb.calls} == {"00"}
+    # (the voice may be generated sentence by sentence into clips/00/en/voice_chunks/)
+    assert {Path(c["dst"]).relative_to(store.dir / "clips").parts[0] for c in vb.calls} == {"00"}
     assert final0.stat().st_mtime_ns != before0
     assert final1.stat().st_mtime_ns == before1
     assert (store.clip_dir(0, "en") / "script.json").read_bytes() == script0  # script kept
