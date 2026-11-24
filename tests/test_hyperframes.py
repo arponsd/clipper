@@ -199,16 +199,21 @@ def test_find_font_file_fonts_dir_bold_then_regular(fonts_dir: Path) -> None:
 
 
 def test_find_font_file_fc_match_checks_family(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # _fc_match directly: find_font_file only asks fontconfig off Windows, and faking os.name="posix"
+    # on Windows makes pathlib build PosixPath objects for the whole process.
     monkeypatch.setattr(config, "FONTS_DIR", tmp_path / "none")
-    monkeypatch.setattr(hf.os, "name", "posix")
     font = tmp_path / "Some-Bold.ttf"
     font.write_bytes(b"x")
     monkeypatch.setattr(hf.shutil, "which", lambda n: "/usr/bin/fc-match" if n == "fc-match" else None)
     monkeypatch.setattr(hf, "_run", lambda args, **kw: _proc(f"Noto Sans Devanagari,Noto Sans Devanagari Bold\n{font}"))
-    assert hf.find_font_file("Noto Sans Devanagari") == font
+    assert hf._fc_match("Noto Sans Devanagari", True) == font
+    if os.name != "nt":
+        assert hf.find_font_file("Noto Sans Devanagari") == font
     # fontconfig substituted another family -> not accepted
     monkeypatch.setattr(hf, "_run", lambda args, **kw: _proc(f"DejaVu Sans\n{font}"))
-    assert hf.find_font_file("Noto Sans Devanagari") is None
+    assert hf._fc_match("Noto Sans Devanagari", True) is None
+    if os.name != "nt":
+        assert hf.find_font_file("Noto Sans Devanagari") is None
 
 
 # --------------------------------------------------------------------------------------------- composition

@@ -1,5 +1,7 @@
 # Auto Clipper
 
+[![CI](https://github.com/arponsd/clipper/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/arponsd/clipper/actions/workflows/ci.yml)
+
 Auto Clipper is a local app that turns one long video into short vertical clips. You give it a file or a URL and it:
 
 1. downloads or copies the video (yt-dlp for URLs),
@@ -654,7 +656,7 @@ Change settings with `autoclipper settings set key.path=value`. The value is par
 | `audio.short_voice_below` | `0.6` | "Short" = the narration ends before this share of the clip (0.1-0.95) |
 | `audio.short_voice_tail` | `1.0` | `trim_clip`: seconds the clip runs on after the narration (0-5; the clip is never under 3 s) |
 | `audio.max_speedup` | `1.25` | Max atempo used to fit the voice into the clip |
-| `audio.loudnorm` | `true` | Normalize the loudness of the final mix (a limiter always keeps peaks below 0 dBFS) |
+| `audio.loudnorm` | `true` | Normalize the loudness of the final mix (a limiter always keeps peaks at or below -1 dBFS) |
 | `audio.target_lufs` | `-14` | Loudness target for `audio.loudnorm` (-30 to -8 LUFS) |
 | `script.wps_en` / `script.wps_hi` | `3.0` / `3.35` | Words per second of the voice, used to size the narration (measured on chatterbox; 1-6) |
 | `script.fill_ratio` | `0.88` | Share of the clip the narration should fill (0.5-1) |
@@ -718,6 +720,17 @@ The default suite never needs Node: the HyperFrames subprocess is faked (`tests/
 Tests never call the real Anthropic API, a real Voicebox server, or download whisper models or videos. They use the fakes in `tests/fakes.py` and a synthetic video made by ffmpeg. Each test gets its own data dir through `AUTOCLIPPER_DATA_DIR`, set in `tests/conftest.py`. The same conftest also guards the whole suite. It removes `ANTHROPIC_*` variables and points `HOME` at a temp dir. It makes `pipeline._make_llm/_make_voicebox/_make_transcriber` raise unless a test has `@pytest.mark.real_clients`, and it blocks socket connections to anything but loopback. Network or model tests must be marked `@pytest.mark.slow`.
 
 The pipeline gets its LLM, Voicebox client and transcriber injected (`autoclipper.pipeline.Deps`). When none are passed, the real clients are built lazily, and only when a stage actually needs them.
+
+### Continuous integration
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs the default suite on every pull request and every push to `main`, on `ubuntu-latest` and `windows-latest` (checks `tests (ubuntu-latest)` and `tests (windows-latest)`). It needs no secrets: no API key, no Voicebox, no `~/tools`, no `.env` and no `data/`. Each job installs uv (`astral-sh/setup-uv`, cached on `uv.lock`), FFmpeg (apt on Linux, Chocolatey on Windows; Linux also gets `fonts-noto-core` so the Devanagari shaping test runs, Windows points `FONTCONFIG_FILE` at the Windows font folder for libass), then:
+
+```bash
+uv sync --locked                      # Python from .python-version
+TMPDIR="$RUNNER_TEMP/ac-tests" uv run --frozen pytest -q -p no:cacheprovider --basetemp "$RUNNER_TEMP/ac-tests/bt" -rs
+```
+
+The 3 tests marked `slow` (real HyperFrames render x2, real Demucs) are deselected there as locally (`addopts = "-m 'not slow'"`); tests that need something the runner may lack skip with a reason: Noto Sans Devanagari + `fc-list` for the shaping test, any system font for the 4 libass burn tests marked `system_font` (`assets/fonts` is not in git), `/proc` or POSIX process groups for some process-kill tests on Windows. There is no linter configured, so CI does not lint. Branch protection for `main` is set up by hand, see CONTRIBUTING.md.
 
 ---
 

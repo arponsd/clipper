@@ -80,6 +80,7 @@ def test_make_cover_from_frame_with_devanagari_title(job):
     assert not list(clip_dir().glob(".cover*"))  # no temp files left
 
 
+@pytest.mark.system_font
 def test_cover_title_changes_the_pixels(job):
     make_frame_cover("en", 1.0, "")
     plain = (clip_dir("en") / "cover.jpg").read_bytes()

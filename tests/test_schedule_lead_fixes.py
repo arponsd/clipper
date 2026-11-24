@@ -475,6 +475,25 @@ def test_known_timezone_setting_is_accepted(tz):
     assert ScheduleSettings(timezone=tz).timezone == tz
 
 
+def test_iana_zones_work_without_a_system_tz_database():
+    """Windows has no system tz database; zoneinfo then reads the `tzdata` package (a runtime
+    dependency). Simulate that here with an empty PYTHONTZPATH in a fresh interpreter."""
+    import os
+    import subprocess
+    import sys
+
+    code = ("import zoneinfo; assert zoneinfo.TZPATH == (), zoneinfo.TZPATH\n"
+            "from autoclipper.publish import schedules\n"
+            "from autoclipper.publish.settings import ScheduleSettings\n"
+            "assert ScheduleSettings(timezone='Asia/Dhaka').timezone == 'Asia/Dhaka'\n"
+            "t, label = schedules.parse_time('2026-11-24T18:30', 'America/New_York')\n"
+            "assert label == 'America/New_York', label\n"
+            "assert schedules.iso_local(t, label) == '2026-11-24T18:30:00-05:00'\n")
+    env = {**os.environ, "PYTHONTZPATH": ""}
+    proc = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr[-2000:]
+
+
 # ---- UX-8 small points ----------------------------------------------------------------------------
 def test_past_time_message(job):
     connect_all()

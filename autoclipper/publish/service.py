@@ -16,7 +16,7 @@ import httpx
 from pydantic import ValidationError
 
 from ..config import Settings, load_settings, settings_path
-from ..jobstore import jobs_root
+from ..jobstore import jobs_root, read_job_text
 from ..models import Job
 from ..stages._atomic import write_text_atomic
 from . import LANG_NAMES, LANGS, PLATFORMS, accounts, oauth_google, records
@@ -431,7 +431,7 @@ def _job(job_id: str) -> Job:
         raise PublishNotFound(f"job {job_id!r} not found")
     p = jobs_root() / job_id / "job.json"
     try:
-        return Job.model_validate_json(p.read_text(encoding="utf-8"))
+        return Job.model_validate_json(read_job_text(p))
     except FileNotFoundError:
         raise PublishNotFound(f"job {job_id} not found") from None
     except (OSError, ValueError):

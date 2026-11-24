@@ -46,6 +46,23 @@ This is how every change to Auto Clipper is made, by people and by agent teams a
 
 3. For anything that changes video or audio output, do one real render and look at frames and loudness.
 
+4. CI (`.github/workflows/ci.yml`) runs the same suite on Linux and Windows for the pull request; both checks must be green before merging.
+
+## CI and branch protection for `main`
+
+CI runs on every pull request and every push to `main`: jobs `tests (ubuntu-latest)` and `tests (windows-latest)`, read-only token, no secrets. A newer push to a pull request cancels its superseded run; runs on `main` are never cancelled. See README "Continuous integration" for the exact commands.
+
+Branch protection is turned on by the repository owner (agents never change repository settings). On GitHub, in `arponsd/clipper`:
+
+1. Settings -> Rules -> Rulesets -> New ruleset -> New branch ruleset (or the classic Settings -> Branches -> Add branch protection rule).
+2. Name it `main`, Enforcement status **Active**, Target branches -> Add target -> Include default branch (or the pattern `main`).
+3. Tick **Restrict deletions** and **Block force pushes**.
+4. Tick **Require a pull request before merging** (this also stops direct pushes to `main`). Approvals can stay at 0 for a single-person repo.
+5. Tick **Require status checks to pass**, optionally "Require branches to be up to date before merging", then Add checks: `tests (ubuntu-latest)` and `tests (windows-latest)`. They appear in the search once the workflow has run at least once (open any pull request first). Require `tests (windows-latest)` only after it has been green once (the Windows job had never run when CI was added), otherwise a Windows-only failure would block the first pull request; until then require `tests (ubuntu-latest)` alone.
+6. Leave the bypass list empty (or add only yourself, if you want an emergency override), and save.
+
+Classic branch rules: the same with "Require a pull request before merging", "Require status checks to pass before merging" (the two checks above) and "Do not allow bypassing the above settings".
+
 ## Pull requests
 
 - Push the branch and open a pull request against `main` (`gh pr create --base main`).
