@@ -2179,3 +2179,96 @@ and no secret). Team A's caption files untouched. Regression tests: NEW `tests/t
 - No in-app warning at the moment dry run is switched on (only the Schedule page note).
 
 ### Sign-off: APPROVED, committed on `feat/publish-schedule-covers` (not pushed)
+
+## Builder (team C: M7 GitHub Actions CI), 2026-11-24
+
+Worktree `auto-clipper-ci`, branch `chore/ci` from `main` 38c35dd. No app code changed; team H's files
+(`stages/voice.py`, `voicebox.py`, `script.py`) untouched. Nothing pushed, nothing published, no server started.
+
+### What I built
+- `.github/workflows/ci.yml`: on `pull_request`, `push` to `main` and `workflow_dispatch`. One matrix job
+  `tests` named `tests (ubuntu-latest)` / `tests (windows-latest)`, `fail-fast: false`, `timeout-minutes: 45`,
+  `permissions: contents: read`, concurrency group per PR / ref with `cancel-in-progress`, `shell: bash` on both.
+  Steps: `actions/checkout@v6` (no persisted credentials), `astral-sh/setup-uv@v7` (`enable-cache`, keyed on
+  `uv.lock`), FFmpeg (`apt-get install ffmpeg fonts-noto-core` on Linux; `choco install ffmpeg` on Windows),
+  tool versions, `uv sync --locked`, then
+  `TMPDIR="$RUNNER_TEMP/ac-tests" uv run --frozen pytest -q -p no:cacheprovider --basetemp "$RUNNER_TEMP/ac-tests/bt" -rs`.
+  No secrets. Both actions run on node24.
+- `.python-version` = `3.12` (what the local venv uses; pyproject allows 3.10-3.13). uv picks it up in CI.
+- New marker `system_font` (pyproject) + `pytest_runtest_setup` skip in `tests/conftest.py`: the 4 tests that burn
+  text with libass and compare pixels (`test_ffmpeg::test_mix_burn_real_path_with_space_and_quote`,
+  `test_fixes_regression::test_long_caption_line_wraps_inside_margins`,
+  `test_product_fixes::test_caption_burn_lands_near_position`,
+  `test_schedule_cover_core::test_cover_title_changes_the_pixels`) failed with no system font (libass draws
+  nothing; `assets/fonts/*.ttf` is gitignored). They now skip when `fc-list : family` lists nothing (Windows
+  without fc-list counts as "has fonts"). CI Linux installs fonts-noto-core, so they run there.
+- README: CI badge, "Continuous integration" section. CONTRIBUTING: step 4 (CI must be green) and
+  "CI and branch protection for `main`" (ruleset steps; the owner enables it).
+- No linter is configured in the repo, so CI does not lint (none introduced).
+
+### Already clean (checked, nothing to change)
+- The 3 deselected tests are the `slow` ones (`addopts = "-m 'not slow'"`): 2 real HyperFrames renders and the
+  real Demucs run; they also skip themselves when the tool is missing.
+- `.env`: `config.load_dotenv()` searches upward from `autoclipper/`; CI has no `.env`, and conftest strips
+  `ANTHROPIC_*`, points HOME/USERPROFILE/XDG at tmp, blocks non-loopback sockets and the real-client factories.
+  No code reads `GEMINI_*`.
+- `~/tools`, Voicebox, `data/`: never needed by the default suite (HOME is tmp, data dir per test).
+- POSIX-only bits are already guarded (`0o600` mode asserts behind `POSIX`, process-group / `/proc` tests skip on nt).
+
+### Tests
+- Baseline before changes: **1648 passed, 3 deselected**.
+- Normal, keys unset (`env -u ANTHROPIC_API_KEY -u GEMINI_API_KEY TMPDIR=~/.cache/ac-ci uv run pytest -q -p no:cacheprovider --basetemp ~/.cache/ac-ci/bt-builder`): **1648 passed, 3 deselected**.
+- Simulated clean runner (fresh `git ls-files` export: no `.env`/`data/`/`.venv`; `env -i`, empty HOME,
+  `PATH=<uv only>:/usr/bin:/bin` so no node/nvm/~/tools, no API keys, fresh `uv sync --locked`):
+  - with an empty fontconfig (no fonts at all): before the marker 4 failed; after **1643 passed, 5 skipped,
+    3 deselected** (shaping test + 4 `system_font`).
+  - with system fonts (like CI Linux with fonts-noto-core): **1648 passed, 3 deselected**.
+- Workflow YAML: `yaml.safe_load` OK; `uvx --from actionlint-py actionlint` clean.
+
+### Not verified / for the lead
+- The Windows job has never run (no Windows machine here). The code has Windows paths (msvcrt lock, taskkill,
+  secrets ACL), but some test may still be POSIX-specific. Suggest: open the PR, look at `tests (windows-latest)`,
+  and require it in branch protection once it is green; fix-forward any Windows-only failures in a `test/` branch.
+- `choco install ffmpeg` is not version-pinned (gyan.dev build; has libass + libvpx). Pin with `--version` if it drifts.
+- Suite takes ~11-12 min on Linux here; Windows will be slower (timeout 45 min).
+
+## Lead triage + fixes + sign-off (team C: M7 GitHub Actions CI), 2026-11-24
+
+Worktree `auto-clipper-ci`, branch `chore/ci`. Reviewer verdict: approve (Linux and an ASCII-locale run
+both 1648 passed; a Noto-only fontconfig run of the font tests 341 passed, Devanagari shaping ran). No app code
+changed, team H's files untouched, nothing pushed or published, no server started.
+
+### Triage of the reviewer's findings
+1. Windows `system_font` tests may fail if the gyan.dev FFmpeg's fontconfig finds no fonts -> **accepted,
+   fixed pre-emptively in CI only**: a Windows-only pwsh step writes `$RUNNER_TEMP/fonts.conf`
+   (`<dir>%WINDIR%\Fonts</dir>` + a cachedir in `$RUNNER_TEMP`) and exports `FONTCONFIG_FILE` via
+   `GITHUB_ENV`. Tests and conftest unchanged. Cheaper than waiting for a red first run.
+2. Windows tests never run on Windows -> **accepted as a risk, no code change**. Checked the two examples:
+   `resolve_node` tries `node.exe` then `node` on nt, so the `node` files the tests create are still found;
+   `ntpath.expandvars` handles `$VAR` and `expanduser` uses USERPROFILE (set by conftest). `dead_pid()` keeps
+   the `Popen` object (and so the process handle) alive while it asserts, so Windows cannot reuse the PID
+   there. Remaining Windows-only failures get fixed forward after the first run.
+3. CONTRIBUTING step 5 vs "require Windows only after green" -> **accepted**: step 5 now says to require
+   `tests (windows-latest)` only after it has been green once (ubuntu alone until then).
+4. Superseded runs on `main` cancelled -> **accepted**:
+   `cancel-in-progress: ${{ github.event_name == 'pull_request' }}`; CONTRIBUTING wording updated.
+5. `choco install ffmpeg` unpinned -> **rejected for now**: I cannot check offline which choco versions exist,
+   and a wrong `--version` pin breaks the job outright. The version is printed in "Show tool versions"; pin
+   to that value after the first green run if it drifts or gyan.dev is flaky.
+6. 45 min timeout tight on Windows -> **accepted**: `timeout-minutes: 60`. Lower it after the first runs.
+7. `| head -n 1` under pipefail -> **accepted**: `| sed -n 1p` (reads all input, no SIGPIPE).
+
+Workflow YAML: `yaml.safe_load` OK, `uvx --from actionlint-py actionlint` clean after the changes.
+
+### Tests (after the fixes)
+- Normal, keys unset (`env -u ANTHROPIC_API_KEY -u GEMINI_API_KEY TMPDIR=~/.cache/ac-ci uv run pytest -q -p no:cacheprovider --basetemp ~/.cache/ac-ci/bt-lead`): **1648 passed, 3 deselected** (18m47s, run in parallel with the next).
+- Simulated clean runner (reviewer's script: `git ls-files` export, `env -i`, empty HOME, PATH = uv +
+  /usr/bin:/bin, no keys, no `.env`/`data/`/`.venv`, fresh `uv sync --locked`, UTF-8 locale): **1648 passed, 3 deselected** (18m55s). Simulation folder deleted afterwards.
+
+### Remaining risks for the first real CI run
+- Windows job never run: possible Windows-only test failures, the fonts.conf step untested (no pwsh here),
+  choco/gyan.dev download speed, Defender-slowed runtime vs the 60 min timeout.
+- Actions pinned to major tags (`checkout@v6`, `setup-uv@v7`), not SHAs; choco FFmpeg unpinned.
+- Branch protection is the owner's step; require `tests (windows-latest)` only after it is green once.
+
+### Sign-off: APPROVED, committed on `chore/ci` (not pushed)

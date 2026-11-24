@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# A newer push to the same PR cancels the run it supersedes. Runs on main are never cancelled,
+# so every merge commit on main gets a finished result.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    # The check names branch protection asks for: "tests (ubuntu-latest)" and "tests (windows-latest)".
+    name: tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    env:
+      # No secrets: the suite never calls Anthropic, Voicebox, Google/Meta or the network (tests/conftest.py).
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install FFmpeg + Noto fonts (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          # fonts-noto-core has Noto Sans + Noto Sans Devanagari, so the Hindi shaping test runs here.
+          sudo apt-get install -y -q --no-install-recommends ffmpeg fonts-noto-core
+
+      - name: Install FFmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg -y --no-progress
+
+      # The 4 `system_font` tests burn text with libass. Point fontconfig at the Windows font folder
+      # explicitly, so libass finds a font whatever fonts.conf the FFmpeg build ships (or lacks).
+      - name: Point fontconfig at Windows fonts (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $conf = Join-Path $env:RUNNER_TEMP 'fonts.conf'
+          $cache = Join-Path $env:RUNNER_TEMP 'fontconfig-cache'
+          $xml = @(
+            '<?xml version="1.0"?>',
+            '<!DOCTYPE fontconfig SYSTEM "fonts.dtd">',
+            '<fontconfig>',
+            "  <dir>$env:WINDIR\Fonts</dir>",
+            "  <cachedir>$cache</cachedir>",
+            '</fontconfig>'
+          )
+          Set-Content -Path $conf -Value $xml -Encoding utf8
+          "FONTCONFIG_FILE=$conf" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Show tool versions
+        run: |
+          uv --version
+          ffmpeg -hide_banner -version | sed -n 1p
+          ffprobe -hide_banner -version | sed -n 1p
+
+      - name: Install dependencies (locked; Python from .python-version)
+        run: uv sync --locked
+
+      - name: Run tests
+        run: |
+          mkdir -p "$RUNNER_TEMP/ac-tests"
+          TMPDIR="$RUNNER_TEMP/ac-tests" uv run --frozen pytest -q -p no:cacheprovider \
+            --basetemp "$RUNNER_TEMP/ac-tests/bt" -rs
