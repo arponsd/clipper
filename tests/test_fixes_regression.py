@@ -468,13 +468,18 @@ def test_concurrent_saves_from_two_jobstores_never_collide() -> None:
             errors.append(e)
 
     def reader() -> None:
+        # Reads the way the app does (jobstore.read_job_text): on Windows a plain open() of job.json
+        # fails with PermissionError while a save's os.replace swaps it in.
         path = first.dir / "job.json"
-        while not stop.is_set():
-            text = path.read_text(encoding="utf-8")
-            try:
-                Job.model_validate_json(text)
-            except ValueError:
-                bad_reads.append(text)
+        try:
+            while not stop.is_set():
+                text = jobstore_mod.read_job_text(path)
+                try:
+                    Job.model_validate_json(text)
+                except ValueError:
+                    bad_reads.append(text)
+        except BaseException as e:  # noqa: BLE001 - the test reports any error
+            errors.append(e)
 
     threads = [threading.Thread(target=writer, args=(s, n)) for n, s in enumerate(stores)]
     r = threading.Thread(target=reader)
@@ -489,6 +494,59 @@ def test_concurrent_saves_from_two_jobstores_never_collide() -> None:
     assert bad_reads == []
     Job.model_validate_json((first.dir / "job.json").read_text(encoding="utf-8"))
     assert list(first.dir.glob("*.tmp")) == []  # no tmp files left behind
+
+
+def test_read_job_text_retries_a_windows_sharing_violation(monkeypatch, tmp_path) -> None:
+    """Windows: open() of job.json raises PermissionError (Errno 13) while another thread or process
+    os.replace()s it. Readers retry like the save does, then give up with the PermissionError."""
+    import pathlib
+
+    path = tmp_path / "job.json"
+    path.write_text('{"x": 1}', encoding="utf-8")
+    real = pathlib.Path.read_text
+    fails = {"n": 2}
+
+    def flaky(self, *a, **kw):
+        if self == path and fails["n"] > 0:
+            fails["n"] -= 1
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(jobstore_mod, "REPLACE_RETRY_DELAY", 0.001)
+    monkeypatch.setattr(pathlib.Path, "read_text", flaky)
+    assert jobstore_mod.read_job_text(path) == '{"x": 1}' and fails["n"] == 0
+
+    fails["n"] = jobstore_mod.REPLACE_RETRIES  # locked for longer than the retry window
+    with pytest.raises(PermissionError):
+        jobstore_mod.read_job_text(path)
+    assert fails["n"] == 0
+    with pytest.raises(FileNotFoundError):  # not retried
+        jobstore_mod.read_job_text(tmp_path / "missing.json")
+
+
+def test_job_readers_survive_a_windows_sharing_violation(monkeypatch) -> None:
+    """JobStore.load, the web read_job and publish's job lookup all go through read_job_text."""
+    import pathlib
+
+    from autoclipper.publish import service as publish_service
+    from autoclipper.web import worker as web_worker
+
+    job_id = JobStore.create("src.mp4").job.id
+    real = pathlib.Path.read_text
+    fails = {"n": 0}
+
+    def flaky(self, *a, **kw):
+        if self.name == "job.json" and fails["n"] > 0:
+            fails["n"] -= 1
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(jobstore_mod, "REPLACE_RETRY_DELAY", 0.001)
+    monkeypatch.setattr(pathlib.Path, "read_text", flaky)
+    for read in (lambda: JobStore.load(job_id).job, lambda: web_worker.read_job(job_id),
+                 lambda: publish_service._job(job_id)):
+        fails["n"] = 5  # more than read_job's own 3 attempts
+        assert read().id == job_id and fails["n"] == 0
 
 
 def test_concurrent_saves_from_two_processes_never_collide() -> None:

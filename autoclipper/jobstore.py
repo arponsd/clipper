@@ -37,6 +37,20 @@ def _replace_with_retry(src: Path, dst: Path) -> None:
             time.sleep(REPLACE_RETRY_DELAY)
 
 
+def read_job_text(path: Path) -> str:
+    """The text of a job.json. On Windows, opening it while a save's os.replace swaps it in fails with
+    PermissionError (Errno 13) for a moment; retry for about 1 s, like the save does. Other errors
+    (FileNotFoundError, decoding) are raised at once."""
+    for attempt in range(REPLACE_RETRIES):
+        try:
+            return path.read_text(encoding="utf-8")
+        except PermissionError:
+            if attempt == REPLACE_RETRIES - 1:
+                raise
+            time.sleep(REPLACE_RETRY_DELAY)
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
 def jobs_root() -> Path:
     p = data_dir() / "jobs"
     p.mkdir(parents=True, exist_ok=True)
@@ -65,7 +79,7 @@ class JobStore:
         path = jobs_root() / job_id / "job.json"
         if not path.exists():
             raise FileNotFoundError(f"job {job_id!r} not found")
-        return cls(Job.model_validate_json(path.read_text(encoding="utf-8")))
+        return cls(Job.model_validate_json(read_job_text(path)))
 
     @staticmethod
     def list_ids() -> list[str]:
