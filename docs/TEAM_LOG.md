@@ -2673,3 +2673,244 @@ Full suite (keys unset): **1821 passed, 3 deselected** (8m24s). New/changed smar
   stretches. Follow-up: keyframes per candidate to Claude (vision).
 - Nolan: premise clip (0-38 s) not always picked; LLM variance. Signals runtime near the 2 min target on 60 fps AV1.
 - Windows CI not run locally.
+
+## Builder (team V: vision check of moment candidates), 2026-11-25
+
+Worktree `auto-clipper-vision`, branch `feat/vision-moments` from `main` 9ad2554. Nothing committed, pushed or
+published; the live app (:8765), its data and Voicebox untouched; no test server started. No new dependency.
+
+### What I built
+- **`stages/vision.py`** (new; job stage `vision` between moments and cut, in `OPTIONAL_JOB_STAGES`):
+  `wanted()` (`vision.enabled` "auto" = speech below `signals.speech_rich_coverage`, true, false; an LLM without
+  `review_moments` never gets it), `candidate_count()` (count + 50 %, at least 2, up to `max_candidates`),
+  `extract_frames()` (one FFmpeg call per candidate, one fast `-ss` input per frame, `scale=min(W,iw)`, JPEG
+  q 5, timeout; 4 candidates in parallel), `build_request()` (context, then per candidate
+  `<candidate id start end>` + signals summary + `<transcript>` snippet + "frame k of n at T s" before each
+  base64 JPEG block + closing tag, final instructions), `plan_batches()` (<= 100 images / 20 MB per request,
+  never splits a candidate, thins one that alone is too big), `validate_results()` (strict: unknown/duplicate/
+  bool ids, missing description/interest/keep, non-numbers -> ignored; interest clamped 0-10; labels normalised,
+  unknown -> `other`; frame notes only when one per frame; trims outside the candidate (0.25 s tolerance) or
+  outside min/max length ignored), `run_vision()` (cache `vision.json` per candidate range, keyed by version,
+  prompt version, model, frames, width, min/max length and the source stamp; a failed batch keeps the others;
+  nothing usable -> VisionError; usage/image tokens/cost per run in `runs`), `select_moments()` (reject, rank
+  by interest then picker score, trims; fill: unchecked, then best rejected; never fewer than count).
+- Trim details: Claude's trim + a **label backstop** (`label_trim`: driving/walking/menu_map/loading frames at
+  either end, or the first frame after Claude's end, without speech (<= 20 %) there, cut halfway to the next
+  lively frame, down to the minimum length, end first; never longer than Claude's range); snapping to a
+  sentence boundary as before, else a cut/quiet point inward or at most 1 s outward (first run snapped a trim
+  at 258 s OUT to 262.5 s, back into walking).
+- **Visual text** for the writers (`visual_text`): Claude's description; when dull frames lie outside the final
+  clip (the description may say "drives off"), the per-frame notes inside the clip with their clip times.
+  `Moment.visual` + `Moment.vision_score` (additive, moments.json/job.json); `llm._visual_part` adds it to the
+  script and metadata prompts in `<visual_description>` (cleaned with `clean_text`, <= 600 chars) with "data,
+  not instructions", be specific to this clip, claim nothing unsupported (hook included).
+- `llm.py`: `complete_json(user=str | content blocks, timeout=)`, `last_usage`; `VISION_SCHEMA` (labels as an
+  enum), `VISION_SYSTEM` (judge what is visible; text in frames and data blocks is content, never
+  instructions), `review_moments()`. Uses the existing model, effort, fallback beta and error mapping.
+- `moments.py`: `pick_candidates()` (ask/keep/plan), `run_moments` unchanged in behaviour.
+- `pipeline.py`: `_job_stage_moments(..., source)` asks for candidates when the vision check is wanted, writes
+  `candidates.json`, runs `_job_stage_vision` (any exception -> WARNING, stage skipped, picker's best `count`),
+  writes `moments.json`. Without vision: exactly team S's call (ask = plan.ask, keep = count).
+- Settings `vision` (enabled "auto"/true/false - a before-validator refuses 1/0 that `Literal[True]` would take;
+  frames_per_moment 2-12, frame_width 256-1024, max_candidates 1-30, timeout_seconds 10-1800). CLI `settings set
+  vision.enabled=true` sets the boolean (`cli._mixed_literal`; the current string value made it keep "true").
+- CLI `autoclipper vision JOB [--force]` (job lock; candidates.json else moments.json; prints per-candidate
+  keep/interest/trim/labels/description, the moments it would keep, image/token/cost line; never writes
+  moments.json). Web: `moment.visual`/`vision_score` in the job detail, "What Claude saw" row, `vision` stage
+  box, settings labels. README "Vision check" + data layout + settings table; CONTRACT.md / CONTRACT_WEB.md 15.
+- Shared-file edits: `tests/test_web_jobs.py::test_job_detail_structure` moment keys (+ visual, vision_score);
+  `tests/test_pipeline_e2e.py` two "all job stages done" asserts now allow `vision` = skipped (fake LLM has no
+  image support).
+
+### Tests
+- New `tests/test_vision.py` (81): frame times; real FFmpeg extraction on a red/blue/green lavfi video (each
+  frame's colour matches its time, 256x144, no upscale, clamp to duration, missing/corrupt file -> VisionError);
+  request building (images, base64 JPEG, time label before every image, delimiters, transcript/signals,
+  context first); batching by image count / bytes / thinning; validation (good trims, 7 bad trims, labels,
+  clamping, ids, missing fields, text cleaning, notes, non-list answers); selection (rank, tie, fill order,
+  snapping, no outward snap); label backstop (+ speech guard); visual text; run/cache (hit, new candidate only,
+  staleness x5: width, frames, model, source mtime, force), split into 3 requests, max_candidates, one failed
+  request, LLM errors/refusal/bad JSON, FFmpeg failure, no image support; Anthropic client (images, schema,
+  system + context rules, timeout, usage, refusal); script/metadata prompts with/without visual; pipeline
+  (low speech: ask 4, candidates.json, trim, reject, visual into the writer, resume makes no request;
+  speech-rich auto == off byte-identical moments and no call; forced; 4 fallback cases); settings API happy path
+  (true/false/"auto"), 18 x 422 with nothing written, 401/403, contract, schema enum; CLI settings; job detail
+  visual + older job + 404 + 401/403; CLI vision run/cache/force/errors.
+- Full suite (keys unset): **1902 passed, 3 deselected** (11m20s); after the last prompt-text edit (prompt
+  version 3, no-names rule) `test_vision.py` + `test_llm_moments_script.py` + `test_smart_moments.py` re-run:
+  202 passed.
+
+### Real verification (`AUTOCLIPPER_DATA_DIR=~/.cache/ac-vision/data-builder`, copies of 3 jobs + settings.json)
+Drivers `~/.cache/ac-vision/scratch/verify_run.py` (signals cached -> moments -> vision -> en metadata) and
+`reselect.py` (candidates.json + vision -> en metadata; used after prompt/trim changes so the picker is not
+paid again). Nemsk copy uses the lead's `signals.json` (v2, mtime matched) and fetched `source_info.json`.
+- **Nemsk** (1 % speech, low-speech path, 6 clips): picker asked for 9 candidates; vision 9 candidates, 54
+  images (512x288), ~10.6K image tokens, ~16.0K input + 1.1-1.9K output tokens, **~$0.09-0.10, 20-31 s**
+  (frames ~3 s); picker ~9.8K/1.2K tokens (~$0.06), 6 metadata calls ~13.3K/2.1K (~$0.10). Rejected: 398-456
+  (walk + driving, interest 3 - team S's weak pick), 612-637 (walk to car, drive), 1668-1725 (highway drive).
+  Final (`verify-final`, sheets `~/.cache/ac-vision/showcase/nemsk_new_NN_*.jpg`, all looked at):
+
+  | team S final (lead2) | team S title | new pick | interest | new title |
+  |---|---|---|---|---|
+  | 0-29 good | Robbing a Bank in GTA 6 Without Firing a Shot | 0-23 (drive at the end cut) | 7 | Holding Up a GTA 6 Bank Without Firing a Shot |
+  | 1885-1945 bank + ~25 s driving | Robbing Every Bank in GTA 6 Without Stopping: The Last One | 1885-1915 (ends walking to the car, no driving) | 4 | Robbing a GTA 6 Bank's Back Office for Marked Bills |
+  | 398-458 weak, mostly driving | GTA 6 Bank Heist Goes Nonstop - Pure Robbery Chaos | **rejected** (interest 3) | - | - |
+  | 1018-1073 good | Robbing Another Bank in GTA 6 Without Stopping | 1023.9-1045.6 (walk-in and walk-out cut) | 7 | GTA 6 Bank Robbery Goes Loud, Then Loots the Teller Desk |
+  | 1513.5-1572.75, last ~17 s car/driving | Robbing Every Bank in GTA 6 Without Stopping | 1513.5-1543.1 (all inside the bank) | 7 | GTA 6 First-Person Fleeca Bank Robbery With a Partner |
+  | 1289.25-1318 good | Robbing Every Bank in GTA 6 Without Stopping 💰 | 1289.25-1314.7 | 8 | Holding Up a Lombank Teller in GTA 6 With a Partner |
+  | - | - | 228-248 (new: grab cash, run out the back; ~9 s corridor/alley) | 5 | GTA 6 Bank Heist: Grabbing Cash and Bolting Out the Back |
+
+  Every description keeps one `Original video by Nemsk: <url>` credit, every hashtag set starts with #GTA6.
+  Earlier runs: v1 (first prompt) put the 230-262 walk-out tail in and snapped a trim outward -> inward snap +
+  label backstop; v3 titles said "Then Driving Off" for a clip that ends before the drive -> notes inside the
+  clip instead of the full description; v3/v4 called the partner "Lucia" ("Lucia Grabs the Cash" while the man
+  grabs it) -> no names unless readable/given (prompt version 3). Final run: no invented names, no driving.
+- **Nolan** (63 %, auto): vision **skipped** ("speech-rich video (63 % speech; vision.enabled is auto)"), picker
+  asked for 5 (same as team S), no review call, no candidates.json; picks = the team S story beats (muscle car
+  64.8-112.1, first heist 141.9-177.7, NPC bank robbery 1058.8-1110.2, dad roast 358.9-395.2, last shot
+  1217.6-1267.7). Signals recomputed (v1 file was stale): 116 s.
+- **Reagan** (66 %, auto, file source): skipped the same way, 2 moments 211.1-260.7 and 127.7-157.9 (team S's
+  211.1 closing start), no credit line.
+- **Nolan forced on** (`verify-forced`): 8 candidates, 48 images, 16.4K/1.7K tokens (~$0.10), moments+vision
+  43 s. Keeps the premise intro (0-25.5, which team S runs often dropped), first jewelry heist, NPC bank
+  robbery (trimmed 1053-1098), last-chance run, dad roast (trimmed 361-383); drops the muscle-car backstory
+  (interest 5, dialogue while driving). Label trims respect speech (the talking-while-driving intro was not cut).
+  Titles specific and correct. Does not hurt, but costs ~$0.10 and re-ranks dialogue: keep "auto".
+
+### Notes for the lead
+- The candidates are only as good as the picker's: vision can reject and trim, not find a moment that was not
+  proposed. With 9 candidates for 6 clips, a weak kept one can still fill (228-248 has ~9 s of running out).
+- Interest scores are coarse (4-8); ties fall back to the picker's score.
+- Character names: Claude knows GTA 6 and named "Lucia" from a red dress; the prompt now forbids names that
+  are not readable or given. The "first person" claim on 1513.5 comes from the first frame (looks right).
+- `autoclipper vision` builds a real client even when everything is cached (simple; could be lazy).
+- Windows: only `tempfile`, list-args subprocess and Path; the scale filter uses single quotes inside one arg
+  (ffmpeg parses them; no shell). Not run on Windows.
+
+## Reviewer (team V: output quality), 2026-11-25
+
+Checked the builder's `verify-final` Nemsk run frame by frame (own 2 s contact sheets with 6 s context each side,
+`~/.cache/ac-vision/review/sheet_*.jpg`), the vision.json notes against full-res frames, and the Nolan/Reagan
+`verify-auto` runs. One extra real run: Hindi metadata for the 6 final Nemsk moments (6 calls, 14.4K in / 4.4K out,
+~$0.15) on a copy in `~/.cache/ac-vision/data-reviewer` (`review-hi/all.json`). No vision call, no server.
+
+### Picks and trims (Nemsk)
+- Big win: no driving left. 398-458 (driving), 612-637 (walk + drive + map) and 1668-1725 (highway) correctly
+  rejected (checked 612-637 sheet). 1885-1915 now ends at the exit door (31:55) instead of 25 s of driving;
+  1513.5-1543.1 is all inside the Fleeca; 1023.9-1045.6 starts exactly as the gunfight starts (17:03.9) and ends
+  on the teller loot; 1289.25-1314.7 is solid hold-up + looting and stops before the walk to the office.
+- 0-22.97 is a cold-open montage: ~0.7 s black (blackdetect 0-0.73), ~5 s driving, 12 s of three different
+  banks, ~5 s driving with the "8 Big Banks, One Run..." caption, cut mid-caption. Claude trimmed to 1.0 s but
+  OUTWARD_SNAP moved it back to 0.0, re-adding the black lead-in.
+- 228-248 (new): ~8 s of loot grab, then ~10 s running out the back/alley. The real hold-up is 3:42-3:47, just
+  BEFORE the candidate. Same pattern on 1289.25 (hold-up starts ~21:23) and 612 (vault loot at 10:06): trims can
+  only shrink, so a picker edge that is a few seconds late can't be fixed.
+- No trim cut speech or a mid-action beat that I could see.
+
+### Titles / descriptions
+- Clearly better: specific, varied, honest, every EN/HI description credits Nemsk with the URL, #GTA6 first.
+- Hallucination by merging (clip 0-22.97): notes are each right (ShoreFront counter at 10-12 s, LOMBANK desk at
+  14 s, security room at 16 s), but EN says "walks up to the ShoreFront counter and holds up the staff in the
+  security camera room" and HI says "शोरफ्रंट बैंक के सिक्योरिटी कैमरा रूम" + title "स्टाफ से बंदूक छीन ली" (snatched
+  the gun; the transcript only has "Give me your gun"). Cause: `visual_text()` swaps the description (which said
+  "intro montage") for per-frame notes when dull frames are trimmed, so the writer doesn't know it is several banks.
+- "Without Firing a Shot" (0-22.97) is carried from team S; the source description says "non-lethal" but the
+  transcript at 2.5 s says "I'll shoot the other guy". Borderline.
+- "First-Person" (1513.5 EN title, HI description) rests on ~2 s of first-person aim; the rest is third person.
+- Notes checked against frames (1514.0 Fleeca + first-person aim, 1537.3 partner + crouching hostages, 1885.5
+  employee in hallway, 0.5 black): accurate; no invented names.
+- Picker `hook`/`reason` are still stale after trims (1885: "action fills every second"); harmless for titles.
+
+### Speech-rich
+- Nolan (63 %) and Reagan (66 %) auto: vision skipped, no candidates.json, picker asked for exactly 5 / 2,
+  same beats as team S (Reagan 211.1-260.7, 127.7-157.9). No regression.
+
+## Reviewer (team V: code + safety + cost), 2026-11-25
+Reviewed the uncommitted diff on top of 9ad2554 (`stages/vision.py`, `llm.py`, `pipeline.py`, `moments.py`,
+`config.py`, `cli.py`, web, tests). `tests/test_vision.py`: 81 passed. Probes (fake client, no API calls) in
+`~/.cache/ac-vision/probe/`.
+
+### OK
+- Image blocks match the Messages API (`{"type":"image","source":{"type":"base64","media_type":"image/jpeg",...}}`),
+  each preceded by a text block with its time; at most 100 images / 20 MB base64 per request, a candidate is
+  never split; 512-1024 px stays under the 2000 px limit for requests with more than 20 images.
+- Injection framing: transcript, notes and Claude's description go through `clean_text` (angle brackets
+  removed), sit inside delimiters and are labelled as data; the web page shows `visual` as text only.
+- Validation is strict (ids, bools, finite numbers, ranges, lengths, labels); every failure path ends in the
+  WARNING fallback; `TaskCancelled` (BaseException) still gets through. With "auto", speech-rich videos make
+  the same picker call as before. Settings 422 / 401 / 403 / 404 and the contract are tested.
+
+### Findings
+1. Medium (cost): the pipeline never reads `candidates.json` back. If a job is stopped during the vision stage,
+   resuming it runs the picker again, gets new times, misses every `vision.json` entry and pays for both again.
+   Only the CLI ever gets cache hits. Fix: on resume, reuse a current `candidates.json`.
+2. Low-medium: `complete_json` uses `max(vision timeout, 1800)` when `llm.max_tokens > 21333`, which is the
+   setting the app itself suggests for long videos. Probe: 1800.0 s sent with `vision.timeout_seconds=60`.
+   The SDK's 2 retries make it up to ~3x. Fix: `review_moments` passes its own small `max_tokens`
+   (the answer is ~2K tokens), and the vision timeout then applies.
+3. Low (cost report): `last_usage` is only set after a successful call, so a failed vision request reports the
+   previous call's tokens (probe: the picker's 5000/900 tokens were logged in `vision.json` runs). Fix: reset it
+   at the start of `complete_json`.
+4. Low (cost estimate): `PRICE_PER_MTOK` is fixed at Opus 5.5 prices even when `llm.model` is different. The
+   settings hint "about 200 tokens each at 512 px" only holds for 16:9: a portrait source is 512x910, about 620
+   tokens per frame (3x).
+5. Low: `candidates.json` stays when moments are later picked again without the vision check, so
+   `autoclipper vision JOB` then reviews old candidates (read-only). `vision.json` results are never pruned.
+
+## Lead (team V: triage, fixes, sign-off), 2026-11-25
+
+Worktree `auto-clipper-vision`, branch `feat/vision-moments`. Live app (:8765), its data and Voicebox untouched;
+no server started; nothing pushed or published. Verification copy `~/.cache/ac-vision/data-lead`.
+
+### Code review findings
+1. Accepted (medium, cost). Resume after a stop/crash in the vision stage re-ran the picker. New
+   `pipeline._resume_candidates`: reuse `candidates.json` only when the vision stage did not finish (status not
+   done/skipped; after a finished check, deleting moments.json still means "pick again"), the file is newer
+   than transcript.json/signals.json and every range is valid for the clip limits. Tests: resume makes no
+   picker call and no vision request, same moments; finished/stale/invalid candidates -> picker again.
+2. Accepted (low-medium). `review_moments` passes `max_tokens=min(VISION_MAX_TOKENS=12000, llm.max_tokens)`,
+   below the SDK long-request limit, so `vision.timeout_seconds` is what is sent (test with max_tokens=32000).
+3. Accepted (low). `complete_json` resets `last_usage` first; test: a failed vision request logs 0 tokens.
+4. Accepted as docs (low). Price assumption noted at `PRICE_PER_MTOK` and in README; settings hint and README
+   give ~200 tokens per 16:9 frame and ~620 per 9:16 frame. Per-model pricing not added (estimate only).
+5. Accepted (low). Moments picked without vision delete `candidates.json` and mark the vision stage skipped
+   (it stayed "done" from the earlier run); `run_vision` keeps only the current candidates in `vision.json`.
+
+### Output-quality findings
+- Must-fix 1 accepted: `visual_text` now keeps Claude's whole-candidate description (with the "leaves out the
+  driving/... part" warning) and appends the notes of the frames inside the clip; `_visual_part` adds: frame
+  notes are snapshots, different places = a montage, never merge them into one scene. VISUAL_MAX 600 -> 1200.
+  Result: clip 1 is now "a GTA 6 gameplay montage of bank robberies, from a bank lobby to the ShoreFront
+  counter, ending with ... a guard ... in the security room" (no merged scene).
+- Must-fix 2 accepted: the real cause was the video start 0.0, which is always a sentence-start boundary, so
+  the sentence snap (not OUTWARD_SNAP) moved 1.0 back to 0.0. Now every snap (sentence or cut/quiet) of a
+  trimmed edge may go back out by at most half of the trim and never onto or past a checked frame outside
+  Claude's range. Tests for both. Final run: starts at 1.0 (black ends 0.73).
+- Nice-to-have "first-person from one frame": accepted as one prompt line (a detail seen in one frame may
+  last a moment; not the headline). Final run: no "First-Person" title.
+- Nice-to-have "let vision extend an edge earlier": deferred (needs frames outside the candidate, more cost
+  and a new validation rule); remaining issue.
+- "Without Firing a Shot" (team S title): not reproduced in the final run; no code change.
+- Stale picker hook/reason after trims: rejected for now (harmless, the writer trusts the visual text).
+
+### Final Nemsk run (`verify-lead`; sheets + table `~/.cache/ac-vision/showcase/SUMMARY.md`, `nemsk_lead_*`)
+Picker asked for 9; vision 9 candidates, 54 images, ~10.6K image tokens, 16.0K in / 1.8K out (~$0.10, 25 s);
+picker 9.8K/1.3K (~$0.065); 6 en metadata calls 14.6K/2.6K (~$0.11). Total ~$0.28. Rejected 830-880 (map +
+highway) and 615-637 (walk + drive). Picks: 1.0-21.0, 1289.25-1314.7, 395-415, 1023.9-1045.6, 1513.5-1543.1,
+1886.4-1910.0; no driving at any tail. Titles specific, different and supported by frames/transcript.
+Nolan / Reagan: not re-run against the API (auto path unchanged: no vision call; covered by the
+speech-rich byte-identical pipeline test); the reviewer's auto runs stand.
+
+### Remaining
+- 395-415 still has ~12 s of walking out the back between two "action" frames (6 frames per 60 s = 12 s
+  apart). Frames proportional to length (e.g. one per 6-8 s) would catch it, at more image cost.
+- 1.0-21.0 keeps ~5 s of driving at the head (speech "I'll shoot the other guy" over it blocks the label
+  trim) and ends as the "8 Big Banks" caption starts. "Disarming a guard" rests on "Give me your gun" + one frame.
+- Picker edges a few seconds late (hold-up just before 228 / 1289) cannot be fixed by trims.
+- PRICE_PER_MTOK is Opus 5.5 only; not run on Windows.
+
+### Tests
+`tests/test_vision.py` 81 -> 92 (snap x2, visual text montage, token budget/timeout, usage reset, cache prune,
+resume, re-pick x3, candidates removal). Full suite (key unset): **1913 passed, 3 deselected** (10m13s).
+
+### Sign-off: APPROVED, committed on `feat/vision-moments` (not pushed)
