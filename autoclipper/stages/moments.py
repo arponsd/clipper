@@ -300,6 +300,40 @@ def plan_moments(t: Transcript, settings: ClipSettings, signals: Signals | None 
     return MomentsPlan(ms, text, count + extra)
 
 
+def pick_candidates(t: Transcript, llm: LLM, settings: ClipSettings, *, signals: Signals | None = None,
+                    signal_settings: object | None = None, context: str = "", ask: int | None = None,
+                    keep: int | None = None, plan: MomentsPlan | None = None,
+                    log: Callable[[str], None] | None = None) -> list[Moment]:
+    """Ask the LLM for ``ask`` moments (default: the plan's count) and validate them; at most ``keep``
+    (default settings.count) are returned, best first. The vision check asks for and keeps extra candidates
+    (stages.vision.candidate_count). Raises MomentsError when nothing usable comes back."""
+    if plan is None:
+        plan = plan_moments(t, settings, signals, signal_settings)
+    text = format_transcript(t)
+    if not text.strip():
+        if not plan.low_speech:
+            raise MomentsError("the transcript is empty (no speech found), so no moments can be picked")
+        text = "(no speech was found in this video)"
+    optional = {"context": context or None}
+    if plan.low_speech and plan.signals is not None:
+        optional.update(signals=plan.signals_text, speech_coverage=plan.signals.coverage)
+    raw = call_with_optional(llm.pick_moments, text, count=ask or plan.ask or settings.count,
+                             min_seconds=settings.min_seconds, max_seconds=settings.max_seconds,
+                             video_duration=t.duration, optional=optional)
+    rejected: list[tuple[Moment, str]] = []
+    moments = validate_moments(raw, t, count=keep or settings.count, min_seconds=settings.min_seconds,
+                               max_seconds=settings.max_seconds, signals=plan.signals, rejected=rejected)
+    if log is not None:
+        for m, why in rejected:
+            log(f"moment {m.start:.1f}-{m.end:.1f}s rejected: {why}")
+    if not moments:
+        raise MomentsError(
+            f"the LLM returned {len(raw)} moment(s) but none were valid "
+            f"({settings.min_seconds:g}-{settings.max_seconds:g}s, inside the video, non-overlapping)"
+        )
+    return moments
+
+
 def run_moments(t: Transcript, llm: LLM, settings: ClipSettings, out_json: Path, *,
                 signals: Signals | None = None, signal_settings: object | None = None, context: str = "",
                 log: Callable[[str], None] | None = None) -> list[Moment]:
@@ -312,28 +346,7 @@ def run_moments(t: Transcript, llm: LLM, settings: ClipSettings, out_json: Path,
     out_json = Path(out_json)
     if out_json.is_file() and out_json.stat().st_size > 0:
         return load_moments(out_json)
-    plan = plan_moments(t, settings, signals, signal_settings)
-    text = format_transcript(t)
-    if not text.strip():
-        if not plan.low_speech:
-            raise MomentsError("the transcript is empty (no speech found), so no moments can be picked")
-        text = "(no speech was found in this video)"
-    optional = {"context": context or None}
-    if plan.low_speech and plan.signals is not None:
-        optional.update(signals=plan.signals_text, speech_coverage=plan.signals.coverage)
-    raw = call_with_optional(llm.pick_moments, text, count=plan.ask or settings.count,
-                             min_seconds=settings.min_seconds, max_seconds=settings.max_seconds,
-                             video_duration=t.duration, optional=optional)
-    rejected: list[tuple[Moment, str]] = []
-    moments = validate_moments(raw, t, count=settings.count, min_seconds=settings.min_seconds,
-                               max_seconds=settings.max_seconds, signals=plan.signals, rejected=rejected)
-    if log is not None:
-        for m, why in rejected:
-            log(f"moment {m.start:.1f}-{m.end:.1f}s rejected: {why}")
-    if not moments:
-        raise MomentsError(
-            f"the LLM returned {len(raw)} moment(s) but none were valid "
-            f"({settings.min_seconds:g}-{settings.max_seconds:g}s, inside the video, non-overlapping)"
-        )
+    moments = pick_candidates(t, llm, settings, signals=signals, signal_settings=signal_settings,
+                              context=context, log=log)
     save_moments(moments, out_json)
     return moments

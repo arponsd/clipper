@@ -114,6 +114,28 @@ class SignalSettings(BaseModel):
     timeout_seconds: float = Field(900.0, ge=30, le=7200)
 
 
+class VisionSettings(BaseModel):
+    """Vision check of moment candidates (README "Vision check"): a few small frames per candidate are sent to
+    Claude, which describes what is visible, labels each frame (action, driving, menu/map, ...), scores the
+    candidate and may tighten it. Results are cached per job in vision.json."""
+    # "auto" = only for low-speech videos (speech below signals.speech_rich_coverage); True = every video
+    # (extra cost); False = never.
+    enabled: Literal["auto", True, False] = "auto"
+    frames_per_moment: int = Field(6, ge=2, le=12)  # evenly spaced, the first and last near the moment's ends
+    frame_width: int = Field(512, ge=256, le=1024)  # px; the height follows the video's aspect ratio
+    # Most candidates checked per job (the moment picker is asked for extra candidates, up to this many).
+    max_candidates: int = Field(12, ge=1, le=30)
+    timeout_seconds: float = Field(300.0, ge=10, le=1800)  # frame extraction + each Claude request
+
+    @field_validator("enabled", mode="before")
+    @classmethod
+    def _enabled_value(cls, v: object) -> object:
+        # Literal[True] would also take 1 / 0; only "auto", true or false are meant
+        if not (isinstance(v, bool) or v == "auto"):
+            raise ValueError('must be "auto", true or false')
+        return v
+
+
 class ContextSettings(BaseModel):
     """Source context for the LLM (README "Video context for titles and descriptions")."""
     enabled: bool = True  # give the moment picker and the script/metadata writer the video's page info + notes
@@ -342,6 +364,7 @@ class Settings(BaseModel):
     clips: ClipSettings = Field(default_factory=ClipSettings)
     signals: SignalSettings = Field(default_factory=SignalSettings)
     context: ContextSettings = Field(default_factory=ContextSettings)
+    vision: VisionSettings = Field(default_factory=VisionSettings)
     audio: AudioSettings = Field(default_factory=AudioSettings)
     captions: CaptionSettings = Field(default_factory=CaptionSettings)
     hook: HookSettings = Field(default_factory=HookSettings)

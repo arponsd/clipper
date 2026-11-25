@@ -327,7 +327,8 @@ def test_job_detail_structure(api):
     (c,) = d["clips"]
     assert_keys(c, {"index": int, "moment": dict, "cut": bool, "langs": dict})
     assert_keys(c["moment"], {"start": float, "end": float, "duration": float, "hook": str, "reason": str,
-                              "score": float})
+                              "score": float,
+                              "visual": str, "vision_score": (float, type(None))})  # vision check (additive)
     assert c["moment"]["duration"] == 12.5 and c["cut"] is True
     en = c["langs"]["en"]
     assert_keys(en, {"stages": dict, "error": (str, type(None)), "final": bool, "video_url": (str, type(None)),

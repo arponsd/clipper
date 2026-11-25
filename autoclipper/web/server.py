@@ -487,7 +487,9 @@ class App:
             clips.append({
                 "index": c.index,
                 "moment": {"start": m.start, "end": m.end, "duration": round(m.end - m.start, 3),
-                           "hook": m.hook, "reason": m.reason, "score": m.score},
+                           "hook": m.hook, "reason": m.reason, "score": m.score,
+                           # vision check (additive): what Claude saw in the frames, interest 0-10
+                           "visual": m.visual, "vision_score": m.vision_score},
                 "cut": _nonempty_file(cdir / "cut.mp4"),
                 "langs": langs,
             })

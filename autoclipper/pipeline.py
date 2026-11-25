@@ -1,6 +1,6 @@
 """Pipeline orchestrator: source video -> per-clip, per-language finished shorts.
 
-Job stages (once per job):      ingest -> transcribe -> signals -> moments -> cut
+Job stages (once per job):      ingest -> transcribe -> signals -> moments -> vision -> cut
 Clip stages (per clip x lang):  script -> voice -> captions -> render (+ metadata)
 
 Progress lives in data/jobs/<id>/job.json through JobStore, so a later web UI can read it while a
@@ -456,8 +456,13 @@ def _job_stage_transcribe(store: JobStore, rep: _Reporter, settings: Settings, d
 
 
 def _job_stage_moments(store: JobStore, rep: _Reporter, settings: Settings, deps: _LazyDeps,
-                       transcript: Transcript, signals: Any = None) -> tuple[list[Moment], bool]:
-    """Returns (moments, fresh): fresh is True when moments were (re)generated in this run."""
+                       transcript: Transcript, signals: Any = None,
+                       source: Path | None = None) -> tuple[list[Moment], bool]:
+    """Returns (moments, fresh): fresh is True when moments were (re)generated in this run.
+
+    With the vision check (stages.vision; settings.vision.enabled, "auto" = low-speech videos only) the
+    picker is asked for extra candidates (candidates.json), Claude looks at frames of each and the best are
+    kept; any vision failure keeps the picker's own choice."""
     out = store.dir / "moments.json"
     fresh = False
     moments: list[Moment] | None = None
@@ -472,23 +477,126 @@ def _job_stage_moments(store: JobStore, rep: _Reporter, settings: Settings, deps
             moments = None
         else:
             rep.skip("moments", message=f"{len(moments)} moments in moments.json")
+            rep.skip("vision", message="moments already picked")
     if moments is None:
-        from .stages.moments import plan_moments, run_moments
+        from .stages.moments import pick_candidates, plan_moments, save_moments
+        from .stages.signals import speech_coverage
         from .stages.source_info import context_for_prompt
+        from .stages.vision import candidate_count, wanted
 
         plan = plan_moments(transcript, settings.clips, signals, settings.signals)
         how = (f"; low speech ({plan.signals.coverage:.0%}): using audio/video signals"
                if plan.low_speech and plan.signals is not None else "")
-        rep.start("moments", message=f"asking {settings.llm.model} for {settings.clips.count} moments{how}")
+        coverage = plan.signals.coverage if plan.signals is not None else speech_coverage(transcript)
+        use_vision, why = wanted(settings.vision.enabled, coverage, settings.signals.speech_rich_coverage,
+                                 deps.llm)
+        count = settings.clips.count
+        ask = keep = None
+        if use_vision:
+            keep = candidate_count(count, settings.vision.max_candidates)
+            ask = max(keep, plan.ask or count)
+            how += f"; {keep} candidates for the vision check"
+        from .stages.vision import CANDIDATES_FILE, save_candidates
+
         context = context_for_prompt(job_source_info(store, settings))
-        moments = run_moments(transcript, deps.llm, settings.clips, out, signals=signals,
-                              signal_settings=settings.signals if signals is not None else None, context=context,
-                              log=lambda line: rep.line("moments", 0.9, line))
+        picked = _resume_candidates(store, settings, transcript, count) if use_vision else None
+        if picked is not None:
+            rep.skip("moments", message=f"{len(picked)} candidates in {CANDIDATES_FILE} (vision check resumed)")
+        else:
+            rep.start("moments", message=f"asking {settings.llm.model} for {count} moments{how}")
+            picked = pick_candidates(transcript, deps.llm, settings.clips, signals=signals,
+                                     signal_settings=settings.signals if signals is not None else None,
+                                     context=context, ask=ask, keep=keep, plan=plan,
+                                     log=lambda line: rep.line("moments", 0.9, line))
+            if use_vision:
+                save_candidates(picked, store.dir / CANDIDATES_FILE)
+                rep.done("moments", message=f"{len(picked)} candidates")
+        if use_vision:
+            moments = _job_stage_vision(store, rep, settings, deps, transcript, plan, picked, context,
+                                        source or _find_source(store), signals)
+        else:
+            # candidates of an earlier vision run no longer describe these moments (`autoclipper vision`)
+            (store.dir / CANDIDATES_FILE).unlink(missing_ok=True)
+            store.set_stage("vision", "skipped", 1.0, why)  # also after an earlier run's check: not used now
+            rep.skip("vision", message=why)
+            moments = picked[:count]
+            rep.done("moments", message=f"{len(moments)} moments")
+        save_moments(moments, out)
         fresh = True
-        rep.done("moments", message=f"{len(moments)} moments")
     if not moments:
         raise PipelineError("no usable moments were found in this video (try a lower --min or a longer video)")
     return moments, fresh
+
+
+def _resume_candidates(store: JobStore, settings: Settings, transcript: Transcript,
+                       count: int) -> list[Moment] | None:
+    """The candidates of a vision check that was interrupted (stopped, crashed) in an earlier run, so resuming
+    does not pay for the picker again and finds its answers in vision.json. Only when the vision stage did not
+    finish (after a finished one, deleting moments.json means "pick again"), the file is newer than the
+    transcript and signals, and every candidate is a valid range within the current clip limits."""
+    from .stages.vision import CANDIDATES_FILE
+
+    path = store.dir / CANDIDATES_FILE
+    st = store.job.stages.get("vision")
+    if st is None or st.status in ("done", "skipped") or not path.is_file():
+        return None
+    try:
+        mtime = path.stat().st_mtime
+        for dep in ("transcript.json", "signals.json"):
+            d = store.dir / dep
+            if d.is_file() and d.stat().st_mtime > mtime:
+                return None
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, list):
+            return None
+        picked = [Moment.model_validate(m) for m in raw]
+    except (OSError, ValueError, TypeError, UnicodeDecodeError):
+        return None
+    lo, hi = settings.clips.min_seconds - 0.05, max(settings.clips.max_seconds, settings.clips.min_seconds) + 0.05
+    dur = float(transcript.duration or 0.0)
+    if len(picked) < min(count, 2) or any(
+            not (lo <= m.end - m.start <= hi) or m.start < 0 or (dur and m.end > dur + 0.05) for m in picked):
+        return None
+    return picked
+
+
+def _find_source(store: JobStore) -> Path | None:
+    from .stages.ingest import find_source
+
+    return find_source(store.dir)
+
+
+def _job_stage_vision(store: JobStore, rep: _Reporter, settings: Settings, deps: _LazyDeps,
+                      transcript: Transcript, plan: Any, candidates: list[Moment], context: str,
+                      source: Path | None, signals: Any = None) -> list[Moment]:
+    """Vision check of the candidates; returns the moments to cut. Never fails the job: any error is a
+    WARNING and the picker's best ``clips.count`` candidates are kept (the behaviour without vision)."""
+    from .stages.vision import VISION_FILE, run_vision, select_moments
+
+    count = settings.clips.count
+    fallback = candidates[:count]
+    rep.start("vision", message=f"checking frames of {min(len(candidates), settings.vision.max_candidates)} "
+                                f"candidates with {settings.llm.model}")
+    try:
+        if source is None:
+            raise RuntimeError("the job has no source video")
+        report = run_vision(source, candidates, transcript, deps.llm, vision=settings.vision, clips=settings.clips,
+                            model=settings.llm.model, cache_path=store.dir / VISION_FILE, signals=signals,
+                            moment_signals=plan.signals, context=context,
+                            log=lambda line: rep.line("vision", 0.9, line), on_progress=rep.progress("vision"))
+        moments = select_moments(candidates, report.results, transcript, count=count,
+                                 min_seconds=settings.clips.min_seconds, max_seconds=settings.clips.max_seconds,
+                                 moment_signals=plan.signals, log=lambda line: rep.line("vision", 0.95, line))
+    except Exception as e:  # noqa: BLE001 - the vision check is optional: keep the picker's choice
+        msg = f"unavailable ({_error_text(e).splitlines()[0][:200]}); moments as picked without it"
+        rep.line("vision", 1.0, "WARNING " + msg)
+        store.set_stage("vision", "skipped", 1.0, msg)
+        return fallback
+    if not moments:
+        store.set_stage("vision", "skipped", 1.0, "no usable result; moments as picked without it")
+        return fallback
+    rep.done("vision", message=report.summary())
+    return moments
 
 
 _OVERRIDE_TOLERANCE = 0.5  # seconds
@@ -1003,7 +1111,7 @@ def run_job(source: str, *, settings: Settings | None = None, deps: Deps | None 
         stage = "signals"
         signals = _job_stage_signals(store, rep, s, src)
         stage = "moments"
-        moments, fresh = _job_stage_moments(store, rep, s, lazy, transcript, signals)
+        moments, fresh = _job_stage_moments(store, rep, s, lazy, transcript, signals, src)
         if not fresh:
             _warn_ignored_overrides(store, log, moments, count, min_seconds, max_seconds)
         _populate_clips(store, moments, s.languages, fresh=fresh, log=log)
