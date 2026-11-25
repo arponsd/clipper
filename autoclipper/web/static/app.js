@@ -18,7 +18,7 @@
   const JOB_ID_RE = '[A-Za-z0-9][A-Za-z0-9_-]{0,63}';
   const LANG_NAMES = { en: 'English', hi: 'हिन्दी (Hindi)' };
   const LANG_SHORT = { en: 'EN', hi: 'HI' };
-  const JOB_STAGES = ['ingest', 'transcribe', 'signals', 'moments', 'cut'];
+  const JOB_STAGES = ['ingest', 'transcribe', 'signals', 'moments', 'vision', 'cut'];
   const NOTES_MAX = 1000; // options.notes (server: stages.source_info.NOTES_MAX)
   const CLIP_STAGES = ['script', 'voice', 'captions', 'render'];
   const DEFAULT_EXTS = ['.mp4', '.mov', '.mkv', '.webm', '.avi', '.m4v', '.ogv'];
@@ -1457,6 +1457,10 @@
       }
       // the moment's hook (why the clip was picked, in English) - not the on-screen hook line below
       if (clip.moment && clip.moment.hook) rows.push(['Moment', clip.moment.hook]);
+      // vision check: what Claude saw in the clip's frames (and its interest score 0-10)
+      if (clip.moment && clip.moment.visual) {
+        rows.push(['What Claude saw', clip.moment.visual + (typeof clip.moment.vision_score === 'number' ? ` (interest ${clip.moment.vision_score}/10)` : '')]);
+      }
       swap(voiceInfo, rows.map(([k, val]) => [el('dt', { text: k }), el('dd', { text: val })]));
       staleNote.hidden = !entry.voice_stale || !vo;
       styleNote.hidden = !entry.style_stale || isDirty();
@@ -1577,6 +1581,7 @@
     hook: ['Hook text', 'A short, punchy line (written by Claude with the script, editable per clip) shown big at the top for the first seconds of every clip. A clip with an empty hook shows nothing.'],
     script: ['Narration script', 'Speaking rate used to size the narration to the clip.'],
     signals: ['Moment signals', 'For videos with little speech (gameplay, sports, music): loudness peaks, scene cuts and static/menu screens are measured locally with FFmpeg and given to Claude with the transcript, so action moments can be picked and maps or menus avoided. Speech-rich videos are picked from the transcript as before.'],
+    vision: ['Vision check', 'Claude looks at a few small frames of each candidate moment (images, extra cost), describes what is visible, drops driving/walking/menu/loading stretches and trims dull starts and ends; titles and descriptions then say what really happens. "auto" = only for videos with little speech. Results are cached per job (vision.json); any failure keeps the moments as picked without it.'],
     context: ['Video context', 'The video page\'s title, channel, description and tags (and your notes on the New job form) are given to Claude, so titles and hashtags say what the video really is and credit its creator.'],
     web: ['Web uploads', 'Limits for files uploaded through this page.'],
     separation: ['Vocal separation (optional)', 'Demucs removes the speech from the clip so the narration is not talking over someone else. Used only with the voice-over on and Background = "no_vocals"; a clip falls back to the original audio (with a warning) if Demucs is missing or fails. Run Doctor to check the install.'],
@@ -1629,6 +1634,11 @@
     'signals.cut_threshold': ['Scene-cut threshold', 'Picture change (0-1) that counts as a cut; lower finds more cuts.'],
     'signals.menu_flatness': ['Menu/map flatness', 'Share of flat, texture-less picture (0-1) from which a second counts as a map or menu screen.'],
     'signals.timeout_seconds': ['Timeout (s)', 'Signals that take longer are skipped (moments from the transcript only).'],
+    'vision.enabled': ['Use the vision check', 'auto = only videos with little speech (gameplay, sports, music); true = every video (extra cost); false = never.'],
+    'vision.frames_per_moment': ['Frames per candidate', 'Evenly spaced, the first and last near the ends. More frames see more but cost more (about 200 tokens each at 512 px for 16:9 video, about 620 for portrait 9:16).'],
+    'vision.frame_width': ['Frame width (px)', 'Frames are shrunk to this width before they are sent.'],
+    'vision.max_candidates': ['Most candidates checked', 'The moment picker is asked for about 50 % more candidates than clips, up to this many.'],
+    'vision.timeout_seconds': ['Timeout (s)', 'For the frame extraction and for each Claude request; on a timeout the moments are kept as picked.'],
     'context.enabled': ['Give Claude the video context', 'Page title, channel, description excerpt, tags and your notes.'],
     'context.credit_source': ['Credit the creator', 'Each description names the original creator and links the source video.'],
     'context.description_chars': ['Description excerpt (characters)', 'How much of the page description is kept (0-1000).'],

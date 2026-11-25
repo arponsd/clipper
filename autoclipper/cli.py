@@ -242,6 +242,86 @@ def cmd_signals(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_vision(args: argparse.Namespace) -> int:
+    """Run (or show the cached) vision check of a job's moment candidates and print what Claude saw.
+
+    Reads candidates.json (written when the vision check ran in the job), else moments.json. Prints the
+    per-candidate result and the moments the check would keep; moments.json is never changed here."""
+    from .joblock import hold_job_lock
+    from .jobstore import JobStore
+    from .models import Transcript
+    from .pipeline import _make_llm, job_source_info, settings_for_job
+    from .stages.ingest import find_source
+    from .stages.moments import load_moments
+    from .stages.signals import load_signals, moment_signals
+    from .stages.source_info import context_for_prompt
+    from .stages.vision import (CANDIDATES_FILE, VISION_FILE, VisionError, describe_labels, run_vision,
+                                select_moments)
+
+    try:
+        store = JobStore.load(args.job)
+    except FileNotFoundError:
+        raise CLIError(f"job {args.job!r} not found (see `autoclipper jobs`)") from None
+    settings = settings_for_job(store.job, _load_settings())
+    src = find_source(store.dir)
+    tp = store.dir / "transcript.json"
+    if src is None or not tp.is_file():
+        raise CLIError(f"job {args.job} has no source video or transcript yet - resume it first")
+    cp = store.dir / CANDIDATES_FILE
+    mp = store.dir / "moments.json"
+    path = cp if cp.is_file() else mp
+    if not path.is_file():
+        raise CLIError(f"job {args.job} has no moments yet - resume it first")
+    try:
+        candidates = load_moments(path)
+    except Exception as e:  # noqa: BLE001 - MomentsError
+        raise CLIError(str(e)) from e
+    transcript = Transcript.model_validate_json(tp.read_text(encoding="utf-8"))
+    sig = load_signals(store.dir / "signals.json")
+    ms = None
+    if sig is not None:
+        ms = moment_signals(sig, transcript, speech_rich_coverage=settings.signals.speech_rich_coverage,
+                            reject_static_fraction=settings.signals.reject_static_fraction)
+    context = context_for_prompt(job_source_info(store, settings))
+    try:
+        llm = _make_llm(settings)
+    except Exception as e:  # noqa: BLE001 - LLMError: no credentials
+        raise CLIError(f"could not start the language model client: {e}") from e
+    _out(f"vision check of {len(candidates)} candidate(s) from {path.name} "
+         f"({settings.vision.frames_per_moment} frames each, {settings.vision.frame_width} px, {settings.llm.model})")
+    with hold_job_lock(args.job):
+        try:
+            report = run_vision(src, candidates, transcript, llm, vision=settings.vision, clips=settings.clips,
+                                model=settings.llm.model, cache_path=store.dir / VISION_FILE, signals=sig,
+                                moment_signals=ms, context=context, force=args.force, log=_out)
+        except VisionError as e:
+            raise CLIError(f"the vision check failed: {e}") from e
+    for i, m in enumerate(candidates):
+        r = report.results.get(i)
+        if r is None:
+            _out(f"  [{i}] {m.start:7.1f}-{m.end:7.1f}s  not checked")
+            continue
+        trim = f" -> {r.start:.1f}-{r.end:.1f}s" if r.trimmed else ""
+        _out(f"  [{i}] {m.start:7.1f}-{m.end:7.1f}s  {'keep  ' if r.keep else 'REJECT'} interest {r.interest:4.1f}"
+             f"{trim}  [{describe_labels(r.labels)}]")
+        _out(f"        {r.description}")
+    count = settings.clips.count
+    if mp.is_file():  # the job's own clip count (run --clips) when it has moments
+        try:
+            count = len(load_moments(mp))
+        except Exception:  # noqa: BLE001
+            pass
+    count = max(1, min(count, len(candidates)))
+    picked = select_moments(candidates, report.results, transcript, count=count,
+                            min_seconds=settings.clips.min_seconds, max_seconds=settings.clips.max_seconds,
+                            moment_signals=ms)
+    _out(f"would keep {len(picked)}: " + ", ".join(f"{m.start:.1f}-{m.end:.1f}s" for m in picked))
+    _out(report.summary())
+    if path == mp:
+        _out("note: moments.json is not changed; delete it and resume the job to re-pick with the vision check")
+    return 0
+
+
 def cmd_rerender(args: argparse.Namespace) -> int:
     from .joblock import hold_job_lock
     from .pipeline import rerender
@@ -368,6 +448,22 @@ def _is_str_field(parts: list[str]) -> bool:
     return typing.get_origin(ann) in (typing.Union, types.UnionType) and args == [str]
 
 
+def _mixed_literal(parts: list[str]) -> bool:
+    """True for a Literal field that also takes non-text values (vision.enabled: "auto", true, false), so
+    `vision.enabled=true` sets the boolean, not the text "true"."""
+    model: Any = Settings
+    field = None
+    for part in parts:
+        fields = getattr(model, "model_fields", None)
+        if not fields or part not in fields:
+            return False
+        field = fields[part]
+        model = field.annotation
+    if field is None or typing.get_origin(field.annotation) is not typing.Literal:
+        return False
+    return any(not isinstance(a, str) for a in typing.get_args(field.annotation))
+
+
 def apply_setting(settings: Settings, assignment: str) -> Settings:
     """`key.path=value` -> new validated Settings. Unknown keys are an error (no silent typos)."""
     if "=" not in assignment:
@@ -389,7 +485,7 @@ def apply_setting(settings: Settings, assignment: str) -> Settings:
         raise CLIError(f"{key!r} is a group; set one of its keys, e.g. {key}.{next(iter(node[parts[-1]]))}=...")
     value = parse_value(raw)
     if (value is not None and not isinstance(value, str) and not raw.strip().startswith(('"', "'"))
-            and (isinstance(node[parts[-1]], str) or _is_str_field(parts))):
+            and (isinstance(node[parts[-1]], str) or _is_str_field(parts)) and not _mixed_literal(parts)):
         # e.g. voicebox.english.profile_id=12345 or captions.primary_color=1e5: keep the text as typed.
         value = raw.strip()
     if key == "languages" and isinstance(value, str):
@@ -875,6 +971,13 @@ def build_parser() -> argparse.ArgumentParser:
     sg.add_argument("job", help="job id")
     sg.add_argument("--no-table", dest="table", action="store_false", help="only the summary line")
     sg.set_defaults(func=cmd_signals)
+
+    vs = sub.add_parser("vision", parents=[common],
+                        help="run (or show the cached) vision check of a job's moment candidates (Claude looks at "
+                             "frames); moments.json is not changed")
+    vs.add_argument("job", help="job id")
+    vs.add_argument("--force", action="store_true", help="ignore vision.json and ask Claude again (extra cost)")
+    vs.set_defaults(func=cmd_vision)
 
     rr = sub.add_parser("rerender", parents=[common], help="re-render one clip from its edited script.json")
     rr.add_argument("job", help="job id")

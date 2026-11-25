@@ -680,3 +680,15 @@ These are part of the contract now. Tests: `tests/test_web_review_fixes.py` plus
   /api/settings` validates them like every other section (422 with dotted errors, unknown keys 422).
 - Frontend: New job "Context / notes" textarea (`options.notes`), the `signals` stage box, a "Video" /
   "Context / notes" row on the job page, labels for both settings sections.
+
+## 15. Vision check, additive (builder team V, 2026-11-25)
+
+- `GET /api/jobs/{id}`: `clips[].moment` gains `"visual"` (str, "" when not checked) and `"vision_score"`
+  (number 0-10 or null). `stages` gains `vision` (between `moments` and `cut`); a job made before it reports
+  `skipped` / "not used (older job)" once moments are done.
+- Settings: new section `vision` (`config.VisionSettings`): `enabled` ("auto" | true | false; 1/0, "true",
+  null -> 422), `frames_per_moment` 2-12, `frame_width` 256-1024, `max_candidates` 1-30, `timeout_seconds`
+  10-1800. `PUT /api/settings` validates it like every other section (422 with dotted errors, nothing
+  written; unknown keys 422; 401/403 without a valid token).
+- Frontend: the `vision` stage box, the settings section and labels, and a "What Claude saw" row per clip on
+  the clip page (textContent only).

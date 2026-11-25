@@ -101,7 +101,9 @@ def test_run_job_produces_final_clips(job: Shared) -> None:
     j = store.job
     assert j.status == "done" and j.error is None
     assert set(j.stages) == set(JOB_STAGES)
-    assert all(st.status == "done" for st in j.stages.values()), j.stages
+    # the vision check is skipped: the fake LLM has no image support (review_moments)
+    assert all(st.status == "done" for name, st in j.stages.items() if name != "vision"), j.stages
+    assert j.stages["vision"].status == "skipped"
     assert len(j.clips) == 2
     for i, clip in enumerate(j.clips):
         assert clip.index == i
@@ -164,7 +166,7 @@ def test_rerun_is_idempotent_and_builds_no_clients(job: Shared, monkeypatch: pyt
     assert final.stat().st_mtime_ns == before
     assert any("skipped" in line for line in logs)
     # stages that ran before stay "done" (not downgraded to "skipped")
-    assert all(st.status == "done" for st in store.job.stages.values())
+    assert all(st.status == "done" for name, st in store.job.stages.items() if name != "vision")
     assert all(st.status == "done" for c in store.job.clips for ls in c.langs.values()
                for st in ls.stages.values())
 

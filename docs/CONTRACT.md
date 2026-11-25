@@ -35,7 +35,9 @@ renames/removals need a TEAM_LOG note and lead sign-off. Architect files (`confi
 | `transcript.json` | `stages.transcribe.run_transcribe` | `models.Transcript` JSON |
 | `source_info.json` | pipeline ingest (`stages.source_info`), web `submit_job`, CLI `run --notes` / `context` | `SourceInfo` JSON: page title, creator, description excerpt, tags, categories, duration, upload date, URL / file name, user notes (job.json `source_info` points at it) |
 | `signals.json` | `stages.signals.compute_signals` (job stage `signals`) | per-second loudness/jumps/motion/static/menu flags + scene cuts, with the analysis params and source stamps (staleness) |
-| `moments.json` | `stages.moments.run_moments` | JSON list of `models.Moment` dicts (validated, sorted by score desc) |
+| `candidates.json` | pipeline moments stage, only when the vision check runs | JSON list of `models.Moment`: the picker's validated candidates (up to `stages.vision.candidate_count`) |
+| `vision.json` | `stages.vision.run_vision` (job stage `vision`) | `{"key": {version, prompt, model, frames_per_moment, frame_width, min_seconds, max_seconds, source stamp}, "results": {"<start>-<end>": {description, labels, notes, interest, keep, start, end, trimmed, frame_times}}, "runs": [{at, candidates, images, requests, image_tokens, input_tokens, output_tokens, seconds, errors}]}`; a different key discards all results |
+| `moments.json` | `stages.moments.run_moments` / pipeline (`stages.vision.select_moments` with the vision check) | JSON list of `models.Moment` dicts (validated; sorted by score desc, or by vision interest when the check ran). `Moment.visual` (str, "" = not checked) and `Moment.vision_score` (0-10 or null) are additive |
 | `clips/NN/cut.mp4` | `stages.cut.cut_clip` | 1080x1920 h264/aac, original audio (silent track added if source has none) |
 | `clips/NN/<lang>/script.json` | `stages.script.write_script` (and pipeline when voice shortens) | `models.ClipScript` JSON - **user-editable** |
 | `clips/NN/<lang>/voice_raw.<ext>` | `stages.voice.make_voice` | bytes from Voicebox `/audio/{id}` |
@@ -353,3 +355,25 @@ API key env present, `node --version` >= 22 (warn only; this machine has v16.20.
 - ffmpeg 7.1.1 at /usr/bin/ffmpeg. No CUDA (ctranslate2 cuda devices = 0).
 - System fonts present: Noto Sans, Noto Sans Devanagari (/usr/share/fonts/truetype/noto). assets/fonts empty.
 - node v16.20.2 (HyperFrames later needs 22+; doctor warns).
+
+## Vision check (additive, team V, 2026-11-25)
+
+- Job stages: `ingest, transcribe, signals, moments, vision, cut` (`jobstore.JOB_STAGES`; `vision` is in
+  `OPTIONAL_JOB_STAGES`, so jobs made before it count as complete). The stage runs inside the moments step:
+  `pipeline._job_stage_moments` asks the picker for `candidate_count` candidates, writes `candidates.json`,
+  runs `_job_stage_vision` and then writes `moments.json`. With `moments.json` present both stages are
+  skipped. Resume after an interrupted vision stage (its status not `done`/`skipped`) reuses
+  `candidates.json` when it is newer than `transcript.json`/`signals.json` and valid for the clip limits
+  (`pipeline._resume_candidates`): no new picker call, cached `vision.json` answers hit. Moments picked
+  without the check delete `candidates.json`; `run_vision` keeps only the current candidates in `vision.json`. Status `skipped` + message: not wanted (`vision.enabled`, speech-rich with "auto", an LLM without
+  `review_moments`) or failed (WARNING, moments = the picker's best `clips.count` candidates).
+- Optional LLM method `review_moments(*, content: list[dict], context: str = "", timeout: float | None) ->
+  dict` (`interfaces` duck typing: an LLM without it never gets the vision check). `content` is the user
+  message built by `stages.vision.build_request` (text blocks + base64 JPEG image blocks); the answer follows
+  `llm.VISION_SCHEMA` and is validated by `stages.vision.validate_results`. `AnthropicLLM.complete_json` now
+  accepts a content-block list as `user`, an optional per-request `timeout`, and keeps `last_usage` (reset
+  at the start of every call, so a failed call reports nothing). `review_moments` sends
+  `max_tokens=min(VISION_MAX_TOKENS=12000, llm.max_tokens)`, below the SDK long-request limit, so the
+  vision timeout is not raised to 1800 s.
+- `write_script` / `write_publish_metadata` read `moment.visual` and add it as `<visual_description>` data
+  (cleaned with `source_info.clean_text`, at most 600 characters). No signature change.

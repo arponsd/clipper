@@ -33,6 +33,10 @@ class Moment(BaseModel):
     hook: str = ""
     reason: str = ""
     score: float = 0.0
+    # Vision check (stages.vision): what Claude saw in the frames ("" = not checked) and its interest score
+    # 0-10 (None = not checked). Moments from before the vision check have neither.
+    visual: str = ""
+    vision_score: float | None = None
 
     @property
     def duration(self) -> float:

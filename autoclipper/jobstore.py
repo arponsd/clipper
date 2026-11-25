@@ -15,9 +15,9 @@ from pathlib import Path
 from .config import data_dir
 from .models import Job, StageState
 
-JOB_STAGES = ["ingest", "transcribe", "signals", "moments", "cut"]
+JOB_STAGES = ["ingest", "transcribe", "signals", "moments", "vision", "cut"]
 # Job stages added later: a job made before one existed has no state for it, which counts as finished.
-OPTIONAL_JOB_STAGES = ("signals",)
+OPTIONAL_JOB_STAGES = ("signals", "vision")
 CLIP_STAGES = ["script", "voice", "captions", "render"]
 
 _lock = threading.RLock()

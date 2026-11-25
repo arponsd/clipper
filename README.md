@@ -384,6 +384,60 @@ After Claude answers:
 If the signals fail (e.g. an unreadable video stream), the stage is marked skipped with a warning and the
 moments come from the transcript as before. Captions of non-speech stretches are naturally sparse.
 
+### Vision check (Claude looks at the frames)
+
+The signals cannot tell driving, walking or a loading screen from real action: all of them are loud and
+moving. And Claude never saw the picture, so titles of low-speech videos stayed generic ("Robbing Every Bank
+in GTA 6" on every clip). The **vision** job stage (between moments and cut) fixes both:
+
+1. The moment picker is asked for extra **candidates** (50 % more, at least 2, up to `vision.max_candidates`),
+   saved in `candidates.json`.
+2. FFmpeg takes `vision.frames_per_moment` (6) small JPEG frames per candidate, evenly spaced with the first
+   and last near its ends, at most `vision.frame_width` (512) px wide (one FFmpeg call per candidate, fast
+   seeking: a few seconds for 9 candidates of a 35-minute 1080p AV1 video).
+3. All candidates go to Claude in one request (split only above 100 images or 20 MB): per candidate its
+   times, a summary of its signals, what is said in it (as delimited, untrusted data) and its frames, each with
+   its time in the video. Claude answers per candidate: a short factual description, one label per frame
+   (`action, dialogue, cutscene, driving, walking, menu_map, loading, other`), one short note per frame, an
+   interest score 0-10, keep or reject, and an optional tighter start/end that drops a dull head or tail.
+4. The answer is checked strictly: unknown or duplicate ids, missing fields and non-numbers are ignored, the
+   score is clamped to 0-10, labels outside the list become `other`, a start/end outside the candidate or
+   outside `clips.min_seconds`-`clips.max_seconds` is ignored (the candidate keeps its range).
+5. Rejected candidates are dropped, the others ranked by interest; the trim is applied, plus a backstop from
+   the frame labels (driving/walking/map/loading frames at either end, without speech there, are cut off
+   halfway to the next lively frame, down to the minimum length), and snapped to a nearby sentence boundary,
+   scene cut or quiet point (an edge may snap back out by at most half of the trim and never onto a checked
+   frame that was cut off, so a black/loading lead-in stays out). If fewer than `clips.count`
+   survive, the unchecked and then the best rejected candidates fill up: the job never has fewer clips.
+6. The description (and, when a dull part was cut off, a warning not to mention it plus the notes of the
+   frames inside the clip, so a montage of several places stays a montage) is stored with
+   the moment (`moments.json` `visual`, `vision_score`) and given to the title/hook/description writer inside
+   `<visual_description>`, as data, with the rule to be specific to this clip and claim nothing it does not
+   support. The job page shows it per clip ("What Claude saw").
+
+`vision.enabled`: `"auto"` (default) runs it only for low-speech videos (speech below
+`signals.speech_rich_coverage`), so speech-rich videos cost nothing extra and are picked exactly as before;
+`true` runs it on every video, `false` never. Results are cached per job in `vision.json`, per candidate
+range, keyed by the model, the frame settings, the clip length limits and the source file, so a resume or a
+re-run does not pay again. A job stopped or crashed during the vision stage resumes with the same
+`candidates.json` (no new picker call, every cached answer reused); after a finished check, deleting
+`moments.json` picks again. `candidates.json` is removed when moments are picked without the check, and
+`vision.json` keeps only the current candidates. Any failure (no credentials, API error, refusal, bad answer, FFmpeg error) is a
+WARNING: the stage is marked skipped and the moments are the picker's own best ones (the behaviour without
+vision); it never fails a job.
+
+Cost on this machine (Claude Opus 5.5, 9 candidates x 6 frames of 512x288): 54 images, about 10,600 image
+tokens, about 16,000 input + 1,100-1,900 output tokens, roughly $0.09-0.10 and 20-30 s per job; the stage
+message and `vision.json` (`runs`) record the image count and tokens of every run. The dollar figure always
+uses Opus 5.5 prices, whatever `llm.model` is. Image tokens depend on the frame shape: about 200 per 512 px
+16:9 frame, about 620 per 512 px portrait (9:16) frame. The request has its own output budget
+(`llm.VISION_MAX_TOKENS`, 12,000, or `llm.max_tokens` if lower), so `vision.timeout_seconds` is the real
+limit per request.
+
+`uv run autoclipper vision <job_id>` runs (or shows the cached) check of a job's candidates (`candidates.json`,
+else `moments.json`) and prints what Claude saw, the labels, the trims and which moments it would keep;
+`--force` asks again. It never changes `moments.json` (delete it and resume the job to re-pick).
+
 ### Audio mix (voice-over)
 
 `audio.mix = "loudness"` (the default) sets the levels from measurements, not from fixed factors, so a loud game stream and a quiet lecture come out the same:
@@ -692,7 +746,9 @@ data/
     transcript.json                 segments + word timestamps
     source_info.json                source context: page title, creator, description excerpt, tags, your notes
     signals.json                    per-second loudness, sudden jumps, motion, static/menu flags, scene cuts
-    moments.json                    chosen moments (start, end, hook, reason, score)
+    candidates.json                 vision check: the picker's candidates (more than the clips)
+    vision.json                     vision check cache: per candidate description, frame labels/notes, interest, trim
+    moments.json                    chosen moments (start, end, hook, reason, score; visual, vision_score)
     clips/00/
       cut.mp4                       1080x1920 cut with original audio
       bed_no_vocals.wav / .json     Demucs no_vocals stem + its key (separation.background=no_vocals only)
@@ -763,6 +819,11 @@ Change settings with `autoclipper settings set key.path=value`. The value is par
 | `signals.reject_static_fraction` | `0.5` | Low-speech videos: a moment static/menu/silent for this share, mostly without speech, is dropped (0.1-1) |
 | `signals.cut_threshold` | `0.35` | Picture change score for a scene cut (0.05-1; lower = more cuts) |
 | `signals.timeout_seconds` | `900` | Longer signal runs are given up (moments from the transcript only) |
+| `vision.enabled` | `"auto"` | Vision check of the moment candidates (see [Vision check](#vision-check-claude-looks-at-the-frames)): `"auto"` = low-speech videos only, `true` = every video (extra cost), `false` = never |
+| `vision.frames_per_moment` | `6` | Frames per candidate (2-12), evenly spaced, the first and last near its ends |
+| `vision.frame_width` | `512` | Frame width in px (256-1024; never upscaled) |
+| `vision.max_candidates` | `12` | Most candidates checked per job (1-30); the picker is asked for 50 % more than `clips.count`, up to this |
+| `vision.timeout_seconds` | `300` | Frame extraction and each Claude request (10-1800); a timeout keeps the moments as picked |
 | `context.enabled` | `true` | Give Claude the video's page info and your notes (see [Video context](#video-context-for-titles-and-descriptions)) |
 | `context.credit_source` | `true` | Make every description credit the original creator and link the source |
 | `context.description_chars` | `1000` | Characters of the page description kept (0-1000) |
